@@ -509,12 +509,10 @@ Everything works without any key. These unlock richer data:
 | `HIBP_API_KEY` | Per-email HaveIBeenPwned lookup |
 | `CHIASMODON_API_KEY` | Chiasmodon pro tier — more results |
 | `RANSOMWARE_LIVE_API_KEY` | Ransomware.live pro feed |
-| `GOOGLE_CSE_KEY` + `GOOGLE_CSE_ID` | Execute Google dorks live |
 
 ```bash
 export SHODAN_API_KEY="your_key_here"
 export HIBP_API_KEY="your_key_here"
-# loaded at runtime — never hardcoded
 ```
 
 ---
