@@ -75,7 +75,7 @@ Takes a live screenshot of the target and runs it against the **ransomware.live*
 Full DNS enumeration with a security grade on email protection. Detects missing DMARC, weak SPF policies, absent DKIM, and open zone transfers.
 
 ```
-  A         203.0.113.10
+  A         203.0.x.x
   MX        mail.corp.com  (priority 10)
   NS        ns1.corp.com · ns2.corp.com
   TXT       v=spf1 include:_spf.google.com ~all
