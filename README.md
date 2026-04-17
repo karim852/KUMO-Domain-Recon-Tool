@@ -44,6 +44,7 @@ python3 kumo.py --web               # web UI → http://localhost:8888
 
 ![Kumo Web UI](web_ui.png)
 
+![Kumo Web UI 2](web_ui2.png)
 **CLI** — the KUMO banner on launch:
 
 ![Kumo CLI](cli_banner.png)
