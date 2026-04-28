@@ -3612,16 +3612,7 @@ def scan_breachintel(domain):
         if _em and _em.endswith("@" + _dom_lo):
             all_stealer_emails.add(_em)
 
-    # Email harvester — always scoped to @domain
-    try:
-        _eh = scan_email_harvest(domain)
-        for _em in _eh.get("emails", []):
-            _em = _em.lower().strip() if isinstance(_em, str) else ""
-            if _em and _em.endswith("@" + _dom_lo):
-                all_stealer_emails.add(_em)
-        results["sources"]["harvested_emails"] = _eh.get("emails", [])
-    except Exception:
-        results["sources"]["harvested_emails"] = []
+    results["sources"]["harvested_emails"] = []  # populated separately by email_harvest module
 
     # Final safety guard — strip any non-@domain email that slipped through
     all_stealer_emails = {e for e in all_stealer_emails if e.endswith("@" + _dom_lo)}
@@ -3730,7 +3721,7 @@ def scan_email_harvest(domain):
     def harvest_page(url, label):
         """Fetch a URL and extract all @domain emails."""
         try:
-            r = requests.get(url, timeout=10, verify=False, allow_redirects=True,
+            r = requests.get(url, timeout=6, verify=False, allow_redirects=True,
                              headers={"User-Agent": "Mozilla/5.0 Kumo/1.0"})
             if r.status_code == 200:
                 found = set(m.lower() for m in EMAIL_RE.findall(r.text))
@@ -3748,7 +3739,7 @@ def scan_email_harvest(domain):
 
     # ── Source 2: crt.sh — sometimes has email in cert subject/SAN ──
     try:
-        r = req(f"https://crt.sh/?q=%25%40{domain}&output=json", timeout=15)
+        r = req(f"https://crt.sh/?q=%25%40{domain}&output=json", timeout=10)
         if r:
             data = r.json()
             for entry in data[:200]:
@@ -3762,36 +3753,39 @@ def scan_email_harvest(domain):
     except Exception:
         pass
 
-    # ── Source 3: Web page scraping (contact, about, team pages) ──
-    scrape_paths = [
-        "/contact", "/contact-us", "/about", "/about-us", "/team",
-        "/our-team", "/staff", "/people", "/company", "/support",
-        "/help", "/reach-us", "/get-in-touch",
-    ]
-    for path in scrape_paths:
+    # ── Source 3: Web page scraping — parallel, 4s timeout each ──
+    scrape_paths = ["/contact", "/contact-us", "/about", "/about-us", "/team", "/support"]
+    import threading as _thr3
+    _s3_lock = _thr3.Lock()
+    def _scrape_path(path):
         for scheme in ["https", "http"]:
             try:
                 r = requests.get(
-                    f"{scheme}://{domain}{path}",
-                    timeout=5, verify=False, allow_redirects=True,
+                    f"{scheme}://{domain}{path}", timeout=4,
+                    verify=False, allow_redirects=True,
                     headers={"User-Agent": "Mozilla/5.0 Kumo/1.0"}
                 )
                 if r.status_code == 200:
                     found = set(m.lower() for m in EMAIL_RE.findall(r.text))
-                    for e in found:
-                        emails_found.add(e)
-                        email_details.setdefault(e, {"sources": []})
-                        email_details[e]["sources"].append(f"webpage{path}")
                     if found:
-                        sources_used.append(f"web{path}")
-                break
+                        with _s3_lock:
+                            for e in found:
+                                emails_found.add(e)
+                                email_details.setdefault(e, {"sources": []})
+                                if "web-scrape" not in email_details[e]["sources"]:
+                                    email_details[e]["sources"].append("web-scrape")
+                        return True
             except Exception:
-                break
+                continue
+        return False
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as _scex:
+        if any(list(_scex.map(_scrape_path, scrape_paths))):
+            sources_used.append("web-scrape")
 
     # ── Source 4: Homepage scrape ──
     for scheme in ["https", "http"]:
         try:
-            r = requests.get(f"{scheme}://{domain}", timeout=8, verify=False,
+            r = requests.get(f"{scheme}://{domain}", timeout=5, verify=False,
                              headers={"User-Agent": "Mozilla/5.0"})
             if r.status_code == 200:
                 found = set(m.lower() for m in EMAIL_RE.findall(r.text))
