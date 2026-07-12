@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Kumo v1.0 — Web Interface
+Kumo v2.0 — Web Interface
 Embedded web server with a hacker-aesthetic dashboard.
 """
 
@@ -20,6 +20,56 @@ from engine import clean_domain, ALL_MODULES, FAST_SKIP, run_scan
 app = Flask(__name__)
 
 # ═══════════════════════════════════════════════════════════════
+# SCAN SESSION REGISTRY — enables the STOP button to cancel a scan
+# ═══════════════════════════════════════════════════════════════
+# Maps scan_id -> threading.Event(). When the event is set, the
+# streaming generator stops waiting on stragglers and shuts down.
+SCAN_STOP_EVENTS = {}
+_SCAN_LOCK = threading.Lock()
+
+# ── Per-module timeouts (seconds) — v2.0: generous, judged individually ──
+# Every module runs against its OWN clock, so a slow scanner (nuclei) can take
+# its time without other modules killing it, and fast modules are never held
+# hostage waiting on a slow one.
+MODULE_TIMEOUTS = {
+    # fast / cheap
+    'dns': 25, 'geo': 25, 'whois': 40, 'robots': 25, 'ssl': 35,
+    'headers': 30, 'favicon': 50, 'dorks': 20, 'osint': 20,
+    # medium (single API / moderate crawling)
+    'shodan': 45, 'censys': 50, 'whatweb': 75, 'wafw00f': 75,
+    'ports': 120, 'endpoints': 120, 'wayback': 120,
+    'email_harvest': 120, 'screenshot': 90,
+    # heavy (many parallel requests / brute / enumeration)
+    'js_secrets': 120, 'api_fuzzer': 120, 'content_intel': 120, 'cloud_buckets': 180,
+    'subdomains': 200, 'brute': 200, 'breachintel': 200,
+    # vulnerability scanner — 145 checks + ~38 sequential exploit probes
+    'nuclei': 360,
+}
+DEFAULT_TIMEOUT = 90    # anything unlisted
+ABS_CAP = 420           # hard safety ceiling per module (7 min)
+
+
+def _register_scan(scan_id):
+    ev = threading.Event()
+    with _SCAN_LOCK:
+        SCAN_STOP_EVENTS[scan_id] = ev
+    return ev
+
+
+def _stop_scan(scan_id):
+    with _SCAN_LOCK:
+        ev = SCAN_STOP_EVENTS.get(scan_id)
+    if ev:
+        ev.set()
+        return True
+    return False
+
+
+def _unregister_scan(scan_id):
+    with _SCAN_LOCK:
+        SCAN_STOP_EVENTS.pop(scan_id, None)
+
+# ═══════════════════════════════════════════════════════════════
 # HTML TEMPLATE — Full hacker terminal aesthetic
 # ═══════════════════════════════════════════════════════════════
 
@@ -29,7 +79,7 @@ HTML_TEMPLATE = r"""
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Kumo — OSINT ReconKumo v1.0</title>
+<title>Kumo — OSINT Recon · Kumo v2.0</title>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet">
 <style>
 :root{
@@ -231,6 +281,101 @@ body{background:var(--bg);color:var(--text);font-family:'Inter',system-ui,sans-s
 .email-stealer-header{display:flex;align-items:center;gap:8px;margin-bottom:4px}
 .email-stealer .email-addr{color:var(--red);font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:700}
 .email-stealer-details{font-size:10px;color:var(--text2);line-height:1.7}
+
+/* ══ UI v2 UPGRADES ══ */
+
+/* stop button */
+.btn-stop{background:var(--red);border-color:var(--red);color:#fff;display:none}
+.btn-stop:hover{background:#ff6b64;border-color:#ff6b64}
+.btn-stop.on{display:flex}
+.btn-stop .stop-ico{width:9px;height:9px;background:#fff;border-radius:2px;display:inline-block}
+.scanning .btn-scan,.scanning .btn-fast{display:none}
+
+/* live elapsed timer chip in header */
+.hdr-timer{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text2);display:none;align-items:center;gap:6px}
+.hdr-timer.on{display:inline-flex}
+.hdr-timer .t-dot{width:5px;height:5px;border-radius:50%;background:var(--yellow);animation:pulse .8s infinite}
+.hdr-timer.done .t-dot{background:var(--green);animation:none}
+.hdr-timer b{color:var(--cyan)}
+
+/* pill toolbar controls */
+.pill-ctrls{margin-left:auto;display:flex;gap:5px;align-items:center}
+.pill-ctrl{font-family:'JetBrains Mono',monospace;font-size:9px;letter-spacing:.5px;color:var(--text3);background:transparent;border:1px solid var(--border);border-radius:6px;padding:3px 9px;cursor:pointer;transition:all .12s;text-transform:uppercase}
+.pill-ctrl:hover{border-color:var(--border3);color:var(--text2)}
+.pill-ctrl.danger:hover{border-color:var(--red);color:var(--red)}
+.pill-count{font-family:'JetBrains Mono',monospace;font-size:9px;color:var(--text3);letter-spacing:.5px}
+.pill-count b{color:var(--cyan)}
+.pill.err{border-color:var(--red);color:var(--red);background:var(--red-dim)}
+.pill.err::after{content:" ✗";font-size:8px}
+
+/* status bar: elapsed + running/done/error segmented counts */
+.s-elapsed{font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text3);margin-left:2px}
+.s-elapsed b{color:var(--cyan)}
+.s-counts .sc{display:inline-flex;align-items:center;gap:4px;padding:1px 7px;border-radius:20px;border:1px solid var(--border)}
+.s-counts .sc-run{color:var(--yellow);border-color:rgba(227,179,65,.3)}
+.s-counts .sc-done{color:var(--green);border-color:rgba(61,220,132,.3)}
+.s-counts .sc-err{color:var(--red);border-color:rgba(248,81,73,.3)}
+.s-cancel{margin-left:8px;font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--red);cursor:pointer;border:1px solid rgba(248,81,73,.3);border-radius:6px;padding:2px 9px;transition:all .12s;display:none}
+.s-cancel.on{display:inline-block}
+.s-cancel:hover{background:var(--red-dim)}
+.s-export{margin-left:6px;font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--cyan);cursor:pointer;border:1px solid rgba(88,166,255,.3);border-radius:6px;padding:2px 9px;transition:all .12s;display:none}
+.s-export.on{display:inline-block}
+.s-export:hover{background:var(--cyan-dim)}
+
+/* running pill spinner */
+.pill.running::before{content:"";display:inline-block;width:6px;height:6px;margin-right:4px;border:1.4px solid var(--yellow);border-top-color:transparent;border-radius:50%;animation:spin .7s linear infinite;vertical-align:middle}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* toast notifications */
+.toast-wrap{position:fixed;bottom:20px;right:20px;z-index:9999;display:flex;flex-direction:column;gap:8px;pointer-events:none}
+.toast{pointer-events:auto;min-width:240px;max-width:360px;background:var(--bg3);border:1px solid var(--border2);border-left:3px solid var(--cyan);border-radius:8px;padding:11px 14px;font-size:12px;color:var(--text);box-shadow:0 8px 28px rgba(0,0,0,.45);animation:toastIn .25s ease both;display:flex;align-items:flex-start;gap:9px;font-family:'JetBrains Mono',monospace}
+.toast.out{animation:toastOut .25s ease both}
+.toast.t-ok{border-left-color:var(--green)}
+.toast.t-warn{border-left-color:var(--yellow)}
+.toast.t-err{border-left-color:var(--red)}
+.toast .t-ico{font-size:14px;line-height:1;flex-shrink:0}
+.toast .t-body b{display:block;font-size:12px;margin-bottom:2px;letter-spacing:.3px}
+.toast .t-body span{font-size:10px;color:var(--text2);line-height:1.4}
+@keyframes toastIn{from{opacity:0;transform:translateX(24px)}to{opacity:1;transform:translateX(0)}}
+@keyframes toastOut{to{opacity:0;transform:translateX(24px)}}
+
+/* completion summary strip */
+.summary{display:none;gap:8px;flex-wrap:wrap;padding:10px 24px;background:var(--bg2);border-bottom:1px solid var(--border)}
+.summary.on{display:flex}
+.sum-chip{display:flex;align-items:center;gap:6px;font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text2);background:var(--bg3);border:1px solid var(--border);border-radius:7px;padding:5px 10px}
+.sum-chip b{font-size:13px;color:var(--text)}
+.sum-chip.crit{border-color:rgba(248,81,73,.3)}.sum-chip.crit b{color:var(--red)}
+.sum-chip.warn{border-color:rgba(227,179,65,.3)}.sum-chip.warn b{color:var(--yellow)}
+.sum-chip.ok{border-color:rgba(61,220,132,.3)}.sum-chip.ok b{color:var(--green)}
+.sum-chip .sc-ico{font-size:13px}
+
+/* focus/scan glow on the search wrap while running */
+.scanning .search-wrap{border-color:var(--border2);opacity:.7}
+#domInput:disabled{cursor:not-allowed}
+
+/* completion modal */
+.cmp-overlay{position:fixed;inset:0;background:rgba(3,6,15,.72);backdrop-filter:blur(4px);z-index:10000;display:none;align-items:center;justify-content:center;padding:20px}
+.cmp-overlay.on{display:flex;animation:cmpFade .2s ease both}
+@keyframes cmpFade{from{opacity:0}to{opacity:1}}
+.cmp-modal{position:relative;width:100%;max-width:440px;background:linear-gradient(180deg,var(--bg2),var(--bg3));border:1px solid var(--border2);border-radius:16px;padding:28px 26px 22px;box-shadow:0 24px 70px rgba(0,0,0,.6);text-align:center;animation:cmpPop .25s cubic-bezier(.2,.9,.3,1.2) both}
+@keyframes cmpPop{from{opacity:0;transform:translateY(14px) scale(.96)}to{opacity:1;transform:translateY(0) scale(1)}}
+.cmp-x{position:absolute;top:12px;right:14px;background:none;border:none;color:var(--text3);font-size:22px;line-height:1;cursor:pointer;padding:2px 6px;border-radius:6px}
+.cmp-x:hover{color:var(--text);background:var(--bg)}
+.cmp-check{width:56px;height:56px;margin:2px auto 12px;border-radius:50%;background:rgba(61,220,132,.14);border:1.5px solid var(--green);color:var(--green);font-size:30px;display:flex;align-items:center;justify-content:center;animation:cmpCheck .4s ease both}
+@keyframes cmpCheck{from{transform:scale(0);opacity:0}to{transform:scale(1);opacity:1}}
+.cmp-title{font-size:19px;font-weight:700;color:var(--text);letter-spacing:.3px}
+.cmp-sub{font-size:12px;color:var(--text2);margin-top:5px;font-family:'JetBrains Mono',monospace}
+.cmp-sub b{color:var(--cyan)}
+.cmp-stats{display:flex;justify-content:center;gap:7px;flex-wrap:wrap;margin:16px 0 18px}
+.cmp-stat{display:flex;flex-direction:column;align-items:center;min-width:56px;padding:8px 10px;background:var(--bg);border:1px solid var(--border);border-radius:9px}
+.cmp-stat .n{font-family:'JetBrains Mono',monospace;font-size:18px;font-weight:700}
+.cmp-stat .l{font-size:8.5px;letter-spacing:.6px;color:var(--text3);text-transform:uppercase;margin-top:2px}
+.cmp-actions{display:flex;flex-direction:column;gap:8px}
+.cmp-btn{width:100%;padding:11px;border-radius:9px;font-size:13px;font-weight:600;cursor:pointer;border:1px solid var(--border2);transition:all .13s;font-family:inherit}
+.cmp-primary{background:linear-gradient(180deg,var(--cyan),#3d7dd8);border-color:var(--cyan);color:#04121f;box-shadow:0 4px 14px rgba(88,166,255,.3)}
+.cmp-primary:hover{filter:brightness(1.08);transform:translateY(-1px)}
+.cmp-ghost{background:var(--bg3);color:var(--text2)}
+.cmp-ghost:hover{background:var(--bg);color:var(--text);border-color:var(--border3)}
 </style>
 </head>
 <body>
@@ -246,12 +391,13 @@ body{background:var(--bg);color:var(--text);font-family:'Inter',system-ui,sans-s
     <div style="display:flex;flex-direction:column;gap:4px;border-left:1px solid var(--border);padding-left:18px">
       <div style="font-size:11px;color:var(--text2);font-family:var(--font-mono)">蜘蛛 · web recon · osint · breach intel</div>
       <div style="display:flex;gap:6px">
-        <span class="logo-ver">v1.0</span>
-        <span class="logo-ver" style="background:transparent;border-color:var(--border)">21 modules</span>
+        <span class="logo-ver">v2.0</span>
+        <span class="logo-ver" id="hdrModCount" style="background:transparent;border-color:var(--border)">modules</span>
         <span class="logo-ver" style="background:transparent;border-color:var(--border)">no key needed</span>
       </div>
     </div>
   </div>
+  <div class="hdr-timer" id="hdrTimer"><span class="t-dot"></span><span>elapsed</span> <b id="hdrTimerVal">0.0s</b></div>
   <span class="hdr-right" id="hdrStat"></span>
 </div>
 
@@ -261,17 +407,47 @@ body{background:var(--bg);color:var(--text);font-family:'Inter',system-ui,sans-s
     <input id="domInput" type="text" placeholder="Enter target domain — e.g. example.com" autocomplete="off" spellcheck="false">
   </div>
   <button class="btn btn-scan" id="scanBtn" onclick="startScan(false)"><span id="scanBtnTxt">SCAN</span></button>
-  <button class="btn btn-fast" onclick="startScan(true)">⚡ FAST</button>
+  <button class="btn btn-fast" id="fastBtn" onclick="startScan(true)">⚡ FAST</button>
+  <button class="btn btn-stop" id="stopBtn" onclick="stopScan()"><span class="stop-ico"></span> STOP</button>
 </div>
 
 <div class="pill-bar" id="pillBar">
   <span class="pill-lbl">MODULES</span>
+  <span class="pill-ctrls">
+    <span class="pill-count"><b id="activeCount">0</b>/<span id="totalModCount">0</span> active</span>
+    <button class="pill-ctrl" id="ctrlAll" onclick="selectAllPills(true)">all</button>
+    <button class="pill-ctrl" id="ctrlNone" onclick="selectAllPills(false)">none</button>
+    <button class="pill-ctrl danger" id="ctrlReset" onclick="resetScan()">reset</button>
+  </span>
 </div>
 <div class="prog" id="prog"><div class="prog-fill" id="progFill"></div></div>
 <div class="status" id="statusBar">
   <div class="s-dot" id="sDot"></div>
   <span class="s-txt" id="sTxt">Ready</span>
+  <span class="s-elapsed" id="sElapsed"></span>
   <div class="s-counts" id="sCounts"></div>
+  <span class="s-cancel" id="sCancel" onclick="stopScan()">■ stop</span>
+  <span class="s-export" id="sReport" onclick="generateReport()" style="color:var(--green);border-color:rgba(61,220,132,.35)">📄 report</span>
+  <span class="s-export" id="sExport" onclick="exportResults()">↓ json</span>
+</div>
+
+<div class="summary" id="summaryBar"></div>
+
+<div class="toast-wrap" id="toastWrap"></div>
+
+<div class="cmp-overlay" id="cmpOverlay" onclick="if(event.target===this)closeCompletionModal()">
+  <div class="cmp-modal" role="dialog" aria-modal="true">
+    <button class="cmp-x" onclick="closeCompletionModal()" aria-label="Close">×</button>
+    <div class="cmp-check">✓</div>
+    <div class="cmp-title">Scan complete</div>
+    <div class="cmp-sub" id="cmpSub"></div>
+    <div class="cmp-stats" id="cmpStats"></div>
+    <div class="cmp-actions">
+      <button class="cmp-btn cmp-primary" onclick="generateReport(); closeCompletionModal();">📄 Generate report</button>
+      <button class="cmp-btn cmp-ghost" onclick="exportResults();">↓ Export JSON</button>
+      <button class="cmp-btn cmp-ghost" onclick="closeCompletionModal()">Dismiss</button>
+    </div>
+  </div>
 </div>
 
 <div class="main-layout">
@@ -302,6 +478,11 @@ body{background:var(--bg);color:var(--text);font-family:'Inter',system-ui,sans-s
 <script>
 const MODULES = __MODULES_JSON__;
 const PILL_LABELS = {
+  'js_secrets':    'js secrets',
+  'content_intel': 'content intel',
+  'api_fuzzer':    'api fuzzer',
+  'favicon':       'favicon',
+  'cloud_buckets': 'cloud buckets',
   'nuclei':        'vuln scanner',
   'email_harvest': 'email harvest',
   'breachintel':   'breach intel',
@@ -318,6 +499,8 @@ const SCAN_ORDER = [
   'nuclei','shodan','censys',
   'subdomains','brute','wayback',
   'breachintel','email_harvest',
+  'js_secrets','content_intel','api_fuzzer',
+  'favicon','cloud_buckets',
   'dorks','osint'
 ];
 
@@ -327,13 +510,19 @@ const ICONS = {
   nuclei:'🔓',shodan:'🔭',censys:'🔬',breachintel:'💀',endpoints:'🔓',
   geo:'📍',robots:'🤖',wayback:'📚',brute:'🔨',dorks:'🔍',osint:'🔗'
 };
-const SLOW = new Set(['wayback','brute','subdomains','screenshot','email_harvest']);
+const SLOW = new Set(['wayback','brute','subdomains','screenshot','email_harvest','nuclei','cloud_buckets']);
 
 let activeModules = new Set(Object.keys(MODULES));
 let scanning = false, completedCount = 0, totalCount = 0, errorCount = 0;
 let currentDomain = '';
+let scanAbort = null;      // AbortController for the active fetch
+let scanId = null;         // unique id shared with the backend for STOP
+let scanTimer = null;      // interval handle for the live elapsed clock
+let scanStartTs = 0;
+let runningSet = new Set(); // modules still in-flight
 
 const pillBar   = document.getElementById('pillBar');
+const pillCtrls = pillBar.querySelector('.pill-ctrls');
 const scanGrid  = document.getElementById('scanGrid');
 const prog      = document.getElementById('prog');
 const progFill  = document.getElementById('progFill');
@@ -341,8 +530,15 @@ const statusBar = document.getElementById('statusBar');
 const sDot      = document.getElementById('sDot');
 const sTxt      = document.getElementById('sTxt');
 const sCounts   = document.getElementById('sCounts');
+const sElapsed  = document.getElementById('sElapsed');
+const sCancel   = document.getElementById('sCancel');
+const sExport   = document.getElementById('sExport');
+const sReport   = document.getElementById('sReport');
+const hdrTimer  = document.getElementById('hdrTimer');
+const hdrTimerVal = document.getElementById('hdrTimerVal');
+const summaryBar= document.getElementById('summaryBar');
 
-// Build module pills in scan order
+// Build module pills in scan order (inserted BEFORE the control cluster)
 [...SCAN_ORDER, ...Object.keys(MODULES).filter(m=>!SCAN_ORDER.includes(m))].forEach(id => {
   if (!MODULES[id]) return;
   const p = document.createElement('div');
@@ -350,13 +546,32 @@ const sCounts   = document.getElementById('sCounts');
   p.onclick = () => {
     if (scanning) return;
     activeModules.has(id) ? (activeModules.delete(id), p.classList.remove('on')) : (activeModules.add(id), p.classList.add('on'));
+    updateActiveCount();
   };
-  pillBar.appendChild(p);
+  pillBar.insertBefore(p, pillCtrls);
 });
+document.getElementById('totalModCount').textContent = Object.keys(MODULES).length;
+document.getElementById('hdrModCount').textContent = Object.keys(MODULES).length + ' modules';
+updateActiveCount();
+
+function updateActiveCount(){
+  document.getElementById('activeCount').textContent = activeModules.size;
+}
+
+function selectAllPills(on){
+  if (scanning) return;
+  pillBar.querySelectorAll('.pill').forEach(p=>{
+    const id=p.dataset.id;
+    if(on){ activeModules.add(id); p.classList.add('on'); }
+    else { activeModules.delete(id); p.classList.remove('on'); }
+  });
+  updateActiveCount();
+}
 
 function getPill(id){ return pillBar.querySelector(`[data-id="${id}"]`); }
 function setPill(id, cls){ const p=getPill(id); if(p){p.classList.remove('on','running','done');p.classList.add(cls);} }
 function escH(s){ return s?String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'):''; }
+function fmtBytes(n){ if(n===''||n===undefined||n===null) return '—'; n=Number(n); if(isNaN(n)) return '—'; if(n<1024) return n+' B'; if(n<1048576) return (n/1024).toFixed(1)+' KB'; return (n/1048576).toFixed(2)+' MB'; }
 function kv(k,v){ return `<div class="kv"><span class="kv-k">${k}</span><span class="kv-v">${v}</span></div>`; }
 
 function getBadges(id, data) {
@@ -564,8 +779,8 @@ function renderContent(id, data) {
     h+=`<div class="c-dim" style="margin-bottom:8px;font-size:11px">${data.total_found||0} found / ${data.total_probed||0} probed</div>`;
     const findings=data.findings||[];
     if(!findings.length) return h+'<div class="alert a-green">✓ No sensitive endpoints found</div>';
-    h+='<table class="tbl"><thead><tr><th>Severity</th><th>Endpoint</th><th>Status</th></tr></thead><tbody>';
-    findings.forEach(f=>{h+=`<tr><td style="color:${sc[f.severity]||'var(--text)'};font-weight:700;font-size:9px">${(f.severity||'').toUpperCase()}</td><td><div style="font-size:11px">${escH(f.name)}</div><div class="mono c-dim" style="font-size:9px">${escH(f.path)}</div></td><td>${(f.status===301||f.status===302)?`<span class="c-dim" style="font-size:10px">[${f.status}]</span>`:`<a href="${escH(f.url)}" target="_blank" class="c-cyan" style="font-size:10px">[${f.status}]</a>`}</td></tr>`;});
+    h+='<table class="tbl"><thead><tr><th>Severity</th><th>Endpoint</th><th>Status</th><th>Size</th></tr></thead><tbody>';
+    findings.forEach(f=>{h+=`<tr><td style="color:${sc[f.severity]||'var(--text)'};font-weight:700;font-size:9px">${(f.severity||'').toUpperCase()}</td><td><div style="font-size:11px">${escH(f.name)}</div><div class="mono c-dim" style="font-size:9px">${escH(f.path)}</div></td><td>${(f.status===301||f.status===302)?`<span class="c-dim" style="font-size:10px">[${f.status}]</span>`:`<a href="${escH(f.url)}" target="_blank" class="c-cyan" style="font-size:10px">[${f.status}]</a>`}</td><td class="mono c-dim" style="font-size:9px;white-space:nowrap">${fmtBytes(f.size)}</td></tr>`;});
     h+='</tbody></table>';
     return h;
   }
@@ -578,10 +793,10 @@ function renderContent(id, data) {
     if(parts) h+=`<div style="margin-bottom:10px;font-size:11px">${parts}</div>`;
     const findings=data.findings||[];
     if(!findings.length) return h+'<div class="alert a-green">✓ No findings</div>';
-    h+='<table class="tbl"><thead><tr><th>Sev</th><th>Finding</th><th>URL</th></tr></thead><tbody>';
+    h+='<table class="tbl"><thead><tr><th>Sev</th><th>Finding</th><th>URL</th><th>Size</th></tr></thead><tbody>';
     findings.forEach(f=>{
       const cveLink=f.cve?`<a href="https://nvd.nist.gov/vuln/detail/${escH(f.cve)}" target="_blank" class="badge b-fail" style="font-size:8px;margin-left:4px">${escH(f.cve)}</a>`:'';
-      const srcBadge=f.source==='exploit_template'?'<span class="badge b-warn" style="font-size:8px">EXPLOIT</span>':f.source==='version_detection'?'<span class="badge b-purple" style="font-size:8px">VERSION</span>':f.source==='wp_plugin_cve'?'<span class="badge b-info" style="font-size:8px">WP PLUGIN</span>':'';
+      const srcBadge=f.source==='exploit_template'?'<span class="badge b-warn" style="font-size:8px">EXPLOIT</span>':f.source==='version_detection'?'<span class="badge b-purple" style="font-size:8px">VERSION</span>':f.source==='recent_cve'?'<span class="badge b-fail" style="font-size:8px">RECENT CVE</span>':f.source==='wp_plugin_cve'?'<span class="badge b-info" style="font-size:8px">WP PLUGIN</span>':'';
       h+=`<tr>
         <td style="color:${sc[f.severity]||'var(--text)'};font-weight:700;font-size:9px">${(f.severity||'').toUpperCase()}</td>
         <td style="font-size:11px">
@@ -593,6 +808,7 @@ function renderContent(id, data) {
             ? `<span class="c-dim">${escH((f.url||'').slice(0,40))}</span> <span style="font-size:9px">[${f.status}]</span>`
             : `<a href="${escH(f.url||f.matched_at||'#')}" target="_blank" style="color:var(--cyan)">${escH((f.url||'').slice(0,40))}</a> ${f.status?`[${f.status}]`:''}`}
         </td>
+        <td class="mono c-dim" style="font-size:9px;white-space:nowrap">${fmtBytes(f.size)}</td>
       </tr>`;
     });;
     h+='</tbody></table>';
@@ -919,6 +1135,201 @@ function renderContent(id, data) {
     h+='</div>';
     return h;
   }
+  case 'favicon':{
+    let h='';
+    if(data.error&&!data.favicon_found) return h+`<div class="alert a-yellow">${escH(data.error)}</div>`;
+    if(!data.favicon_found) return h+'<div class="c-dim">No favicon found</div>';
+    h+=`<div class="stat-row" style="margin-bottom:10px">
+      <div class="stat-box"><div class="stat-n c-cyan" style="font-size:16px">🎯</div><div class="stat-l">Found</div></div>
+      <div class="stat-box"><div class="stat-n c-dim" style="font-size:11px">${data.size_bytes||0}B</div><div class="stat-l">Size</div></div>
+      ${data.technology?`<div class="stat-box"><div class="stat-n c-yellow" style="font-size:11px">${escH(data.technology)}</div><div class="stat-l">Tech</div></div>`:''}
+    </div>`;
+    if(data.favicon_url) h+=kv('URL',`<a href="${escH(data.favicon_url)}" target="_blank" class="c-cyan" style="font-size:10px">${escH(data.favicon_url)}</a>`);
+    if(data.hash_shodan!==null&&data.hash_shodan!==undefined) h+=kv('Shodan hash',`<span class="mono c-yellow">${data.hash_shodan}</span>`);
+    if(data.hash_md5) h+=kv('MD5 hash',`<span class="mono c-dim" style="font-size:10px">${data.hash_md5}</span>`);
+    const links=data.search_links||{};
+    if(Object.keys(links).length){
+      h+='<div class="sec" style="margin-top:10px">🔍 Cross-Infrastructure Search</div>';
+      h+='<div style="display:flex;flex-direction:column;gap:5px;margin-top:6px">';
+      Object.entries(links).forEach(([name,url])=>{
+        h+=`<a href="${escH(url)}" target="_blank" style="display:flex;align-items:center;gap:8px;padding:5px 8px;background:var(--bg3);border:1px solid var(--border);border-radius:5px;text-decoration:none">
+          <span style="color:var(--text2);font-size:10px;min-width:70px">${escH(name)}</span>
+          <span style="color:var(--cyan);font-size:10px">Search servers with this favicon →</span>
+        </a>`;
+      });
+      h+='</div>';
+    }
+    return h;
+  }
+
+  case 'cloud_buckets':{
+    let h='';
+    const exposed=data.exposed||[];
+    const critical=exposed.filter(b=>b.severity==='critical');
+    const medium=exposed.filter(b=>b.severity==='medium');
+    h+=`<div class="stat-row" style="margin-bottom:10px">
+      <div class="stat-box"><div class="stat-n ${critical.length?'c-red':'c-green'}">${critical.length}</div><div class="stat-l">Public</div></div>
+      <div class="stat-box"><div class="stat-n ${medium.length?'c-yellow':'c-dim'}">${medium.length}</div><div class="stat-l">Exists (private)</div></div>
+      <div class="stat-box"><div class="stat-n c-dim" style="font-size:11px">${data.checked||0}</div><div class="stat-l">Probed</div></div>
+    </div>`;
+    if(!exposed.length) return h+'<div class="alert a-green">✓ No exposed cloud buckets found</div>';
+    if(critical.length){
+      h+='<div class="sec" style="color:var(--red)">☠ Publicly Accessible Buckets</div>';
+      critical.forEach(b=>{
+        h+=`<div class="alert a-red" style="margin-bottom:6px;padding:8px 12px">
+          <div style="font-weight:700;font-size:11px;font-family:monospace">${escH(b.bucket)}</div>
+          <div style="font-size:10px;color:var(--text2);margin-top:4px">
+            <span class="badge" style="background:rgba(248,81,73,.15);border:1px solid var(--red);font-size:9px;margin-right:6px">${escH(b.provider)}</span>
+            ${escH(b.status)}
+          </div>
+          ${b.files_exposed?`<div style="font-size:10px;color:var(--orange);margin-top:3px">📂 ${b.files_exposed} objects visible</div>`:''}
+          ${(b.sample_files||[]).length?`<div style="font-size:9px;font-family:monospace;color:var(--text3);margin-top:3px">${b.sample_files.map(f=>escH(f)).join(' · ')}</div>`:''}
+          <a href="${escH(b.url)}" target="_blank" style="display:block;margin-top:5px;font-size:9px;color:var(--cyan);font-family:monospace">${escH(b.url)}</a>
+        </div>`;
+      });
+    }
+    if(medium.length){
+      h+='<div class="sec" style="margin-top:8px">Bucket Names Confirmed (access denied)</div>';
+      h+='<table class="tbl"><thead><tr><th>Bucket</th><th>Provider</th><th></th></tr></thead><tbody>';
+      medium.forEach(b=>{
+        h+=`<tr>
+          <td class="mono" style="font-size:10px">${escH(b.bucket)}</td>
+          <td style="font-size:10px;color:var(--text2)">${escH(b.provider)}</td>
+          <td><a href="${escH(b.url)}" target="_blank" style="font-size:9px;color:var(--cyan)">→</a></td>
+        </tr>`;
+      });
+      h+='</tbody></table>';
+    }
+    return h;
+  }
+
+  case 'js_secrets':{
+    let h='';
+    const secrets=data.secrets||[];
+    const files=data.js_files||[];
+
+    // Summary stats
+    const bysev={critical:0,high:0,medium:0,low:0};
+    secrets.forEach(s=>{if(bysev[s.severity]!==undefined)bysev[s.severity]++;});
+    h+=`<div class="stat-row" style="margin-bottom:12px">
+      <div class="stat-box"><div class="stat-n ${secrets.length?'c-red':'c-green'}" style="font-size:28px">${secrets.length}</div><div class="stat-l">Total Secrets</div></div>
+      ${bysev.critical?`<div class="stat-box"><div class="stat-n c-red">${bysev.critical}</div><div class="stat-l">Critical</div></div>`:''}
+      ${bysev.high?`<div class="stat-box"><div class="stat-n c-orange">${bysev.high}</div><div class="stat-l">High</div></div>`:''}
+      ${bysev.medium?`<div class="stat-box"><div class="stat-n c-yellow">${bysev.medium}</div><div class="stat-l">Medium</div></div>`:''}
+      <div class="stat-box"><div class="stat-n c-dim">${files.length}</div><div class="stat-l">JS Files</div></div>
+    </div>`;
+
+    if(data.error) return h+`<div class="alert a-yellow">${escH(data.error)}</div>`;
+    if(!secrets.length) return h+'<div class="alert a-green">✓ No secrets found in JS files</div>';
+
+    const sc={'critical':'var(--red)','high':'var(--orange)','medium':'var(--yellow)','low':'var(--text2)'};
+
+    h+='<div class="sec" style="color:var(--red)">⚠ Secrets Detected (clear text)</div>';
+
+    secrets.forEach(s=>{
+      h+=`<div style="margin-bottom:10px;padding:10px 12px;background:var(--bg3);border:1px solid var(--border);border-left:3px solid ${sc[s.severity]||'var(--border)'};border-radius:5px">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+          <span style="font-size:9px;font-weight:700;color:${sc[s.severity]}">${(s.severity||'').toUpperCase()}</span>
+          <span style="font-size:11px;color:var(--text);font-weight:600">${escH(s.type)}</span>
+          <span class="mono" style="font-size:9px;color:var(--text2);margin-left:auto">${escH(s.file)}</span>
+        </div>
+        <div style="font-family:monospace;font-size:12px;color:var(--cyan);background:var(--bg);padding:6px 8px;border-radius:4px;word-break:break-all;margin-bottom:${s.line?'5':'0'}px">${escH(s.value)}</div>
+        ${s.line?`<div style="font-family:monospace;font-size:9px;color:var(--text3);padding:4px 8px;background:rgba(0,0,0,.3);border-radius:3px;word-break:break-all;white-space:pre-wrap">${escH(s.line.slice(0,120))}</div>`:''}
+      </div>`;
+    });
+
+    if(files.length){
+      h+='<div class="sec" style="margin-top:10px">JS Files Scanned</div>';
+      h+='<div style="display:flex;flex-direction:column;gap:2px">';
+      files.slice(0,15).forEach(f=>{
+        h+=`<div class="mono c-dim" style="font-size:9px;padding:2px 4px">${escH(f.split('?')[0].slice(-70))}</div>`;
+      });
+      h+='</div>';
+    }
+    return h;
+  }
+
+  case 'content_intel':{
+    let h='';
+    if(data.error) return `<div class="alert a-yellow">${escH(data.error)}</div>`;
+    const cat=data.categories||{};
+    const cnt=data.counts||{};
+    const ss=data.sources_scanned||{};
+    h+=`<div class="stat-row" style="margin-bottom:12px">
+      <div class="stat-box"><div class="stat-n ${data.total?'c-cyan':'c-dim'}" style="font-size:28px">${data.total||0}</div><div class="stat-l">Items Extracted</div></div>
+      <div class="stat-box"><div class="stat-n c-dim">${ss.js_files||0}</div><div class="stat-l">JS Files</div></div>
+      <div class="stat-box"><div class="stat-n c-dim">${ss.inline_scripts||0}</div><div class="stat-l">Inline</div></div>
+    </div>`;
+    if(!data.total) return h+'<div class="alert a-green">✓ Nothing interesting extracted from HTML/JS</div>';
+
+    // group config: key -> [label, color, icon, isSensitive]
+    const groups=[
+      ['databases','Database URIs','var(--red)','🗄️'],
+      ['cloud_storage','Cloud Storage','var(--orange)','☁️'],
+      ['api_endpoints','API Endpoints','var(--purple)','🔌'],
+      ['sensitive','Sensitive Info','var(--red)','🔐'],
+      ['urls_external','External Sources','var(--yellow)','🌐'],
+      ['urls_internal','Internal URLs','var(--cyan)','🔗'],
+      ['endpoints','Endpoints / Paths','var(--cyan)','📍'],
+      ['internal_hosts','Internal Hosts','var(--orange)','🏠'],
+      ['ip_addresses','IP Addresses','var(--text2)','🔢'],
+      ['emails','Emails','var(--text2)','✉️'],
+    ];
+    const sevc={critical:'var(--red)',high:'var(--orange)',medium:'var(--yellow)',low:'var(--text2)'};
+    groups.forEach(([key,label,color,ico])=>{
+      const items=cat[key]||[];
+      if(!items.length) return;
+      h+=`<div class="sec" style="color:${color};margin-top:10px">${ico} ${label} <span class="c-dim" style="font-weight:400">(${items.length}${cnt[key]>=200?'+':''})</span></div>`;
+      h+='<div style="display:flex;flex-direction:column;gap:3px">';
+      items.slice(0,40).forEach(it=>{
+        const kindBadge=it.kind?`<span class="badge" style="font-size:8px;background:var(--bg3);border:1px solid var(--border);color:${sevc[it.severity]||'var(--text2)'}">${escH(it.kind)}</span>`:'';
+        const src=it.source?`<span class="mono c-dim" style="font-size:8px;margin-left:auto;white-space:nowrap;flex-shrink:0">${escH(it.source)}</span>`:'';
+        const topRow=(kindBadge||src)?`<div style="display:flex;align-items:center;gap:6px;margin-bottom:3px">${kindBadge}${src}</div>`:'';
+        h+=`<div style="font-family:monospace;font-size:10px;background:var(--bg3);border:1px solid var(--border);border-radius:4px;padding:5px 8px">
+          ${topRow}<div style="color:var(--text);overflow-wrap:anywhere;white-space:pre-wrap;line-height:1.45">${escH(it.value)}</div>
+        </div>`;
+      });
+      if(items.length>40) h+=`<div class="c-dim" style="font-size:9px;padding:2px 4px">+ ${items.length-40} more…</div>`;
+      h+='</div>';
+    });
+    return h;
+  }
+
+  case 'api_fuzzer':{
+    let h='';
+    const eps=data.endpoints||[];
+    const gql=data.graphql;
+    h+=`<div class="stat-row" style="margin-bottom:10px">
+      <div class="stat-box"><div class="stat-n ${data.total?'c-red':'c-green'}">${data.total||0}</div><div class="stat-l">Endpoints Found</div></div>
+      <div class="stat-box"><div class="stat-n c-dim">${data.base_found||'—'}</div><div class="stat-l">API Base</div></div>
+    </div>`;
+    if(data.error) return h+`<div class="alert a-yellow">${escH(data.error)}</div>`;
+    if(gql){
+      const gc=gql.severity==='high'?'var(--orange)':'var(--yellow)';
+      h+=`<div class="alert" style="border:1px solid var(--border);margin-bottom:8px;padding:7px 10px">
+        <div style="font-weight:700;font-size:11px;color:${gc}">⚡ GraphQL — ${escH(gql.path)} <span class="mono c-dim" style="font-size:9px;font-weight:400">${fmtBytes(gql.size)}</span></div>
+        <div style="font-size:10px;color:var(--text2);margin-top:3px">${escH(gql.detail)}</div>
+      </div>`;
+    }
+    if(!eps.length&&!gql) return h+'<div class="alert a-green">✓ No API endpoints found</div>';
+    if(eps.length){
+      const sc={'critical':'var(--red)','high':'var(--orange)','medium':'var(--yellow)','low':'var(--text2)'};
+      h+='<div class="sec">API Endpoints</div>';
+      h+='<table class="tbl"><thead><tr><th>SEV</th><th>Endpoint</th><th>Name</th><th>Status</th><th>Size</th></tr></thead><tbody>';
+      eps.forEach(e=>{
+        h+=`<tr>
+          <td style="color:${sc[e.severity]||'var(--text)'};font-weight:700;font-size:9px">${(e.severity||'').toUpperCase()}</td>
+          <td class="mono" style="font-size:10px;color:var(--cyan)">${escH(e.path)}</td>
+          <td style="font-size:10px">${escH(e.name)}</td>
+          <td><span class="badge" style="background:var(--bg3);border:1px solid var(--border);font-size:9px">[${e.status}]</span></td>
+          <td class="mono c-dim" style="font-size:9px;white-space:nowrap">${fmtBytes(e.size)}</td>
+        </tr>`;
+      });
+      h+='</tbody></table>';
+    }
+    return h;
+  }
+
   default:
     return `<pre style="font-size:10px;white-space:pre-wrap;color:var(--text2)">${escH(JSON.stringify(data,null,2).slice(0,500))}</pre>`;
   }
@@ -1008,34 +1419,48 @@ function fillCard(id, data) {
 }
 
 // ── Scan ──
+function newScanId(){ return (crypto.randomUUID?crypto.randomUUID():Date.now()+'-'+Math.random().toString(16).slice(2)); }
+
 async function startScan(fast) {
   const domain = document.getElementById('domInput').value.trim();
   if (!domain || scanning) return;
   scanning = true; currentDomain = domain;
-  window._scanResults = {};  // clear previous scan results
+  window._scanResults = {};
   completedCount = 0; errorCount = 0;
+  runningSet.clear();
 
+  const myId = scanId = newScanId();
+  scanAbort = new AbortController();
+
+  // ── enter scanning UI mode ──
+  document.body.classList.add('scanning');
+  document.getElementById('stopBtn').classList.add('on');
   const scanBtn = document.getElementById('scanBtn');
   const scanBtnTxt = document.getElementById('scanBtnTxt');
   scanBtn.disabled = true; scanBtn.classList.add('busy');
   scanBtnTxt.textContent = 'SCANNING…';
+  document.getElementById('domInput').blur();
 
   document.getElementById('welcome')?.remove();
   scanGrid.innerHTML = '';
+  summaryBar.classList.remove('on'); summaryBar.innerHTML = '';
   document.getElementById('dorksPanel').innerHTML = '<div style="color:var(--text3);font-size:11px;text-align:center;padding:20px 0">Generating dorks…</div>';
   document.getElementById('osintPanel').innerHTML = '<div style="color:var(--text3);font-size:11px;text-align:center;padding:20px 0">Generating links…</div>';
 
   const mods = [...SCAN_ORDER.filter(m => activeModules.has(m)), ...Object.keys(MODULES).filter(m => activeModules.has(m) && !SCAN_ORDER.includes(m))];
   const toRun = fast ? mods.filter(m => !SLOW.has(m)) : mods;
   totalCount = toRun.length;
+  toRun.forEach(m => runningSet.add(m));
 
   prog.classList.add('on'); progFill.style.width = '0%';
   statusBar.classList.add('on'); sDot.className = 's-dot';
+  sCancel.classList.add('on'); sExport.classList.remove('on'); sReport.classList.remove('on');
   sTxt.innerHTML = `Scanning <b>${escH(domain)}</b> — ${toRun.length} modules in parallel`;
+  startTimer();
   updateCounts();
 
-  // Reset pills
-  pillBar.querySelectorAll('.pill').forEach(p => { if(activeModules.has(p.dataset.id)){p.classList.remove('done','running');p.classList.add('on');} });
+  // Reset pills to running for active modules
+  pillBar.querySelectorAll('.pill').forEach(p => { p.classList.remove('done','running','err','on'); if(activeModules.has(p.dataset.id)) p.classList.add('on'); });
 
   // Pre-create cards in logical order (skip dorks/osint — they go in right panel)
   toRun.filter(id => id !== 'dorks' && id !== 'osint').forEach(id => {
@@ -1049,7 +1474,8 @@ async function startScan(fast) {
     const resp = await fetch('/api/scan', {
       method: 'POST',
       headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({domain, modules: toRun, fast})
+      body: JSON.stringify({domain, modules: toRun, fast, scan_id: myId}),
+      signal: scanAbort.signal
     });
     const reader = resp.body.getReader();
     const decoder = new TextDecoder();
@@ -1058,20 +1484,22 @@ async function startScan(fast) {
     while (true) {
       const {done, value} = await reader.read();
       if (done) break;
+      if (scanId !== myId) break;   // a new scan/reset superseded this one
       buffer += decoder.decode(value, {stream: true});
       const lines = buffer.split('\n');
       buffer = lines.pop();
 
       for (const line of lines) {
-        if (!line.startsWith('data: ')) continue;
+        if (!line.startsWith('data: ')) continue;   // skip heartbeats/comments
         try {
           const msg = JSON.parse(line.slice(6));
           if (msg.type === 'done') {
+            runningSet.delete(msg.module);
             completedCount++;
-            if (msg.data?.error) errorCount++;
-            setPill(msg.module, 'done');
+            const isErr = !!(msg.data && msg.data.error);
+            if (isErr) errorCount++;
+            setPill(msg.module, isErr ? 'err' : 'done');
 
-            // Store results for cross-card use
             if(!window._scanResults) window._scanResults={};
             window._scanResults[msg.module]=msg.data;
 
@@ -1082,37 +1510,512 @@ async function startScan(fast) {
             } else {
               fillCard(msg.module, msg.data);
             }
-            // Re-render breachintel when email_harvest finishes (stealer injection)
             if(msg.module==='email_harvest'&&window._scanResults&&window._scanResults['breachintel']){
               fillCard('breachintel', window._scanResults['breachintel']);
             }
 
             progFill.style.width = (completedCount/totalCount*100)+'%';
-            sTxt.innerHTML = `Scanning <b>${escH(domain)}</b> — ${completedCount}/${totalCount} complete`;
+            const still = runningSet.size;
+            sTxt.innerHTML = `Scanning <b>${escH(domain)}</b> — ${completedCount}/${totalCount} done${still?` · ${still} running`:''}`;
             updateCounts();
           } else if (msg.type === 'complete') {
-            sTxt.innerHTML = `<b>${escH(domain)}</b> — scan complete in ${msg.duration}`;
-            sDot.className = 's-dot done';
-            document.getElementById('hdrStat').innerHTML = `<span>${escH(domain)}</span> · ${totalCount} modules · ${msg.duration}`;
+            finalizeComplete(domain, msg.duration, msg.timed_out);
+          } else if (msg.type === 'stopped') {
+            // backend acknowledged a stop it initiated (rare) — just tidy up
+            finalizeComplete(domain, msg.duration, false);
           }
         } catch(e){}
       }
     }
   } catch(e) {
+    if (e.name === 'AbortError' || scanId !== myId) return;   // user stopped — handled elsewhere
     sTxt.innerHTML = `<span style="color:var(--red)">Scan failed: ${escH(e.message)}</span>`;
+    toast('err','Scan failed', e.message);
   }
 
+  // Stream ended. If it wasn't stopped/superseded and we never got 'complete',
+  // finalize defensively so nothing is left showing "running".
+  if (scanId === myId && scanning) {
+    finalizeComplete(domain, hdrTimerVal.textContent, false);
+  }
+}
+
+// ── Stop a running scan and reset everything ──
+async function stopScan() {
+  if (!scanning) return;
+  const sid = scanId;
+  scanId = null;              // invalidate the in-flight loop
+  try { scanAbort?.abort(); } catch(e){}
+  try {
+    await fetch('/api/stop', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({scan_id: sid})
+    });
+  } catch(e){}
+  resetScanUI();
+  toast('warn','Scan stopped','Everything reset — ready for a new scan');
+}
+
+// ── Reset button: stop if running, then wipe back to a clean slate ──
+function resetScan() {
+  if (scanning) { stopScan(); return; }
+  resetScanUI();
+  toast('ok','Reset','Ready for a new scan');
+}
+
+// ── Teardown shared by stop + reset ──
+function resetScanUI() {
   scanning = false;
+  document.body.classList.remove('scanning');
+  document.getElementById('cmpOverlay').classList.remove('on');
+  document.getElementById('stopBtn').classList.remove('on');
+  const scanBtn = document.getElementById('scanBtn');
   scanBtn.disabled = false; scanBtn.classList.remove('busy');
-  scanBtnTxt.textContent = 'SCAN';
+  document.getElementById('scanBtnTxt').textContent = 'SCAN';
+  stopTimer();
+  runningSet.clear();
+  scanAbort = null; scanId = null;
+
+  prog.classList.remove('on'); progFill.style.width = '0%';
+  statusBar.classList.remove('on'); sDot.className = 's-dot';
+  sCancel.classList.remove('on'); sExport.classList.remove('on'); sReport.classList.remove('on');
+  sElapsed.textContent = ''; sCounts.innerHTML = '';
+  summaryBar.classList.remove('on'); summaryBar.innerHTML = '';
+  hdrTimer.classList.remove('on','done');
+  document.getElementById('hdrStat').innerHTML = '';
+
+  scanGrid.innerHTML = `<div class="welcome" id="welcome"><div class="welcome-icon">☠️</div><div class="welcome-sub">Enter a domain to start reconnaissance.<br>Cards stream in as each module completes.<br>Try <code>example.com</code> or <code>target.org</code></div></div>`;
+  document.getElementById('dorksPanel').innerHTML = '<div style="color:var(--text3);font-size:11px;text-align:center;padding:20px 0">Run a scan to generate dorks</div>';
+  document.getElementById('osintPanel').innerHTML = '<div style="color:var(--text3);font-size:11px;text-align:center;padding:20px 0">Run a scan to generate links</div>';
+  window._scanResults = {};
+
+  pillBar.querySelectorAll('.pill').forEach(p => { p.classList.remove('running','done','err','on'); if(activeModules.has(p.dataset.id)) p.classList.add('on'); });
+}
+
+// ── Natural completion finalize (keeps results on screen) ──
+function finalizeComplete(domain, duration, timedOut) {
+  scanning = false;
+  document.body.classList.remove('scanning');
+  document.getElementById('stopBtn').classList.remove('on');
+  const scanBtn = document.getElementById('scanBtn');
+  scanBtn.disabled = false; scanBtn.classList.remove('busy');
+  document.getElementById('scanBtnTxt').textContent = 'SCAN';
+  sCancel.classList.remove('on');
+  stopTimer();
+  scanAbort = null;
+
   progFill.style.width = '100%';
+  sDot.className = 's-dot done';
+  hdrTimer.classList.add('done');
+
+  // Defensive: resolve any pill still visually "running".
+  pillBar.querySelectorAll('.pill.running').forEach(p => { p.classList.remove('running'); p.classList.add('done'); });
+
+  sTxt.innerHTML = `<b>${escH(domain)}</b> — scan ${timedOut?'finished (some modules timed out)':'complete'} in ${duration}`;
+  document.getElementById('hdrStat').innerHTML = `<span>${escH(domain)}</span> · ${completedCount}/${totalCount} · ${duration}`;
+  sExport.classList.add('on');
+  sReport.classList.add('on');
+  buildSummary();
+  showCompletionModal(domain, duration, timedOut);
+}
+
+// ── Completion modal ("scan finished — generate a report?") ──
+function showCompletionModal(domain, duration, timedOut) {
+  const R = window._scanResults || {};
+  // severity tally across findings-bearing modules
+  const t = {critical:0, high:0, medium:0, low:0};
+  const bump = arr => (arr||[]).forEach(f => { const s=(f.severity||'').toLowerCase(); if(s in t) t[s]++; });
+  bump(R.nuclei?.findings); bump(R.endpoints?.findings); bump(R.api_fuzzer?.endpoints); bump(R.js_secrets?.secrets);
+  const totalFindings = t.critical+t.high+t.medium+t.low;
+
+  document.getElementById('cmpSub').innerHTML =
+    `<b>${escH(domain)}</b> · ${completedCount}/${totalCount} modules · ${duration}` +
+    (timedOut ? ' · some timed out' : '');
+
+  const stat = (n, l, c) => `<div class="cmp-stat"><div class="n" style="color:${c}">${n}</div><div class="l">${l}</div></div>`;
+  document.getElementById('cmpStats').innerHTML =
+    stat(totalFindings, 'findings', 'var(--text)') +
+    (t.critical ? stat(t.critical, 'critical', 'var(--red)') : '') +
+    (t.high ? stat(t.high, 'high', 'var(--orange)') : '') +
+    (errorCount ? stat(errorCount, 'errors', 'var(--yellow)') : '');
+
+  document.getElementById('cmpOverlay').classList.add('on');
+}
+
+function closeCompletionModal() {
+  document.getElementById('cmpOverlay').classList.remove('on');
+}
+
+// ── Live elapsed clock ──
+function startTimer() {
+  scanStartTs = Date.now();
+  hdrTimer.classList.remove('done'); hdrTimer.classList.add('on');
+  const tick = () => {
+    const s = ((Date.now()-scanStartTs)/1000).toFixed(1)+'s';
+    hdrTimerVal.textContent = s;
+    sElapsed.innerHTML = `· <b>${s}</b>`;
+  };
+  tick();
+  scanTimer = setInterval(tick, 100);
+}
+function stopTimer() { if (scanTimer) { clearInterval(scanTimer); scanTimer = null; } }
+
+// ── Completion summary chips ──
+function buildSummary() {
+  const r = window._scanResults || {};
+  const chips = [];
+  const add = (cls, ico, val, lbl) => chips.push(`<div class="sum-chip ${cls}"><span class="sc-ico">${ico}</span><b>${val}</b> ${lbl}</div>`);
+  add('', '📦', `${completedCount}/${totalCount}`, 'modules');
+  let crit = 0, high = 0;
+  const nc = r.nuclei?.severity_counts || {}; crit += nc.critical||0; high += nc.high||0;
+  const ec = r.endpoints?.severity_counts || {}; crit += ec.critical||0; high += ec.high||0;
+  const cves = r.shodan?.summary?.total_cves || 0;
+  if (crit) add('crit', '☠', crit, 'critical');
+  if (high) add('warn', '▲', high, 'high');
+  if (cves) add('crit', '🐛', cves, 'CVEs');
+  const ports = r.ports?.open?.length || 0; if (ports) add('warn', '🚪', ports, 'open ports');
+  const subs = r.subdomains?.total || 0; if (subs) add('', '🗺️', subs, 'subdomains');
+  const bs = r.breachintel?.summary || {}; const leaks = (bs.total_infostealer_hits||0)+(bs.total_employees_leaked||0);
+  if (leaks) add('crit', '💀', leaks, 'leaked creds');
+  const grade = r.headers?.grade; if (grade) add((grade==='A'||grade==='B')?'ok':'warn', '🛡️', grade, 'headers');
+  if (errorCount) add('warn', '⚠', errorCount, errorCount===1?'error':'errors');
+  summaryBar.innerHTML = chips.join('');
+  summaryBar.classList.add('on');
+}
+
+// ── Export results as JSON ──
+function exportResults() {
+  const data = window._scanResults || {};
+  if (!Object.keys(data).length) { toast('warn','Nothing to export','Run a scan first'); return; }
+  const payload = { domain: currentDomain, generated: new Date().toISOString(), modules: data };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], {type:'application/json'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `kumo_${(currentDomain||'scan').replace(/[^a-z0-9.\-]/gi,'_')}.json`;
+  a.click();
+  URL.revokeObjectURL(url);
+  toast('ok','Exported', a.download);
+}
+
+// ── Generate a standalone HTML security report ──
+function generateReport() {
+  const R = window._scanResults || {};
+  if (!Object.keys(R).length) { toast('warn','Nothing to report','Run a scan first'); return; }
+
+  const esc = escH;
+  const sevRank = {critical:0, high:1, medium:2, low:3, info:4};
+  const sevColor = {critical:'#e5484d', high:'#f76808', medium:'#e3b341', low:'#8b949e', info:'#3b82f6'};
+  const SKIP_KEYS = new Set(['html','raw','body','screenshot','logo_url','favicon','content','snapshot',
+    'parsed','api_data','ip_data','json','sources_failed','q','per_page','page','normal_status','probe_status']);
+  const isObj = v => v && typeof v === 'object' && !Array.isArray(v);
+  const pretty = k => esc(String(k).replace(/_/g,' ').replace(/\b\w/g, c => c.toUpperCase()));
+  const pick = (o, ...keys) => { for (const k of keys){ if (o && o[k]!=null && o[k]!=='') return o[k]; } return null; };
+
+  function fmtVal(v){
+    if (v==null || v==='') return '<span class="muted">—</span>';
+    if (typeof v==='boolean') return v ? '<span class="ok">✓ yes</span>' : '<span class="muted">✗ no</span>';
+    if (typeof v==='number') return String(v);
+    if (typeof v==='string'){ const s = v.length>400 ? v.slice(0,400)+'…' : v; return esc(s); }
+    return esc(JSON.stringify(v).slice(0,200));
+  }
+
+  function tableFromArray(arr){
+    if (!arr.length) return '';
+    const objRows = arr.filter(isObj);
+    if (!objRows.length){
+      const shown = arr.slice(0,300);
+      return '<div class="chips">' + shown.map(x=>`<span class="chip">${esc(String(x))}</span>`).join('') + '</div>' +
+             (arr.length>300 ? `<div class="muted">+ ${arr.length-300} more</div>` : '');
+    }
+    const keys = [];
+    objRows.slice(0,80).forEach(o => Object.keys(o).forEach(k => { if(!keys.includes(k) && !SKIP_KEYS.has(k)) keys.push(k); }));
+    const cols = keys.slice(0,7);
+    const rows = arr.slice(0,80);
+    let h = '<table><thead><tr>' + cols.map(k=>`<th>${pretty(k)}</th>`).join('') + '</tr></thead><tbody>';
+    rows.forEach(o=>{
+      h += '<tr>' + cols.map(k=>{
+        let v = isObj(o) ? o[k] : '';
+        if (isObj(v) || Array.isArray(v)) v = JSON.stringify(v).slice(0,90);
+        return `<td>${fmtVal(v)}</td>`;
+      }).join('') + '</tr>';
+    });
+    h += '</tbody></table>';
+    if (arr.length>80) h += `<div class="muted">+ ${arr.length-80} more rows</div>`;
+    return h;
+  }
+
+  function kvFromObject(obj, depth){
+    depth = depth || 0;
+    const scalars = [], complex = [];
+    Object.keys(obj).forEach(k=>{
+      if (SKIP_KEYS.has(k)) return;
+      const v = obj[k];
+      if (v==null || v==='') return;
+      if (Array.isArray(v)){ if (v.length) complex.push([k,v]); }
+      else if (isObj(v)){ if (Object.keys(v).length) complex.push([k,v]); }
+      else scalars.push([k,v]);
+    });
+    let h = '';
+    if (scalars.length){
+      h += '<div class="kv-grid">' + scalars.map(([k,v]) =>
+        `<div class="kv"><div class="kv-k">${pretty(k)}</div><div class="kv-v">${fmtVal(v)}</div></div>`).join('') + '</div>';
+    }
+    if (depth < 2) complex.forEach(([k,v])=>{
+      h += `<h4>${pretty(k)} <span class="muted">(${Array.isArray(v)?v.length:'obj'})</span></h4>`;
+      h += Array.isArray(v) ? tableFromArray(v) : kvFromObject(v, depth+1);
+    });
+    return h || '<div class="muted">No data</div>';
+  }
+
+  function renderAny(data){
+    if (data==null) return '<div class="muted">No data</div>';
+    if (Array.isArray(data)) return tableFromArray(data);
+    if (isObj(data)) return kvFromObject(data, 0);
+    return `<div>${fmtVal(data)}</div>`;
+  }
+
+  // ── collect findings (vuln + endpoints + api) ──
+  const rows = [];
+  const push = (mod, f) => rows.push({
+    mod, severity: (f.severity||'info').toLowerCase(),
+    name: f.name || f.path || '—', url: f.url || f.matched_at || '',
+    status: (f.status===''||f.status==null) ? '' : f.status, size: f.size,
+    cve: f.cve || (/(CVE-\d{4}-\d+)/.exec(f.description||'')||[])[1] || '',
+    desc: f.description || ''
+  });
+  (R.nuclei?.findings||[]).forEach(f => push('Vuln Scan', f));
+  (R.endpoints?.findings||[]).forEach(f => push('Endpoints', f));
+  (R.api_fuzzer?.endpoints||[]).forEach(f => push('API Fuzzer', f));
+  if (R.api_fuzzer?.graphql) push('API Fuzzer', {severity:R.api_fuzzer.graphql.severity, name:'GraphQL — '+R.api_fuzzer.graphql.path, url:'', status:R.api_fuzzer.graphql.status, size:R.api_fuzzer.graphql.size, description:R.api_fuzzer.graphql.detail});
+  rows.sort((a,b)=> (sevRank[a.severity]??9)-(sevRank[b.severity]??9));
+
+  const tally = {critical:0,high:0,medium:0,low:0,info:0};
+  rows.forEach(r => { tally[r.severity] = (tally[r.severity]||0)+1; });
+  // include js_secrets + content_intel sensitive in tally
+  (R.js_secrets?.secrets||[]).forEach(s=>{ const k=(s.severity||'info').toLowerCase(); if(k in tally) tally[k]++; });
+
+  const findingRows = rows.map(r => {
+    const sc = sevColor[r.severity]||'#8b949e';
+    const cve = r.cve ? `<a href="https://nvd.nist.gov/vuln/detail/${esc(r.cve)}" style="color:#ff6b64;font-weight:600">${esc(r.cve)}</a>` : '';
+    const urlCell = r.url ? `<a href="${esc(r.url)}" style="color:#58a6ff;word-break:break-all">${esc(r.url)}</a>` : '<span class="muted">—</span>';
+    return `<tr>
+      <td><span class="sev" style="background:${sc}1a;color:${sc};border:1px solid ${sc}55">${esc(r.severity.toUpperCase())}</span></td>
+      <td class="nowrap muted small">${esc(r.mod)}</td>
+      <td><div class="strong">${esc(r.name)} ${cve}</div>${r.desc?`<div class="muted small mt2">${esc(r.desc)}</div>`:''}</td>
+      <td class="mono small">${urlCell}</td>
+      <td class="center mono small">${r.status!==''?esc(String(r.status)):'—'}</td>
+      <td class="right mono small nowrap">${fmtBytes(r.size)}</td>
+    </tr>`;
+  }).join('');
+
+  // ── target overview (curated, defensive) ──
+  const geo=R.geo||{}, who=R.whois||{}, ssl=R.ssl||{}, hdr=R.headers||{}, waf=R.wafw00f||{}, ww=R.whatweb||{}, dns=R.dns||{};
+  const ov = [];
+  const addOv = (label,val)=>{ if(val!=null && val!=='' ) ov.push([label, val]); };
+  addOv('IP address', pick(geo,'ip'));
+  const loc = [pick(geo,'city'), pick(geo,'region'), pick(geo,'country')].filter(Boolean).join(', ');
+  addOv('Location', loc);
+  addOv('ASN / Org', [pick(geo,'asn'), pick(geo,'org','asn_name','isp')].filter(Boolean).join(' · '));
+  addOv('Registrar', pick(who,'registrar'));
+  addOv('Registered', pick(who,'registration'));
+  addOv('Expires', pick(who,'expiration'));
+  addOv('SSL issuer', pick(ssl,'issuer','issuer_cn'));
+  const sslexp = pick(ssl,'valid_until','not_after'); const ssldays = pick(ssl,'days_left');
+  addOv('SSL expiry', sslexp ? (sslexp + (ssldays!=null?` (${ssldays}d)`:'')) : null);
+  addOv('SSL grade', pick(ssl,'grade'));
+  addOv('Headers grade', pick(hdr,'grade'));
+  addOv('Server', pick(hdr,'server'));
+  addOv('WAF', (pick(waf,'waf_found')||pick(waf,'detected')) ? (pick(waf,'waf')||'detected') : null);
+  addOv('Tech / CMS', pick(ww,'cms') || (Array.isArray(pick(ww,'technology'))? ww.technology.slice(0,4).join(', ') : pick(ww,'technology')));
+  const es = dns.email_security||{}; addOv('Email security', pick(es,'grade') ? `Grade ${es.grade}` : null);
+  const overviewGrid = ov.length ? ('<div class="kv-grid">' + ov.map(([k,v])=>`<div class="kv"><div class="kv-k">${esc(k)}</div><div class="kv-v">${esc(String(v))}</div></div>`).join('') + '</div>') : '';
+
+  // ── content intelligence section ──
+  let ciSection = '';
+  const CI = R.content_intel;
+  if (CI && CI.categories && CI.total){
+    const cc = CI.categories, cn = CI.counts||{};
+    const chip = (label,color,n) => n ? `<span class="pill" style="background:${color}1a;color:${color};border:1px solid ${color}55">${esc(label)}: <b>${n}</b></span>` : '';
+    const listBlock = (title, items, opts) => {
+      opts = opts||{}; const lim = opts.limit||40;
+      if (!items || !items.length) return '';
+      const body = items.slice(0,lim).map(it=>{
+        const k = opts.kind ? `<td class="nowrap muted small">${esc(it.kind||'')}</td>` : '';
+        return `<tr>${k}<td class="mono small break">${esc(it.value)}</td><td class="muted mono tiny nowrap">${esc(it.source||'')}</td></tr>`;
+      }).join('');
+      const kh = opts.kind ? '<th>Type</th>' : '';
+      return `<h4>${esc(title)} <span class="muted">(${items.length})</span></h4><table><thead><tr>${kh}<th>Value</th><th>Source</th></tr></thead><tbody>${body}</tbody></table>` +
+             (items.length>lim ? `<div class="muted">+ ${items.length-lim} more</div>` : '');
+    };
+    ciSection = section('content-intel','Content Intelligence — JS/HTML Extraction',
+      '<div class="pills">' + chip('Endpoints','#58a6ff',cn.endpoints)+chip('Internal URLs','#33b3c9',cn.urls_internal)+
+        chip('External hosts','#e3b341',cn.urls_external)+chip('API endpoints','#8b5cf6',cn.api_endpoints)+
+        chip('Databases','#e5484d',cn.databases)+chip('Cloud storage','#f76808',cn.cloud_storage)+
+        chip('Sensitive','#e5484d',cn.sensitive)+chip('Emails','#6b7280',cn.emails)+
+        chip('IPs','#6b7280',cn.ip_addresses)+chip('Internal hosts','#f76808',cn.internal_hosts) + '</div>' +
+      listBlock('Database URIs', cc.databases, {kind:true}) +
+      listBlock('Cloud Storage', cc.cloud_storage, {kind:true}) +
+      listBlock('API Endpoints', cc.api_endpoints, {limit:30}) +
+      listBlock('Sensitive Information', cc.sensitive, {kind:true}) +
+      listBlock('External / Third-party Hosts', cc.urls_external, {limit:40}) +
+      listBlock('Endpoints & Paths', cc.endpoints, {limit:30}));
+  }
+
+  // ── per-module adaptive detail ──
+  const MODORDER = ['dns','geo','whois','ssl','headers','wafw00f','ports','whatweb','robots','security_txt',
+    'shodan','censys','subdomains','brute','wayback','email_harvest','breachintel','favicon','cloud_buckets',
+    'js_secrets','screenshot','dorks','osint'];
+  const CURATED = new Set(['nuclei','endpoints','api_fuzzer','content_intel']);
+  const modName = id => (typeof MODULES!=='undefined' && MODULES[id]) || id.replace(/_/g,' ');
+  const modIcon = {dns:'📡',geo:'📍',whois:'🌐',ssl:'🔒',headers:'🛡️',wafw00f:'🧱',ports:'🚪',whatweb:'🕵️',
+    robots:'🤖',shodan:'🔭',censys:'🔬',subdomains:'🗺️',brute:'🔨',wayback:'📚',email_harvest:'📧',
+    breachintel:'💀',favicon:'🎯',cloud_buckets:'☁️',js_secrets:'🔑',screenshot:'🖼️',dorks:'🔍',osint:'🔗'};
+  const seen = new Set();
+  const order = MODORDER.filter(id => R[id] !== undefined);
+  Object.keys(R).forEach(id => { if(!order.includes(id) && !CURATED.has(id)) order.push(id); });
+  let moduleSections = '';
+  order.forEach(id => {
+    if (CURATED.has(id) || seen.has(id)) return; seen.add(id);
+    const d = R[id];
+    if (d==null) return;
+    let inner;
+    if (isObj(d) && d.error) inner = `<div class="warnbox">⚠ ${esc(d.error)}</div>`;
+    else inner = renderAny(d);
+    moduleSections += section('mod-'+id, (modIcon[id]?modIcon[id]+' ':'') + modName(id), inner);
+  });
+
+  // ── severity bar (SVG) ──
+  const totFind = rows.length;
+  const barTotal = (tally.critical+tally.high+tally.medium+tally.low+tally.info)||1;
+  let x=0; const segs = ['critical','high','medium','low','info'].map(s=>{
+    const w = (tally[s]/barTotal)*100; const seg = w>0 ? `<rect x="${x}%" y="0" width="${w}%" height="18" fill="${sevColor[s]}"><title>${s}: ${tally[s]}</title></rect>` : ''; x+=w; return seg;
+  }).join('');
+  const sevBar = `<svg viewBox="0 0 100 18" preserveAspectRatio="none" width="100%" height="18" style="border-radius:6px;overflow:hidden">${segs}</svg>`;
+
+  const cards = ['critical','high','medium','low','info'].map(s =>
+    `<div class="card"><div class="num" style="color:${sevColor[s]}">${tally[s]||0}</div><div class="lbl">${s.toUpperCase()}</div></div>`).join('');
+
+  // ── recon highlight chips ──
+  const stat = [];
+  const spush=(l,v,c)=>{ if(v) stat.push(`<span class="pill" style="background:${c}14;color:${c};border:1px solid ${c}44">${esc(l)}: <b>${v}</b></span>`); };
+  spush('Open ports', (R.ports?.open||[]).length, '#f76808');
+  spush('Subdomains', R.subdomains?.total || (R.subdomains?.subdomains||[]).length, '#58a6ff');
+  spush('CVEs', R.shodan?.summary?.total_cves, '#e5484d');
+  const bs=R.breachintel?.summary||{}; spush('Leaked creds', (bs.total_infostealer_hits||0)+(bs.total_employees_leaked||0), '#e5484d');
+  spush('JS secrets', R.js_secrets?.total, '#f76808');
+  spush('Intel items', R.content_intel?.total, '#8b5cf6');
+  spush('Emails', (R.email_harvest?.emails||[]).length, '#6b7280');
+
+  // ── nav / toc ──
+  const navItems = [['exec','Summary'],['overview','Overview'],['findings','Findings']];
+  if (ciSection) navItems.push(['content-intel','Content Intel']);
+  order.forEach(id=>{ if(!CURATED.has(id) && R[id]!=null) navItems.push(['mod-'+id, modName(id)]); });
+  const nav = '<nav class="toc">' + navItems.map(([id,label])=>`<a href="#${id}">${esc(label)}</a>`).join('') + '</nav>';
+
+  function section(id,title,inner){
+    return `<section id="${id}"><h2>${title}</h2>${inner}</section>`;
+  }
+
+  const now = new Date();
+  const domain = currentDomain || 'target';
+  const dur = (document.getElementById('hdrStat').textContent||'').trim();
+
+  const CSS = `*{box-sizing:border-box}body{margin:0;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#c9d1d9;background:#0a0e16;line-height:1.55}
+  .wrap{max-width:1080px;margin:0 auto;background:#0d1117;box-shadow:0 0 0 1px #1c2330,0 18px 60px rgba(0,0,0,.6)}
+  .hero{background:linear-gradient(135deg,#0d1117 0%,#141b2e 55%,#1b2545 100%);color:#fff;padding:38px 44px;position:relative;overflow:hidden;border-bottom:1px solid #1c2330}
+  .hero:after{content:"蜘蛛";position:absolute;right:24px;top:2px;font-size:130px;color:rgba(76,141,255,.10);font-weight:700;line-height:1}
+  .hero h1{margin:0;font-size:34px;letter-spacing:8px;color:#4c8dff;font-family:ui-monospace,Menlo,monospace;text-shadow:0 0 24px rgba(76,141,255,.4)}
+  .hero .sub{color:#8b949e;font-size:12px;margin-top:6px;font-family:ui-monospace,monospace;letter-spacing:1px}
+  .hero .tgt{font-size:22px;margin-top:18px;font-weight:700;color:#f0f6fc}
+  .hero .meta{color:#8b98ad;font-size:12px;margin-top:4px}
+  .warn{background:rgba(227,179,65,.08);color:#e3b341;padding:9px 44px;font-size:12px;border-bottom:1px solid rgba(227,179,65,.2)}
+  .toc{position:sticky;top:0;z-index:5;display:flex;flex-wrap:wrap;gap:2px;background:#080b12;padding:8px 44px;border-bottom:1px solid #1c2330}
+  .toc a{color:#8b98ad;font-size:11px;text-decoration:none;padding:4px 10px;border-radius:6px;white-space:nowrap}
+  .toc a:hover{background:rgba(88,166,255,.12);color:#58a6ff}
+  section{padding:22px 44px;border-bottom:1px solid #161c26}
+  h2{font-size:15px;text-transform:uppercase;letter-spacing:1px;color:#e6edf3;border-bottom:2px solid #1c2330;padding-bottom:8px;margin:0 0 16px;scroll-margin-top:48px}
+  h4{font-size:13px;margin:16px 0 6px;color:#adbac7}
+  .cards{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px}
+  .card{flex:1;min-width:84px;border:1px solid #1c2330;border-radius:10px;padding:14px;text-align:center;background:#11161f}
+  .card .num{font-size:30px;font-weight:800;font-family:ui-monospace,monospace}.card .lbl{font-size:10px;color:#8b949e;letter-spacing:1px;margin-top:4px}
+  .pills{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0 14px}
+  .pill{display:inline-block;font-size:11px;border-radius:20px;padding:3px 10px}
+  table{width:100%;border-collapse:collapse;font-size:12.5px;margin:4px 0}
+  th{text-align:left;background:#11161f;color:#8b949e;font-size:11px;text-transform:uppercase;letter-spacing:.5px;padding:8px 10px;border-bottom:1px solid #1c2330}
+  td{padding:8px 10px;border-bottom:1px solid #161c26;vertical-align:top;color:#c9d1d9}
+  tr:hover td{background:#0f141d}
+  .kv-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:8px}
+  .kv{border:1px solid #1c2330;border-radius:8px;padding:8px 11px;background:#11161f}
+  .kv-k{font-size:10px;text-transform:uppercase;letter-spacing:.5px;color:#7d8794}
+  .kv-v{font-size:13px;color:#e6edf3;word-break:break-word;margin-top:1px}
+  .sev{display:inline-block;font-size:10px;font-weight:700;padding:2px 8px;border-radius:20px;letter-spacing:.5px}
+  .chips{display:flex;flex-wrap:wrap;gap:5px}.chip{font-size:11px;background:#161c26;border:1px solid #232b38;border-radius:6px;padding:2px 8px;font-family:ui-monospace,monospace;color:#adbac7}
+  .mono{font-family:ui-monospace,Menlo,monospace}.small{font-size:11px}.tiny{font-size:10px}.muted{color:#7d8794}.strong{font-weight:600;color:#e6edf3}
+  .center{text-align:center}.right{text-align:right}.nowrap{white-space:nowrap}.break{word-break:break-all}.mt2{margin-top:2px}.ok{color:#3fb950}
+  a{color:#58a6ff}
+  .warnbox{color:#e3b341;background:rgba(227,179,65,.08);border:1px solid rgba(227,179,65,.25);border-radius:8px;padding:9px 12px;font-size:12px}
+  .empty{color:#3fb950;background:rgba(63,185,80,.08);border:1px solid rgba(63,185,80,.25);border-radius:8px;padding:12px;text-align:center;font-weight:600}
+  footer{padding:20px 44px;color:#6e7781;font-size:11px}
+  @media print{body,.wrap{background:#0d1117}.toc{display:none}section{page-break-inside:avoid}}`;
+
+  const html =
+'<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">' +
+'<title>Kumo Report — ' + esc(domain) + '</title><style>' + CSS + '</style></head><body><div class="wrap">' +
+'<div class="hero"><h1>KUMO</h1><div class="sub">蜘蛛 · web recon · osint · breach intel · v2.0</div>' +
+'<div class="tgt">' + esc(domain) + '</div><div class="meta">Report generated ' + esc(now.toLocaleString()) + (dur?(' · ' + esc(dur)):'') + '</div></div>' +
+'<div class="warn">⚠ For authorized security testing only. Findings are indicators that require manual verification — false positives are possible.</div>' +
+nav +
+section('exec','Executive Summary',
+  '<div class="cards">' + cards +
+  '<div class="card"><div class="num" style="color:#f0f6fc">' + Object.keys(R).length + '</div><div class="lbl">MODULES</div></div>' +
+  '<div class="card"><div class="num" style="color:#f0f6fc">' + totFind + '</div><div class="lbl">FINDINGS</div></div></div>' +
+  (totFind ? ('<div style="margin:6px 0 12px">' + sevBar + '</div>') : '') +
+  (stat.length ? ('<div class="pills">' + stat.join('') + '</div>') : '')) +
+(overviewGrid ? section('overview','Target Overview', overviewGrid) : '') +
+section('findings','Vulnerabilities, Endpoints &amp; API Findings',
+  (rows.length ? ('<table><thead><tr><th>Severity</th><th>Module</th><th>Finding</th><th>URL</th><th>Status</th><th>Size</th></tr></thead><tbody>' + findingRows + '</tbody></table>')
+   : '<div class="empty">✓ No vulnerabilities or exposed endpoints detected</div>')) +
+ciSection +
+moduleSections +
+'<footer>Generated by <b>Kumo v2.0</b> — Domain OSINT &amp; Reconnaissance Framework · ' + esc(now.toISOString()) + '<br>This report is provided as-is for authorized security assessment. Verify all findings manually before acting on them.</footer>' +
+'</div></body></html>';
+
+  const blob = new Blob([html], {type:'text/html'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'kumo_report_' + domain.replace(/[^a-z0-9.\-]/gi,'_') + '_' + now.toISOString().slice(0,10) + '.html';
+  a.click();
+  URL.revokeObjectURL(url);
+  toast('ok','Report generated', a.download);
+}
+
+// ── Toasts ──
+function toast(kind, title, body) {
+  const ico = {ok:'✓', warn:'▲', err:'✕', info:'ℹ'}[kind] || 'ℹ';
+  const cls = {ok:'t-ok', warn:'t-warn', err:'t-err', info:''}[kind] || '';
+  const el = document.createElement('div');
+  el.className = 'toast ' + cls;
+  el.innerHTML = `<span class="t-ico">${ico}</span><div class="t-body"><b>${escH(title)}</b>${body?`<span>${escH(body)}</span>`:''}</div>`;
+  document.getElementById('toastWrap').appendChild(el);
+  setTimeout(() => { el.classList.add('out'); setTimeout(() => el.remove(), 260); }, 3600);
 }
 
 function updateCounts(){
-  sCounts.innerHTML = `<span>Done: <span>${completedCount}/${totalCount}</span></span>${errorCount>0?`<span>Errors: <span style="color:var(--red)">${errorCount}</span></span>`:''}`;
+  const done = completedCount, run = runningSet.size, err = errorCount;
+  sCounts.innerHTML =
+    `<span class="sc sc-run">◐ ${run} running</span>` +
+    `<span class="sc sc-done">✓ ${done}/${totalCount}</span>` +
+    (err>0 ? `<span class="sc sc-err">✕ ${err}</span>` : '');
 }
 
 document.getElementById('domInput').addEventListener('keydown', e => { if(e.key==='Enter') startScan(false); });
+document.addEventListener('keydown', e => {
+  if (e.key !== 'Escape') return;
+  if (document.getElementById('cmpOverlay').classList.contains('on')) { closeCompletionModal(); return; }
+  if (scanning) stopScan();
+});
 </script>
 </body>
 </html>
@@ -1145,14 +2048,8 @@ def api_scan():
     modules = data.get('modules', list(ALL_MODULES.keys()))
     fast = data.get('fast', False)
 
-    # Per-module timeouts (seconds) — generous but bounded
-    MODULE_TIMEOUTS = {
-        'dns': 8, 'whois': 15, 'ssl': 10, 'subdomains': 60,
-        'crtsh': 30, 'headers': 12, 'ports': 25, 'tech': 12,
-        'whatweb': 30, 'wafw00f': 35, 'nuclei': 120, 'shodan': 15,
-        'censys': 20, 'breachintel': 60, 'geo': 10, 'robots': 10,
-        'wayback': 30, 'brute': 60, 'dorks': 5, 'osint': 5,
-    }
+    scan_id = data.get('scan_id') or ''
+    stop_event = _register_scan(scan_id) if scan_id else threading.Event()
 
     def generate():
         import concurrent.futures
@@ -1163,44 +2060,101 @@ def api_scan():
         if fast:
             to_run = {k: v for k, v in to_run.items() if k not in FAST_SKIP}
 
+        total = len(to_run)
+        # Track which modules are still outstanding so we NEVER declare the
+        # scan complete while something is still running.
+        pending_keys = set(to_run.keys())
+
         # Queue for streaming results back as they complete
         result_queue = queue_mod.Queue()
-        pending = len(to_run)
 
         def run_module(key, desc, func):
+            # Bail early if the user already hit stop before this thread started.
+            if stop_event.is_set():
+                return
             try:
                 result = func(domain)
             except Exception as e:
                 result = {"error": str(e)}
-            result_queue.put((key, desc, result))
+            if not stop_event.is_set():
+                result_queue.put((key, desc, result))
 
         # Fire all modules in parallel
-        executor = concurrent.futures.ThreadPoolExecutor(max_workers=min(len(to_run), 12))
-        futures = {}
+        executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(total, 12) if total else 1)
         for key, (desc, func) in to_run.items():
-            f = executor.submit(run_module, key, desc, func)
-            futures[f] = (key, desc)
+            executor.submit(run_module, key, desc, func)
 
         # Signal start for all modules immediately
         for key, (desc, _) in to_run.items():
             yield f"data: {json.dumps({'type':'start','module':key,'description':desc})}\n\n"
 
-        # Stream results as each module finishes
-        completed = 0
-        while completed < pending:
-            try:
-                key, desc, result = result_queue.get(timeout=MODULE_TIMEOUTS.get(key, 30))
-                completed += 1
-                yield f"data: {json.dumps({'type':'done','module':key,'description':desc,'data':result}, default=str)}\n\n"
-            except Exception:
+        # ── Per-module deadlines ──
+        # Modules run in parallel and are each timed on their own clock, so a
+        # slow module (nuclei) is never killed by a deadline sized for another
+        # module, and fast modules are never held hostage by a slow one.
+        base = time.time()
+        module_deadline = {
+            k: base + min(MODULE_TIMEOUTS.get(k, DEFAULT_TIMEOUT), ABS_CAP)
+            for k in to_run
+        }
+
+        stopped = False
+        timed_out_count = 0
+
+        # Stream results as each module finishes. We poll in short slices so we
+        # can (a) react to STOP within ~1s, (b) send SSE heartbeats to keep the
+        # stream warm, and (c) time out only the specific module that overran.
+        while pending_keys:
+            if stop_event.is_set():
+                stopped = True
                 break
 
+            now = time.time()
+            # Time out any module that blew past its individual budget.
+            expired = [k for k in pending_keys if now >= module_deadline[k]]
+            for k in expired:
+                pending_keys.discard(k)
+                timed_out_count += 1
+                desc = to_run[k][0]
+                budget = int(min(MODULE_TIMEOUTS.get(k, DEFAULT_TIMEOUT), ABS_CAP))
+                err = {"error": f"Module timed out after {budget}s"}
+                yield f"data: {json.dumps({'type':'done','module':k,'description':desc,'data':err})}\n\n"
+            if not pending_keys:
+                break
+
+            # Wait only until the next upcoming deadline (max 1s for stop/heartbeat).
+            next_dl = min(module_deadline[k] for k in pending_keys)
+            wait = max(0.1, min(1.0, next_dl - now))
+            try:
+                key, desc, result = result_queue.get(timeout=wait)
+            except queue_mod.Empty:
+                yield ": keepalive\n\n"
+                continue
+            if key in pending_keys:
+                pending_keys.discard(key)
+                yield f"data: {json.dumps({'type':'done','module':key,'description':desc,'data':result}, default=str)}\n\n"
+
         executor.shutdown(wait=False)
+        _unregister_scan(scan_id)
+
         elapsed = f"{time.time()-start:.1f}s"
-        yield f"data: {json.dumps({'type':'complete','duration':elapsed})}\n\n"
+        if stopped:
+            yield f"data: {json.dumps({'type':'stopped','duration':elapsed,'remaining':sorted(pending_keys)})}\n\n"
+        else:
+            yield f"data: {json.dumps({'type':'complete','duration':elapsed,'timed_out':timed_out_count>0,'timed_out_count':timed_out_count})}\n\n"
 
     return Response(generate(), mimetype='text/event-stream',
-                    headers={'X-Accel-Buffering': 'no', 'Cache-Control': 'no-cache'})
+                    headers={'X-Accel-Buffering': 'no', 'Cache-Control': 'no-cache',
+                             'Connection': 'keep-alive'})
+
+
+@app.route('/api/stop', methods=['POST'])
+def api_stop():
+    data = request.json or {}
+    scan_id = data.get('scan_id', '')
+    stopped = _stop_scan(scan_id)
+    return jsonify({"stopped": stopped})
 
 
 @app.route('/api/modules')

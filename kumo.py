@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Kumo v1.0 — Domain OSINT & Reconnaissance Framework
+Kumo v2.0 — Domain OSINT & Reconnaissance Framework
 Usage:
     python3 kumo.py example.com              CLI full scan
     python3 kumo.py example.com --fast        CLI fast scan
@@ -41,6 +41,8 @@ class C:
 # ═══════════════════════════════════════════════════════════════
 
 def banner():
+    import platform
+    os_name = platform.system() or "Unknown"
     print(f"""{C.B}{C.BD}
 ██╗  ██╗██╗   ██╗███╗   ███╗ ██████╗
 ██║ ██╔╝██║   ██║████╗ ████║██╔═══██╗
@@ -48,18 +50,101 @@ def banner():
 ██╔═██╗ ██║   ██║██║╚██╔╝██║██║   ██║
 ██║  ██╗╚██████╔╝██║ ╚═╝ ██║╚██████╔╝
 ╚═╝  ╚═╝ ╚═════╝ ╚═╝     ╚═╝ ╚═════╝{C.RS}
-  {C.CY}{C.BD}┌──────────────────────────────────────────────┐
-  蜘蛛 · web recon · osint · breach intel
-  v1.0  ·  21 modules  ·  no api key required
-  └──────────────────────────────────────────────┘{C.RS}
-  {C.GR}For authorized security testing only.{C.RS}
+  {C.CY}{C.BD}Powered by Kumo Recon Engine{C.RS}        {C.GR}v2.0{C.RS}
+  {C.M}{C.BD}蜘蛛{C.RS}  {C.GR}web recon · osint · breach intel{C.RS}
+  {C.Y}OS:{C.RS} {C.W}{os_name}{C.RS}    {C.Y}Modules:{C.RS} {C.W}{len(ALL_MODULES)}{C.RS}    {C.Y}API Key:{C.RS} {C.G}not required{C.RS}
+  {C.CY}🌐 github.com/karim852/KUMO{C.RS}   {C.GR}·  authorized security testing only{C.RS}
 """)
 
 
 def section(title, icon="►"):
-    print(f"\n{C.GR}{'━' * 62}{C.RS}")
-    print(f"  {C.CY}{C.BD}{icon}  {title.upper()}{C.RS}")
-    print(f"{C.GR}{'━' * 62}{C.RS}")
+    print(f"\n  {C.CY}{C.BD}{icon}  {title.upper()}{C.RS}")
+    print(f"  {C.GR}{'─' * 60}{C.RS}")
+
+
+def _box(title, rows, color=None):
+    """Draw a clean framed box with a title and label/value rows."""
+    color = color or C.CY
+    width = 54
+    inner = width - 2            # printable columns between the │ borders
+    label_w = 10
+    top = f"  {color}╭─ {C.BD}{title}{C.RS}{color} " + "─" * (inner - len(title) - 3) + "╮" + C.RS
+    print(top)
+    for label, value in rows:
+        val = _strip_ansi(str(value))
+        # content = 1 leading space + label field + value + pad  == inner
+        pad = inner - 1 - label_w - len(val)
+        if pad < 1:
+            val = val[: inner - 1 - label_w - 1]
+            pad = 1
+        print(f"  {color}│{C.RS} {C.Y}{label:<{label_w}}{C.RS}{C.W}{val}{C.RS}{' ' * pad}{color}│{C.RS}")
+    print(f"  {color}╰" + "─" * inner + f"╯{C.RS}")
+
+
+def _strip_ansi(s):
+    import re as _re
+    return _re.sub(r'\033\[[0-9;]*m', '', str(s))
+
+
+def _dwidth(s):
+    """Approximate terminal display width (emoji/CJK count as 2 cells)."""
+    w = 0
+    for ch in _strip_ansi(s):
+        o = ord(ch)
+        w += 2 if (o >= 0x1100 and (o >= 0x2600 or 0x1100 <= o <= 0x115F or 0x2E80 <= o <= 0xA4CF
+                   or 0xAC00 <= o <= 0xD7A3 or 0xF900 <= o <= 0xFAFF or 0xFE30 <= o <= 0xFE4F
+                   or 0xFF00 <= o <= 0xFF60 or 0x1F000 <= o <= 0x1FAFF)) else 1
+    return w
+
+
+def _textbox(title, text, color=None, width=60):
+    """Draw a bordered box with a title and wrapped body text (HeroMap-style)."""
+    import textwrap as _tw
+    color = color or C.CY
+    inner = width - 2
+    tw = _dwidth(title)
+    print(f"  {color}╭─ {C.BD}{title}{C.RS}{color} " + "─" * max(1, inner - tw - 3) + "╮" + C.RS)
+    for ln in _tw.wrap(text, inner - 2) or [""]:
+        pad = inner - 1 - len(ln)
+        print(f"  {color}│{C.RS} {C.W}{ln}{C.RS}{' ' * max(0, pad)}{color}│{C.RS}")
+    print(f"  {color}╰" + "─" * inner + f"╯{C.RS}")
+
+
+def _bar(pct, width=12, color=None):
+    color = color or C.G
+    filled = int(round(pct / 100 * width))
+    return f"{color}{'█' * filled}{C.GR}{'░' * (width - filled)}{C.RS}"
+
+
+TIPS = [
+    "A 403 on /.git/config means the path is blocked, not exposed — Kumo won't flag it.",
+    "Run --fast to skip the slow modules (vuln scan, subdomains, brute, cloud buckets).",
+    "Content Intel pulls DB connection strings and API routes straight out of JS files.",
+    "Favicon MMH3 hashes let you pivot to other hosts running the same stack on Shodan.",
+    "Kumo never sends exploit payloads — recent-CVE checks only fingerprint exposure.",
+    "Use -o report.json to save the full machine-readable results for later.",
+    "The web UI (--web) streams all modules live and builds a shareable HTML report.",
+    "Breach intel runs a per-email infostealer check against Hudson Rock automatically.",
+    "External URLs in Content Intel are collapsed to unique hosts — your third-party map.",
+    "Pass -m to run only what you need, e.g. -m dns ssl headers ports.",
+]
+
+
+def print_tip():
+    import random
+    _textbox("💡 RECON TIP", random.choice(TIPS), C.Y)
+
+
+def _human_bytes_cli(n):
+    try:
+        n = float(n)
+    except (TypeError, ValueError):
+        return "—"
+    if n < 1024:
+        return f"{int(n)} B"
+    if n < 1048576:
+        return f"{n/1024:.1f} KB"
+    return f"{n/1048576:.2f} MB"
 
 
 def info(label, value, indent=4):
@@ -365,9 +450,15 @@ def render_nuclei(data):
         sev = f.get("severity", "").upper()
         url = f.get("url") or f.get("matched_at", "")
         status = f.get("status", "")
+        size = f.get("size", "")
         print(f"    {sc}[{sev}]{C.RS} {C.W}{name}{C.RS}")
         if url:
-            dimprint(f"  → {url}" + (f"  [{status}]" if status else ""), 6)
+            meta = ""
+            if status:
+                meta += f"  [{status}]"
+            if size != "" and size is not None:
+                meta += f"  {_human_bytes(size)}"
+            dimprint(f"  → {url}{meta}", 6)
         desc = f.get("description", "")
         if desc:
             dimprint(f"  {desc[:80]}", 6)
@@ -701,6 +792,87 @@ def render_osint(data):
     print(f"\n    {C.G}{C.BD}Total: {total} URLs{C.RS}")
 
 
+def _human_bytes(n):
+    try:
+        n = float(n)
+    except (TypeError, ValueError):
+        return "—"
+    if n < 1024:
+        return f"{int(n)} B"
+    if n < 1048576:
+        return f"{n/1024:.1f} KB"
+    return f"{n/1048576:.2f} MB"
+
+
+def render_endpoints(data):
+    section("SENSITIVE ENDPOINTS", "📂")
+    if data.get("error"):
+        fail(data["error"]); return
+    counts = data.get("severity_counts", {})
+    if counts:
+        parts = []
+        for sev, color in [("critical", C.R), ("high", C.Y), ("medium", C.Y), ("low", C.GR), ("info", C.B)]:
+            if counts.get(sev):
+                parts.append(f"{color}{sev.upper()}: {counts[sev]}{C.RS}")
+        print(f"\n    {' | '.join(parts)}")
+    dimprint(f"{data.get('total_found', 0)} found / {data.get('total_probed', 0)} probed", 4)
+    findings = data.get("findings", [])
+    if not findings:
+        ok("No sensitive endpoints found"); return
+    print()
+    sev_color = {"critical": C.R, "high": C.Y, "medium": C.Y, "low": C.GR, "info": C.B}
+    for f in findings:
+        sc = sev_color.get(f.get("severity", ""), C.W)
+        print(f"    {sc}[{f.get('severity','').upper()}]{C.RS} {C.W}{f.get('name','')}{C.RS}  "
+              f"{C.GR}[{f.get('status','')}]  {_human_bytes(f.get('size',''))}{C.RS}")
+        url = f.get("url", "")
+        if url:
+            dimprint(f"  → {url}", 6)
+
+
+def render_content_intel(data):
+    section("CONTENT INTELLIGENCE (JS/HTML EXTRACTION)", "🧠")
+    if data.get("error"):
+        fail(data["error"]); return
+    ss = data.get("sources_scanned", {})
+    dimprint(f"Scanned: 1 HTML · {ss.get('inline_scripts',0)} inline · {ss.get('js_files',0)} JS files", 4)
+    total = data.get("total", 0)
+    if not total:
+        ok("Nothing interesting extracted"); return
+    print(f"    {C.CY}{C.BD}{total} items extracted{C.RS}")
+
+    cats = data.get("categories", {})
+    counts = data.get("counts", {})
+    # (key, label, color, is_kinded)
+    groups = [
+        ("databases",      "Database URIs",      C.R,  True),
+        ("cloud_storage",  "Cloud Storage",      C.Y,  True),
+        ("api_endpoints",  "API Endpoints",      C.M,  False),
+        ("sensitive",      "Sensitive Info",     C.R,  True),
+        ("urls_external",  "External Sources",   C.Y,  False),
+        ("urls_internal",  "Internal URLs",      C.CY, False),
+        ("endpoints",      "Endpoints / Paths",  C.CY, False),
+        ("internal_hosts", "Internal Hosts",     C.Y,  False),
+        ("ip_addresses",   "IP Addresses",       C.W,  False),
+        ("emails",         "Emails",             C.W,  False),
+    ]
+    sev_color = {"critical": C.R, "high": C.Y, "medium": C.Y, "low": C.GR}
+    for key, label, color, kinded in groups:
+        items = cats.get(key, [])
+        if not items:
+            continue
+        extra = "+" if counts.get(key, 0) >= 200 else ""
+        print(f"\n    {color}{C.BD}{label}{C.RS} {C.GR}({len(items)}{extra}){C.RS}")
+        for it in items[:15]:
+            if kinded and it.get("kind"):
+                kc = sev_color.get(it.get("severity", ""), C.GR)
+                print(f"      {kc}[{it['kind']}]{C.RS} {C.W}{it['value']}{C.RS}")
+            else:
+                print(f"      {C.GR}•{C.RS} {C.W}{it['value']}{C.RS}")
+        if len(items) > 15:
+            dimprint(f"  + {len(items)-15} more…", 6)
+
+
 RENDERERS = {
     "dns": render_dns, "whois": render_whois, "ssl": render_ssl,
     "crtsh": render_crtsh, "headers": render_headers, "ports": render_ports,
@@ -710,11 +882,153 @@ RENDERERS = {
     "subdomains": render_subdomains,
     "whatweb": render_whatweb,
     "nuclei": render_nuclei,
+    "endpoints": render_endpoints,
+    "content_intel": render_content_intel,
     "shodan": render_shodan,
     "censys": render_censys,
     "wafw00f": render_wafw00f,
     "breachintel": render_breachintel,
 }
+
+
+# ═══════════════════════════════════════════════════════════════
+# SUMMARY DASHBOARD
+# ═══════════════════════════════════════════════════════════════
+
+def print_summary(results, domain, elapsed, to_run):
+    R = results or {}
+
+    # ── aggregate severities across all finding-bearing modules ──
+    sev = {"critical": 0, "high": 0, "medium": 0, "low": 0}
+    def add_sev(items, key="severity"):
+        for it in (items or []):
+            s = (it.get(key) or "").lower()
+            if s in sev:
+                sev[s] += 1
+    add_sev((R.get("nuclei") or {}).get("findings"))
+    add_sev((R.get("endpoints") or {}).get("findings"))
+    add_sev((R.get("api_fuzzer") or {}).get("endpoints"))
+    add_sev((R.get("content_intel") or {}).get("categories", {}).get("sensitive"))
+    add_sev((R.get("js_secrets") or {}).get("secrets"))
+
+    total_findings = sum(sev.values())
+
+    print(f"\n  {C.CY}{C.BD}{'═' * 60}{C.RS}")
+    print(f"  {C.G}{C.BD}  ✓  SCAN COMPLETE{C.RS}   {C.GR}{domain}{C.RS}")
+    print(f"  {C.CY}{C.BD}{'═' * 60}{C.RS}\n")
+
+    # ── module roadmap (numbered, with status bars — HeroMap style) ──
+    print(f"  {C.W}{C.BD}Module roadmap{C.RS}")
+    ok_count = 0
+    for i, k in enumerate(to_run, 1):
+        res = R.get(k, {})
+        err = isinstance(res, dict) and res.get("error")
+        name = ALL_MODULES.get(k, (k,))[0]
+        name = name if len(name) <= 28 else name[:27] + "…"
+        if err:
+            timed = "timed out" in str(err).lower() or "timeout" in str(err).lower()
+            col = C.Y if timed else C.R
+            icon = "⏱" if timed else "✗"
+            label = "timeout" if timed else "no data"
+            bar = _bar(100, 10, col)
+        else:
+            ok_count += 1
+            col, icon, label, bar = C.G, "✓", "done", _bar(100, 10, C.G)
+        print(f"    {C.GR}[{i:>2}]{C.RS} {C.W}{name:<28}{C.RS} {bar} {col}{icon}{C.RS} {C.GR}{label}{C.RS}")
+    overall = (ok_count / len(to_run) * 100) if to_run else 0
+    print(f"\n    {C.CY}{C.BD}Overall{C.RS}  {_bar(overall, 24, C.CY)} {C.W}{overall:.0f}%{C.RS} "
+          f"{C.GR}({ok_count}/{len(to_run)} ok){C.RS}\n")
+
+    # ── severity bar ──
+    sev_colors = {"critical": C.R, "high": C.M, "medium": C.Y, "low": C.GR}
+    sev_icons  = {"critical": "☠", "high": "▲", "medium": "◆", "low": "•"}
+    if total_findings:
+        print(f"  {C.W}{C.BD}Findings by severity{C.RS}")
+        maxv = max(sev.values()) or 1
+        for s in ("critical", "high", "medium", "low"):
+            n = sev[s]
+            bar = "█" * int((n / maxv) * 28) if n else ""
+            print(f"    {sev_colors[s]}{sev_icons[s]} {s.upper():<9}{C.RS} "
+                  f"{sev_colors[s]}{bar}{C.RS} {C.W}{n}{C.RS}")
+        print()
+
+    # ── key recon stats ──
+    def g(*path, default=0):
+        cur = R
+        for p in path:
+            if isinstance(cur, dict):
+                cur = cur.get(p)
+            else:
+                return default
+        return cur if cur is not None else default
+
+    stats = []
+    ports = g("ports", "open", default=[])
+    if ports: stats.append(("Open ports", len(ports)))
+    subs = g("subdomains", "total", default=0) or len(g("subdomains", "subdomains", default=[]) or [])
+    if subs: stats.append(("Subdomains", subs))
+    cves = g("shodan", "summary", "total_cves", default=0)
+    if cves: stats.append(("CVEs (Shodan)", cves))
+    bs = g("breachintel", "summary", default={}) or {}
+    leaks = (bs.get("total_infostealer_hits", 0) or 0) + (bs.get("total_employees_leaked", 0) or 0)
+    if leaks: stats.append(("Leaked creds", leaks))
+    secrets = g("js_secrets", "total", default=0)
+    if secrets: stats.append(("JS secrets", secrets))
+    ci = g("content_intel", "total", default=0)
+    if ci: stats.append(("Intel items", ci))
+    emails = len(g("email_harvest", "emails", default=[]) or [])
+    if emails: stats.append(("Emails", emails))
+    grade = g("headers", "grade", default=None)
+    if grade: stats.append(("Header grade", grade))
+
+    if stats:
+        print(f"  {C.W}{C.BD}Recon highlights{C.RS}")
+        for i in range(0, len(stats), 2):
+            left = stats[i]
+            cell_l = f"{C.Y}{left[0]:<16}{C.RS}{C.CY}{C.BD}{left[1]}{C.RS}"
+            if i + 1 < len(stats):
+                right = stats[i + 1]
+                cell_r = f"{C.Y}{right[0]:<16}{C.RS}{C.CY}{C.BD}{right[1]}{C.RS}"
+                print(f"    {cell_l:<44}   {cell_r}")
+            else:
+                print(f"    {cell_l}")
+        print()
+
+    # ── top critical/high findings ──
+    top = []
+    for f in (R.get("nuclei") or {}).get("findings", []):
+        if (f.get("severity") or "").lower() in ("critical", "high"):
+            top.append((f.get("severity"), f.get("name") or f.get("path", ""), "vuln"))
+    for f in (R.get("endpoints") or {}).get("findings", []):
+        if (f.get("severity") or "").lower() in ("critical", "high"):
+            top.append((f.get("severity"), f.get("name") or f.get("path", ""), "endpoint"))
+    if top:
+        print(f"  {C.W}{C.BD}Top findings{C.RS}")
+        for s, name, kind in top[:8]:
+            sc = sev_colors.get((s or "").lower(), C.W)
+            print(f"    {sc}[{(s or '').upper():<8}]{C.RS} {C.W}{name[:48]}{C.RS} {C.GR}({kind}){C.RS}")
+        if len(top) > 8:
+            dimprint(f"  + {len(top)-8} more", 4)
+        print()
+
+    # ── quick commands (HeroMap-style bracketed menu) ──
+    print(f"  {C.W}{C.BD}Commands{C.RS}")
+    for key, label, cmd in [
+        ("o", "Save JSON report", f"kumo.py {domain} -o report.json"),
+        ("f", "Fast scan",        f"kumo.py {domain} --fast"),
+        ("w", "Launch web UI",    "kumo.py --web"),
+        ("m", "List all modules", "kumo.py --list-modules"),
+    ]:
+        print(f"    {C.M}[{key}]{C.RS} {C.W}{label:<18}{C.RS}{C.GR}{cmd}{C.RS}")
+    print()
+
+    _box("SCAN SUMMARY", [
+        ("Target", domain),
+        ("Modules", f"{len(to_run)} executed"),
+        ("Findings", f"{total_findings} ({sev['critical']}C / {sev['high']}H / {sev['medium']}M / {sev['low']}L)"),
+        ("Duration", f"{elapsed:.1f}s"),
+    ], color=C.G)
+    print()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -725,7 +1039,7 @@ def main():
     mod_list = "\n".join(f"  {k:<14} {desc}" for k, (desc, _) in ALL_MODULES.items())
 
     parser = argparse.ArgumentParser(
-        description="Kumo v1.0 — Domain OSINT & Reconnaissance Framework",
+        description="Kumo v2.0 — Domain OSINT & Reconnaissance Framework",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent(f"""\
 Examples:
@@ -788,8 +1102,7 @@ Modules ({len(ALL_MODULES)}):
         sys.exit(1)
 
     banner()
-    print(f"  {C.W}Target  : {C.G}{C.BD}{domain}{C.RS}")
-    print(f"  {C.W}Date    : {C.GR}{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}{C.RS}")
+    print_tip()
 
     if args.modules:
         to_run = args.modules
@@ -798,13 +1111,23 @@ Modules ({len(ALL_MODULES)}):
     else:
         to_run = list(ALL_MODULES.keys())
 
-    print(f"  {C.W}Modules : {C.GR}{len(to_run)}/{len(ALL_MODULES)}{C.RS}")
+    _box("SCAN CONFIG", [
+        ("Target", domain),
+        ("Date", datetime.now().strftime('%Y-%m-%d %H:%M:%S')),
+        ("Modules", f"{len(to_run)} / {len(ALL_MODULES)}"),
+        ("Mode", "fast" if args.fast else ("custom" if args.modules else "full")),
+    ])
 
     start = time.time()
     all_results = {}
+    total_mods = len(to_run)
+    counter = {"n": 0}
 
     def callback(key, desc, result):
         all_results[key] = result
+        counter["n"] += 1
+        el = time.time() - start
+        print(f"\n  {C.GR}[{counter['n']:>2}/{total_mods}] · {el:5.1f}s{C.RS}", end="")
         renderer = RENDERERS.get(key)
         if renderer:
             try:
@@ -822,18 +1145,12 @@ Modules ({len(ALL_MODULES)}):
 
     elapsed = time.time() - start
 
-    print(f"\n{C.GR}{'━' * 62}{C.RS}")
-    print(f"  {C.CY}{C.BD}✓ SCAN COMPLETE{C.RS}")
-    print(f"{C.GR}{'━' * 62}{C.RS}")
-    print(f"  {C.W}Target   : {C.G}{domain}{C.RS}")
-    print(f"  {C.W}Modules  : {C.GR}{len(to_run)} executed{C.RS}")
-    print(f"  {C.W}Duration : {C.GR}{elapsed:.1f}s{C.RS}")
-    print()
+    print_summary(all_results, domain, elapsed, to_run)
 
     if args.output:
         try:
             report = {
-                "tool": "Kumo v1.0", "target": domain,
+                "tool": "Kumo v2.0", "target": domain,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "modules": to_run, "duration": f"{elapsed:.1f}s",
                 "results": all_results,

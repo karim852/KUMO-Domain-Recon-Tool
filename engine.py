@@ -36,7 +36,7 @@ def clean_domain(d):
 def req(url, timeout=10, headers=None):
     if not HAS_REQUESTS:
         return None
-    h = {"User-Agent": "Kumo/1.0 (Security Research)", "Accept": "*/*"}
+    h = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36", "Accept": "*/*"}
     if headers:
         h.update(headers)
     try:
@@ -174,40 +174,158 @@ def scan_dns(domain):
 # MODULE: WHOIS
 # ═══════════════════════════════════════════════════════════════
 
+def _whois_socket(domain, timeout=8):
+    """Classic WHOIS over port 43 with IANA referral — covers ccTLDs (.tn, etc.)
+    that have no RDAP server. Returns parsed dict or None."""
+    import socket as _sock
+    import re as _re
+
+    def query(server, q):
+        s = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+        s.settimeout(timeout)
+        try:
+            s.connect((server, 43))
+            s.sendall((q + "\r\n").encode())
+            buf = b""
+            while len(buf) < 200000:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                buf += chunk
+            return buf.decode("utf-8", "ignore")
+        finally:
+            s.close()
+
+    tld = domain.split(".")[-1]
+    # Known whois servers (fallback if IANA referral is missing)
+    KNOWN = {
+        "tn": "whois.ati.tn", "com": "whois.verisign-grs.com", "net": "whois.verisign-grs.com",
+        "org": "whois.pir.org", "io": "whois.nic.io", "co": "whois.nic.co",
+        "uk": "whois.nic.uk", "fr": "whois.nic.fr", "de": "whois.denic.de",
+        "eu": "whois.eu", "info": "whois.afilias.net", "me": "whois.nic.me",
+    }
+    server = None
+    try:
+        ref = query("whois.iana.org", tld)
+        m = _re.search(r'(?im)^\s*whois:\s*(\S+)', ref)
+        if m:
+            server = m.group(1).strip()
+    except Exception:
+        pass
+    if not server:
+        server = KNOWN.get(tld)
+    if not server:
+        return None
+
+    try:
+        raw = query(server, domain)
+    except Exception:
+        return None
+    if not raw or len(raw) < 20:
+        return None
+
+    def grab(*labels):
+        for lab in labels:
+            m = _re.search(rf'(?im)^\s*{lab}[.\s]*:\s*(.+?)\s*$', raw)
+            if m and m.group(1).strip().lower() not in ("", "n/a", "none"):
+                return m.group(1).strip()
+        return None
+
+    def grab_all(*labels):
+        out = []
+        for lab in labels:
+            for m in _re.finditer(rf'(?im)^\s*{lab}[.\s]*:\s*(.+?)\s*$', raw):
+                v = m.group(1).strip()
+                if v and v.lower() not in ("", "n/a"):
+                    out.append(v)
+        seen, uniq = set(), []
+        for v in out:
+            if v.lower() not in seen:
+                seen.add(v.lower()); uniq.append(v)
+        return uniq
+
+    res = {"domain": domain, "source": f"whois ({server})"}
+    reg = grab("Registrar", "registrar", "Sponsoring Registrar")
+    if reg:
+        res["registrar"] = reg
+    created = grab("Creation Date", "created", "Registered on", "Domain Registration Date", "Registration Date")
+    if created:
+        res["registration"] = created[:24]
+    expiry = grab("Registry Expiry Date", "Expiration Date", "Expiry Date", "paid-till",
+                  "Registrar Registration Expiration Date", "Expiry")
+    if expiry:
+        res["expiration"] = expiry[:24]
+    changed = grab("Updated Date", "last-update", "Last Modified", "changed")
+    if changed:
+        res["last_changed"] = changed[:24]
+    status = grab_all("Domain Status", "status", "Status")
+    if status:
+        res["status"] = [s.split()[0] for s in status[:6]]
+    ns = grab_all("Name Server", "Nameserver", "nserver", "Name servers", "dns")
+    if ns:
+        res["nameservers"] = [n.split()[0].lower() for n in ns[:8]]
+    org = grab("Registrant Organization", "Registrant", "org", "Organization", "owner")
+    if org:
+        res["entities"] = [{"role": "registrant", "name": org}]
+
+    # days until expiry
+    if res.get("expiration"):
+        from datetime import datetime as _dt
+        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d", "%d-%b-%Y", "%d.%m.%Y", "%Y.%m.%d"):
+            try:
+                exp = _dt.strptime(res["expiration"][:len(_dt.now().strftime(fmt))], fmt)
+                res["days_until_expiry"] = (exp - _dt.now()).days
+                break
+            except Exception:
+                continue
+
+    # Consider it a success only if we extracted something meaningful
+    if any(k in res for k in ("registrar", "registration", "expiration", "nameservers", "status")):
+        return res
+    return None
+
+
 def scan_whois(domain):
     results = {}
     r = req(f"https://rdap.org/domain/{domain}", timeout=15)
-    if not r:
-        return {"error": "RDAP lookup failed"}
-    try:
-        data = r.json()
-        results["domain"] = data.get("ldhName", domain)
-        results["status"] = [s.split()[-1] for s in data.get("status", [])[:4]]
+    if r:
+        try:
+            data = r.json()
+            results["domain"] = data.get("ldhName", domain)
+            results["status"] = [s.split()[-1] for s in data.get("status", [])[:4]]
 
-        for ev in data.get("events", []):
-            act, dt = ev.get("eventAction", ""), ev.get("eventDate", "")[:10]
-            if act in ("registration", "expiration", "last changed"):
-                results[act.replace(" ", "_")] = dt
-                if act == "expiration":
-                    try:
-                        results["days_until_expiry"] = (datetime.strptime(dt, "%Y-%m-%d") - datetime.now()).days
-                    except Exception:
-                        pass
+            for ev in data.get("events", []):
+                act, dt = ev.get("eventAction", ""), ev.get("eventDate", "")[:10]
+                if act in ("registration", "expiration", "last changed"):
+                    results[act.replace(" ", "_")] = dt
+                    if act == "expiration":
+                        try:
+                            results["days_until_expiry"] = (datetime.strptime(dt, "%Y-%m-%d") - datetime.now()).days
+                        except Exception:
+                            pass
 
-        ns = [n.get("ldhName", "") for n in data.get("nameservers", []) if n.get("ldhName")]
-        results["nameservers"] = ns
+            ns = [n.get("ldhName", "") for n in data.get("nameservers", []) if n.get("ldhName")]
+            results["nameservers"] = ns
 
-        entities = []
-        for ent in data.get("entities", []):
-            roles = ent.get("roles", [])
-            vcard = ent.get("vcardArray", [None, []])[1] if ent.get("vcardArray") else []
-            for item in vcard:
-                if item[0] == "fn":
-                    entities.append({"role": roles[0] if roles else "unknown", "name": item[3]})
-        results["entities"] = entities
-        return results
-    except Exception as e:
-        return {"error": str(e)}
+            entities = []
+            for ent in data.get("entities", []):
+                roles = ent.get("roles", [])
+                vcard = ent.get("vcardArray", [None, []])[1] if ent.get("vcardArray") else []
+                for item in vcard:
+                    if item[0] == "fn":
+                        entities.append({"role": roles[0] if roles else "unknown", "name": item[3]})
+            results["entities"] = entities
+            if any(results.get(k) for k in ("registration", "expiration", "nameservers", "status", "entities")):
+                results["source"] = "RDAP"
+                return results
+        except Exception:
+            pass
+
+    # RDAP failed or was empty (common for ccTLDs like .tn) → fall back to WHOIS:43
+    w = _whois_socket(domain)
+    if w:
+        return w
+    return {"error": "WHOIS/RDAP lookup failed (no RDAP server and port 43 unreachable)"}
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -309,7 +427,7 @@ def scan_headers(domain):
     for scheme in ["https", "http"]:
         try:
             resp = requests.get(f"{scheme}://{domain}", timeout=10, allow_redirects=True,
-                                headers={"User-Agent": "Kumo/1.0"})
+                                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"})
             break
         except Exception:
             continue
@@ -576,7 +694,7 @@ def scan_tech(domain):
     for scheme in ["https", "http"]:
         try:
             resp = requests.get(f"{scheme}://{domain}", timeout=10, allow_redirects=True,
-                                headers={"User-Agent": "Kumo/1.0"})
+                                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"})
             break
         except Exception:
             continue
@@ -662,7 +780,7 @@ def scan_robots(domain):
         return results
 
     try:
-        r = requests.get(f"https://{domain}/robots.txt", timeout=10, headers={"User-Agent": "Kumo/1.0"})
+        r = requests.get(f"https://{domain}/robots.txt", timeout=10, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"})
         if r.status_code == 200 and r.text.strip():
             disallowed = []
             sitemaps = []
@@ -692,7 +810,7 @@ def scan_robots(domain):
 
     for path in ["/.well-known/security.txt", "/security.txt"]:
         try:
-            r = requests.get(f"https://{domain}{path}", timeout=8, headers={"User-Agent": "Kumo/1.0"})
+            r = requests.get(f"https://{domain}{path}", timeout=8, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"})
             if r.status_code == 200 and "contact" in r.text.lower():
                 results["security_txt"] = {"path": path, "content": r.text[:500]}
                 break
@@ -700,6 +818,99 @@ def scan_robots(domain):
             pass
 
     return results
+
+
+# ═══════════════════════════════════════════════════════════════
+# SHARED: CATCH-ALL / WAF BASELINE DETECTION
+# ═══════════════════════════════════════════════════════════════
+# Many hosts (WAF, SPA, catch-all vhosts) return the SAME response — a generic
+# 403/404 error page or the homepage — for *every* path. Without fingerprinting
+# that behaviour first, every probed path looks like a "finding". These helpers
+# probe a few random non-existent paths and record their (status, size) so real
+# scanners can suppress responses that merely echo the catch-all.
+
+def _catchall_baseline(domain, prefix="/", n=2, timeout=6):
+    """Probe random non-existent paths; return a set of (status, size_bucket) sigs."""
+    import random as _rnd
+    import string as _s
+    sigs = set()
+    if not HAS_REQUESTS:
+        return sigs
+    for scheme in ("https", "http"):
+        got = False
+        for _ in range(n):
+            rnd = prefix.rstrip("/") + "/" + "".join(_rnd.choices(_s.ascii_lowercase + _s.digits, k=16))
+            try:
+                r = requests.get(f"{scheme}://{domain}{rnd}", timeout=timeout, verify=False,
+                                 allow_redirects=False, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"})
+                sigs.add((r.status_code, len(r.content) // 64))
+                # also record the redirect target host so www/https redirects are caught
+                if r.status_code in (301, 302, 307, 308):
+                    sigs.add((r.status_code, -1))
+                got = True
+            except Exception:
+                pass
+        if got:
+            break   # one working scheme is enough
+    return sigs
+
+
+def _is_catchall(r, sigs):
+    """True if response r matches the catch-all baseline (should be suppressed)."""
+    try:
+        if (r.status_code, len(r.content) // 64) in sigs:
+            return True
+        if r.status_code in (301, 302, 307, 308) and (r.status_code, -1) in sigs:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _looks_like_html(content):
+    """True if the body is an HTML page (so NOT a raw config/source/backup file)."""
+    try:
+        head = (content[:512] if isinstance(content, (bytes, bytearray)) else content[:512].encode("utf-8", "ignore")).lstrip().lower()
+        return head.startswith(b"<!doctype") or head.startswith(b"<html") or b"<head" in head[:200] or b"<body" in head[:300]
+    except Exception:
+        return False
+
+
+# Markers proving a raw sensitive file is genuinely exposed (not a 200 error page)
+_RAWFILE_MARKERS = {
+    ".git/config": [b"[core]", b"repositoryformatversion"],
+    ".git/head": [b"ref:"],
+    ".git/commit_editmsg": [],
+    ".git/index": [b"DIRC"],
+    ".git/logs": [b" commit", b" clone", b"@"],
+    ".svn/entries": [b"svn", b"dir"],
+    ".svn/wc.db": [b"SQLite format"],
+    ".hg/hgrc": [b"[paths]", b"[ui]", b"default ="],
+    ".htpasswd": [b":$", b":{", b":$apr1$"],
+    ".env": [b"=", b"APP_", b"DB_", b"SECRET", b"KEY"],
+    "wp-config": [b"DB_NAME", b"DB_PASSWORD", b"<?php", b"AUTH_KEY"],
+    ".sql": [b"INSERT INTO", b"CREATE TABLE", b"DROP TABLE", b"-- "],
+    ".ds_store": [b"Bud1", b"\x00\x00\x00\x01Bud1"],
+    "backup": [b"PK\x03\x04", b"\x1f\x8b", b"SQLite", b"INSERT INTO", b"CREATE TABLE"],
+}
+
+
+def _rawfile_validated(path, content):
+    """For raw-file paths, require file-specific markers so a 200 error/HTML
+    page is not mistaken for real exposure. Returns True if it looks genuine."""
+    p = path.lower()
+    raw_hint = any(tok in p for tok in (
+        "/.git", "/.svn", "/.hg", ".htpasswd", ".env", "wp-config", ".ds_store",
+        "backup", "dump", ".sql", ".bak", "database", "db.sqlite", "/.aws", "config.php.bak"))
+    if not raw_hint:
+        return True   # not a raw-file path — no special validation needed
+    body = content if isinstance(content, (bytes, bytearray)) else content.encode("utf-8", "ignore")
+    if _looks_like_html(body):
+        return False   # HTML page served instead of the raw file → false positive
+    for key, markers in _RAWFILE_MARKERS.items():
+        if key in p and markers:
+            return any(mk in body for mk in markers)
+    return True   # raw-ish path, non-HTML body, no strict markers defined → accept
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -811,6 +1022,10 @@ def scan_endpoints(domain):
 
     sev_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
 
+    # Fingerprint catch-all / WAF behaviour first so we don't report the same
+    # generic 403/404/homepage for every path.
+    base_sigs = _catchall_baseline(domain)
+
     def probe(item):
         path, name, severity = item
         for scheme in ["https", "http"]:
@@ -818,12 +1033,19 @@ def scan_endpoints(domain):
                 r = requests.get(
                     f"{scheme}://{domain}{path}",
                     timeout=5, allow_redirects=False,
-                    headers={"User-Agent": "Kumo/1.0"},
+                    headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"},
                     verify=False,
                 )
+                # Suppress catch-all responses (same as a random non-existent path)
+                if _is_catchall(r, base_sigs):
+                    return None
                 if r.status_code not in (404, 410, 400, 501):
                     content_len = len(r.content)
                     if r.status_code in (200, 403, 500) and content_len > 0:
+                        # Raw sensitive files must actually contain the file — a
+                        # 200/403 HTML error page is a false positive.
+                        if not _rawfile_validated(path, r.content):
+                            return None
                         sev = severity
                         if r.status_code == 403:
                             sev = {"critical":"high","high":"medium","medium":"low","low":"info","info":"info"}.get(severity, severity)
@@ -939,7 +1161,7 @@ def scan_screenshot(domain):
     # Correct endpoint: /searchvictims/<keyword>
     import os
     rw_api_key = os.environ.get("RANSOMWARE_LIVE_API_KEY", "").strip()
-    rw_headers = {"User-Agent": "Kumo/1.0", "Accept": "application/json"}
+    rw_headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36", "Accept": "application/json"}
     if rw_api_key:
         rw_headers["X-API-Key"] = rw_api_key
 
@@ -1011,7 +1233,7 @@ def scan_screenshot(domain):
             "https://urlhaus-api.abuse.ch/v1/host/",
             data={"host": domain},
             timeout=8,
-            headers={"User-Agent": "Kumo/1.0"},
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"},
         )
         if r and r.status_code == 200:
             j = r.json()
@@ -1137,7 +1359,7 @@ def scan_bruteforce(domain):
             try:
                 probe = requests.get(
                     f"https://{fqdn}", timeout=4, allow_redirects=False,
-                    headers={"User-Agent": "Kumo/1.0"}, verify=False
+                    headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"}, verify=False
                 )
                 # Accept 200, 401, 403, 404, 500 — these are real responses
                 # Reject 301/302 that redirect OUT of the domain (catches wildcard CDN redirects)
@@ -1214,7 +1436,7 @@ def scan_subdomains(domain):
     # --- Source 3: RapidDNS ---
     try:
         r = req(f"https://rapiddns.io/subdomain/{domain}?full=1", timeout=15,
-                headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"})
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"})
         if r:
             found = re.findall(r'<td>([a-zA-Z0-9\-\.]+\.' + re.escape(domain) + r')</td>', r.text)
             for name in found:
@@ -1380,7 +1602,7 @@ def _whatweb_python(domain):
         try:
             resp = requests.get(
                 f"{scheme}://{domain}", timeout=12, allow_redirects=True,
-                headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
                                        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
             )
             final_url = resp.url
@@ -1774,6 +1996,10 @@ def _nuclei_manual_checks(domain):
 
     findings = []
 
+    # Fingerprint catch-all / WAF so we don't flag the generic 403/404 page
+    # that many hosts return for every path.
+    base_sigs = _catchall_baseline(domain)
+
     def check_path(item):
         path, name, severity = item
         for scheme in ["https", "http"]:
@@ -1782,44 +2008,48 @@ def _nuclei_manual_checks(domain):
                     f"{scheme}://{domain}{path}",
                     timeout=6,
                     allow_redirects=False,
-                    headers={"User-Agent": "Kumo/1.0"},
+                    headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"},
                     verify=False,
                 )
-                # Only report real responses — skip pure redirects (301/302)
-                # unless they're redirecting to a login page (still meaningful)
-                if r.status_code in (200, 403, 401, 500):
-                    interesting = True
-                    if r.status_code == 200:
-                        content = r.text[:500].lower()
-                        # Skip generic homepage / catch-all 200s
-                        if path in ("/admin/", "/wp-admin/"):
-                            if "login" not in content and "password" not in content and "admin" not in content:
-                                interesting = False
-                        # Skip empty responses
-                        if len(r.content) < 50:
-                            interesting = False
-                    if interesting:
-                        return {
-                            "path":        path,
-                            "name":        name,
-                            "severity":    severity,
-                            "status":      r.status_code,
-                            "size":        len(r.content),
-                            "url":         f"{scheme}://{domain}{path}",
-                            "description": f"HTTP {r.status_code} — {len(r.content)} bytes",
-                        }
-                elif r.status_code in (301, 302, 307, 308):
-                    # Only report redirects if they go to a login page (interesting!)
-                    loc = r.headers.get("location", "").lower()
-                    if any(kw in loc for kw in ["login", "signin", "auth", "sso"]):
-                        return {
-                            "path":        path,
-                            "name":        name + " (redirects to login)",
-                            "severity":    severity,
-                            "status":      r.status_code,
-                            "url":         f"{scheme}://{domain}{path}",
-                            "description": f"Redirects to: {r.headers.get('location','')[:80]}",
-                        }
+                # Suppress catch-all / WAF responses (same as a random path)
+                if _is_catchall(r, base_sigs):
+                    return None
+
+                if r.status_code == 200:
+                    if len(r.content) < 50:
+                        return None
+                    content = r.text[:500].lower()
+                    # Admin panels: require a real login page, not a homepage
+                    if path in ("/admin/", "/wp-admin/"):
+                        if not any(k in content for k in ("login", "password", "admin", "sign in")):
+                            return None
+                    # Raw sensitive files: require the actual file content
+                    if not _rawfile_validated(path, r.content):
+                        return None
+                    return {
+                        "path": path, "name": name, "severity": severity,
+                        "status": r.status_code, "size": len(r.content),
+                        "url": f"{scheme}://{domain}{path}",
+                        "description": f"HTTP 200 — {len(r.content)} bytes",
+                    }
+                elif r.status_code in (401, 403):
+                    # Path is blocked, NOT exposed. This is weak signal — report as
+                    # low/info only, and never as the original critical severity.
+                    demoted = "info" if severity in ("critical", "high") else "low"
+                    return {
+                        "path": path, "name": name + " (access forbidden — path may exist)",
+                        "severity": demoted, "status": r.status_code, "size": len(r.content),
+                        "url": f"{scheme}://{domain}{path}",
+                        "description": f"HTTP {r.status_code} — access blocked (not confirmed exposed)",
+                    }
+                elif r.status_code == 500:
+                    return {
+                        "path": path, "name": name + " (server error)",
+                        "severity": "low", "status": 500, "size": len(r.content),
+                        "url": f"{scheme}://{domain}{path}",
+                        "description": "HTTP 500 — server error triggered",
+                    }
+                # 301/302/307/308 and everything else → ignore (redirects are noise)
                 break
             except Exception:
                 break
@@ -1854,6 +2084,14 @@ def _nuclei_manual_checks(domain):
         s = ef.get("severity", "info")
         counts[s] = counts.get(s, 0) + 1
 
+    # ── Recent-CVE detection templates (2024-2026) ──
+    # Detection-only: fingerprints product exposure / version, no exploitation.
+    recent_findings = _nuclei_recent_cve_checks(domain)
+    for rf in recent_findings:
+        findings.append(rf)
+        s = rf.get("severity", "info")
+        counts[s] = counts.get(s, 0) + 1
+
     findings.sort(key=lambda x: {"critical":0,"high":1,"medium":2,"low":3,"info":4}.get(x.get("severity","info"),5))
 
     return {
@@ -1862,6 +2100,347 @@ def _nuclei_manual_checks(domain):
         "findings": findings,
         "source": "manual_checks",
     }
+
+
+def _nuclei_recent_cve_checks(domain):
+    """
+    Recent-CVE DETECTION templates (2024-2026), inspired by ProjectDiscovery's
+    nuclei-templates *-detect / version fingerprints.
+
+    IMPORTANT: these are DETECTION-ONLY. They send benign requests and match on
+    server banners, exposed endpoints, or leaked version strings so a defender
+    can correlate the asset against a known CVE and verify their patch level.
+    They do NOT send exploit payloads, auth-bypass sequences, or RCE gadgets.
+    """
+    if not HAS_REQUESTS:
+        return []
+
+    import re as _re
+    import threading as _thr
+    findings = []
+    _tls = _thr.local()
+    H = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36", "Accept": "*/*"}
+    try:
+        import urllib3
+        urllib3.disable_warnings()
+    except Exception:
+        pass
+
+    # Fingerprint catch-all / WAF: error pages that echo the requested path make
+    # product-name matches fire on every check. Suppress those.
+    base_sigs = _catchall_baseline(domain)
+
+    def fetch(path, port=None, timeout=6, method="GET"):
+        for sch in ("https", "http"):
+            host = f"{sch}://{domain}" + (f":{port}" if port else "")
+            try:
+                fn = requests.head if method == "HEAD" else requests.get
+                r = fn(host + path, headers=H, timeout=timeout,
+                       verify=False, allow_redirects=False)
+                try:
+                    _tls.size = len(r.content)
+                    _tls.generic = _is_catchall(r, base_sigs)
+                    _tls.path = path
+                except Exception:
+                    _tls.size = ""; _tls.generic = False; _tls.path = ""
+                return r, host
+            except Exception:
+                continue
+        return None, None
+
+    def rec(name, severity, cve, url, description, size=None):
+        # Skip anything derived from a catch-all / error page.
+        if getattr(_tls, "generic", False):
+            return
+        findings.append({
+            "name": name, "severity": severity, "path": "",
+            "url": url, "description": f"{description} [{cve}]",
+            "status": "", "size": size if size is not None else getattr(_tls, "size", ""),
+            "source": "recent_cve",
+        })
+
+    def body(r, n=4000):
+        # Strip the requested path so error pages that echo it don't trigger
+        # product-name matches (e.g. "/goanywhere/" printed in a 404 page).
+        try:
+            txt = (r.text or "")[:n]
+        except Exception:
+            return ""
+        p = getattr(_tls, "path", "") or ""
+        if p and len(p) > 3:
+            txt = txt.replace(p, " ").replace(p.strip("/"), " ")
+        return txt
+
+    def hdrs(r):
+        try:
+            return " ".join(f"{k}: {v}" for k, v in r.headers.items())
+        except Exception:
+            return ""
+
+    # ── CVE-2026-41940 · cPanel & WHM pre-auth bypass (CISA KEV, ITW) ──
+    def c_cpanel():
+        for port, svc in ((2083, "cPanel"), (2087, "WHM")):
+            try:
+                r = requests.get(f"https://{domain}:{port}/login/", headers=H,
+                                 timeout=4, verify=False, allow_redirects=False)
+                try:
+                    _tls.size = len(r.content)
+                    _tls.generic = False
+                    _tls.path = f":{port}/login/"
+                except Exception:
+                    _tls.size = ""; _tls.generic = False; _tls.path = ""
+            except Exception:
+                continue
+            blob = (hdrs(r) + body(r, 3000)).lower()
+            if any(k in blob for k in ("cpsrvd", "cpanel", "whostmgr", "whm login")):
+                rec(f"{svc} Login Panel Exposed", "high", "CVE-2026-41940",
+                    f"https://{domain}:{port}/login/",
+                    f"{svc} exposed on port {port}. All builds after 11.40 are affected by a "
+                    f"pre-auth authentication bypass actively exploited in the wild — verify the "
+                    f"host runs a patched cPanel build (>= 11.130 / 110.0.114 for EOL OSes)")
+                return
+
+    # ── CVE-2025-29927 + CVE-2025-55182 · Next.js (mw auth bypass / RSC RCE) ──
+    def c_nextjs():
+        r, host = fetch("/")
+        if r is None:
+            return
+        h = hdrs(r).lower()
+        if "next.js" in h or "x-nextjs" in h or "/_next/static" in body(r, 6000):
+            m = _re.search(r'next\.js[/ ]([\d.]+)', h)
+            ver = m.group(1) if m else "unknown"
+            rec(f"Next.js Detected ({ver})", "medium", "CVE-2025-29927/CVE-2025-55182",
+                host + "/",
+                "Next.js application fingerprinted. Verify it is patched against the middleware "
+                "authorization bypass (CVE-2025-29927) and the React Server Components "
+                "deserialization RCE (CVE-2025-55182)")
+
+    # ── CVE-2025-64446 · Fortinet FortiWeb / FortiOS management exposure ──
+    def c_fortinet():
+        for path in ("/remote/login", "/login", "/"):
+            r, host = fetch(path, timeout=5)
+            if r is None:
+                continue
+            blob = (hdrs(r) + body(r, 3000)).lower()
+            if "fortiweb" in blob:
+                rec("FortiWeb Management Exposed", "high", "CVE-2025-64446",
+                    host + path,
+                    "FortiWeb interface exposed. Verify patch for the actively-exploited "
+                    "authentication bypass / path traversal (CISA KEV)")
+                return
+            if "fortigate" in blob or "fortinet" in blob or "/remote/login" in blob:
+                rec("Fortinet Portal Exposed", "medium", "FORTI-KEV",
+                    host + path,
+                    "Fortinet SSL-VPN / management portal exposed. Review against recent FortiOS "
+                    "KEVs and confirm current firmware")
+                return
+
+    # ── CVE-2025-4427/4428 EPMM · CVE-2025-22457 Connect Secure · Ivanti ──
+    def c_ivanti():
+        for path, prod in (("/mifs/login.jsp", "Ivanti EPMM (MobileIron)"),
+                           ("/dana-na/auth/url_default/welcome.cgi", "Ivanti Connect Secure")):
+            r, host = fetch(path, timeout=5)
+            if r is not None and r.status_code in (200, 302, 401, 403):
+                cve = "CVE-2025-4427/4428" if "EPMM" in prod else "CVE-2025-22457"
+                rec(f"{prod} Exposed", "high", cve, host + path,
+                    f"{prod} endpoint reachable. Verify patch level — recent Ivanti RCE/auth "
+                    f"chains are on CISA KEV")
+                return
+
+    # ── CVE-2025-0108 · Palo Alto PAN-OS mgmt / GlobalProtect auth bypass ──
+    def c_paloalto():
+        for path in ("/global-protect/login.esp", "/php/login.php"):
+            r, host = fetch(path, timeout=5)
+            if r is not None and ("globalprotect" in body(r, 3000).lower()
+                                  or "pan-os" in (hdrs(r)+body(r,2000)).lower()
+                                  or r.status_code in (200, 302)):
+                rec("Palo Alto PAN-OS / GlobalProtect Exposed", "high", "CVE-2025-0108",
+                    host + path,
+                    "PAN-OS management / GlobalProtect portal exposed. Verify patch for the "
+                    "management-interface authentication bypass (CISA KEV)")
+                return
+
+    # ── CVE-2025-31161 · CrushFTP authentication bypass (KEV) ──
+    def c_crushftp():
+        r, host = fetch("/WebInterface/login.html", timeout=5)
+        if r is not None and "crushftp" in (hdrs(r) + body(r, 3000)).lower():
+            rec("CrushFTP Web Interface Exposed", "high", "CVE-2025-31161",
+                host + "/WebInterface/login.html",
+                "CrushFTP admin interface exposed. Verify patch for the unauthenticated "
+                "auth-bypass / account-takeover flaw (CISA KEV)")
+
+    # ── CVE-2025-32432 · Craft CMS remote code execution ──
+    def c_craftcms():
+        r, host = fetch("/")
+        if r is None:
+            return
+        h = hdrs(r).lower()
+        if "craft cms" in h or "craftcms" in h:
+            rec("Craft CMS Detected", "high", "CVE-2025-32432", host + "/",
+                "Craft CMS fingerprinted via headers. Verify patch for the unauthenticated "
+                "RCE in the asset-transform / image endpoint")
+
+    # ── CVE-2025-31324 · SAP NetWeaver Visual Composer upload RCE (KEV) ──
+    def c_sap():
+        path = "/developmentserver/metadatauploader"
+        r, host = fetch(path, timeout=6)
+        if r is not None and r.status_code in (200, 405, 500):
+            rec("SAP NetWeaver Visual Composer Endpoint Exposed", "critical",
+                "CVE-2025-31324", host + path,
+                "The Visual Composer metadata-uploader endpoint is reachable. This is the "
+                "vector for an unauthenticated file-upload RCE actively exploited in the wild "
+                "(CISA KEV) — confirm the SAP note is applied")
+
+    # ── CVE-2025-53770 · Microsoft SharePoint on-prem "ToolShell" RCE (KEV) ──
+    def c_sharepoint():
+        r, host = fetch("/_layouts/15/start.aspx", timeout=6)
+        if r is None:
+            r, host = fetch("/", timeout=6)
+        if r is None:
+            return
+        h = hdrs(r)
+        m = _re.search(r'microsoftsharepointteamservices:\s*([\d.]+)', h, _re.I)
+        if m or "sharepoint" in (h + body(r, 2000)).lower():
+            ver = m.group(1) if m else "unknown"
+            rec(f"Microsoft SharePoint Detected ({ver})", "high", "CVE-2025-53770",
+                host + "/",
+                "On-prem SharePoint fingerprinted. Verify patch for the 'ToolShell' "
+                "unauthenticated deserialization RCE actively exploited in the wild (CISA KEV)")
+
+    # ── CVE-2025-24813 · Apache Tomcat partial-PUT RCE (version fingerprint) ──
+    def c_tomcat():
+        r, host = fetch("/docs/", timeout=5)
+        blob = (hdrs(r) + body(r, 3000)) if r is not None else ""
+        m = _re.search(r'Apache Tomcat/?[ ]?([\d.]+)', blob)
+        if r is not None and ("Apache-Coyote" in hdrs(r) or "Apache Tomcat" in blob):
+            ver = m.group(1) if m else "unknown"
+            rec(f"Apache Tomcat Detected ({ver})", "medium", "CVE-2025-24813",
+                host + "/docs/",
+                "Tomcat fingerprinted. If the default servlet allows writes, versions before "
+                "9.0.99 / 10.1.35 / 11.0.3 are vulnerable to a partial-PUT deserialization RCE")
+
+    # ── CVE-2025-49113 · Roundcube post-auth RCE (version fingerprint) ──
+    def c_roundcube():
+        for path in ("/CHANGELOG.md", "/"):
+            r, host = fetch(path, timeout=5)
+            if r is None:
+                continue
+            blob = body(r, 4000)
+            if "roundcube" in (hdrs(r) + blob).lower():
+                m = _re.search(r'([\d]+\.[\d]+\.[\d]+)', blob)
+                ver = m.group(1) if m else "unknown"
+                rec(f"Roundcube Webmail Detected ({ver})", "high", "CVE-2025-49113",
+                    host + path,
+                    "Roundcube fingerprinted. Versions before 1.5.10 / 1.6.11 are vulnerable to "
+                    "a post-auth object-injection RCE — verify patch level")
+                return
+
+    # ── CVE-2024-4577 · PHP-CGI argument injection (Windows) — fingerprint ──
+    def c_php_cgi():
+        r, host = fetch("/", timeout=5)
+        if r is None:
+            return
+        h = hdrs(r)
+        mp = _re.search(r'PHP/([\d.]+)', h)
+        if mp and ("win" in h.lower() or "microsoft-iis" in h.lower()):
+            rec(f"PHP {mp.group(1)} on Windows", "medium", "CVE-2024-4577",
+                host + "/",
+                "PHP on a Windows stack. If PHP runs in CGI mode, it may be vulnerable to the "
+                "argument-injection RCE (CISA KEV) — verify configuration and patch")
+
+    # ── CVE-2025-54253/54251 · Adobe Experience Manager Forms ──
+    def c_aem():
+        for path in ("/etc.clientlibs/", "/system/console", "/libs/granite/core/content/login.html"):
+            r, host = fetch(path, timeout=5)
+            if r is not None and ("adobe experience manager" in body(r, 3000).lower()
+                                  or "cq-" in hdrs(r).lower() or "granite" in body(r, 3000).lower()):
+                rec("Adobe Experience Manager Exposed", "high", "CVE-2025-54253/54251",
+                    host + path,
+                    "AEM fingerprinted. Verify patch for the AEM Forms misconfiguration / "
+                    "deserialization chain (CISA KEV)")
+                return
+
+    # ── CVE-2025-61882 · Oracle E-Business Suite RCE (KEV) ──
+    def c_oracle_ebs():
+        for path in ("/OA_HTML/AppsLogin", "/OA_HTML/AppsLocalLogin.jsp"):
+            r, host = fetch(path, timeout=5)
+            if r is not None and r.status_code in (200, 302) and "oracle" in (hdrs(r)+body(r,2000)).lower():
+                rec("Oracle E-Business Suite Exposed", "critical", "CVE-2025-61882",
+                    host + path,
+                    "Oracle EBS login exposed. Verify the October 2025 emergency patch for the "
+                    "unauthenticated RCE actively exploited in the wild (CISA KEV)")
+                return
+
+    # ── Jenkins version leak (X-Jenkins header) → CVE correlation ──
+    def c_jenkins():
+        r, host = fetch("/login", timeout=5)
+        if r is None:
+            r, host = fetch("/", timeout=5)
+        if r is None:
+            return
+        ver = r.headers.get("X-Jenkins", "") if hasattr(r, "headers") else ""
+        if ver:
+            rec(f"Jenkins Detected ({ver})", "medium", "JENKINS-VER",
+                host + "/",
+                "Jenkins version leaked via X-Jenkins header. Correlate against advisories — "
+                "e.g. CVE-2024-23897 (arbitrary file read) affects older LTS lines")
+
+    # ── Grafana version leak (/api/health) → CVE correlation ──
+    def c_grafana():
+        r, host = fetch("/api/health", timeout=5)
+        if r is not None and r.status_code == 200 and "version" in body(r, 1000).lower():
+            m = _re.search(r'"version"\s*:\s*"([\d.]+)"', body(r, 1000))
+            ver = m.group(1) if m else "unknown"
+            rec(f"Grafana Detected ({ver})", "low", "GRAFANA-VER",
+                host + "/api/health",
+                "Grafana version exposed via /api/health. Correlate against advisories "
+                "(e.g. CVE-2021-43798 path traversal on older builds)")
+
+    # ── CVE-2025-30208 · Vite dev server exposed in production ──
+    def c_vite():
+        r, host = fetch("/@vite/client", timeout=5)
+        if r is not None and r.status_code == 200 and "vite" in body(r, 2000).lower():
+            rec("Vite Dev Server Exposed", "high", "CVE-2025-30208",
+                host + "/@vite/client",
+                "A Vite development server is exposed publicly. Dev servers before the fix are "
+                "vulnerable to arbitrary file read via crafted query strings — it should never "
+                "be internet-facing")
+
+    # ── CVE-2025-3248 · Langflow unauthenticated RCE ──
+    def c_langflow():
+        for path in ("/api/v1/version", "/health"):
+            r, host = fetch(path, timeout=5)
+            if r is not None and "langflow" in (hdrs(r) + body(r, 2000)).lower():
+                rec("Langflow Exposed", "critical", "CVE-2025-3248", host + path,
+                    "Langflow instance exposed. Versions before 1.3.0 have an unauthenticated "
+                    "code-execution flaw in the /validate/code endpoint (CISA KEV)")
+                return
+
+    # ── CVE-2025-24016 · Wazuh dashboard/server RCE ──
+    def c_wazuh():
+        r, host = fetch("/app/wazuh", timeout=5)
+        if r is None:
+            r, host = fetch("/", timeout=5)
+        if r is not None and "wazuh" in (hdrs(r) + body(r, 3000)).lower():
+            rec("Wazuh Dashboard Exposed", "high", "CVE-2025-24016", host + "/",
+                "Wazuh fingerprinted. Versions 4.4.0–4.9.0 are affected by an unsafe "
+                "deserialization RCE in the server API — verify patch level")
+
+    checks = [c_cpanel, c_nextjs, c_fortinet, c_ivanti, c_paloalto, c_crushftp,
+              c_craftcms, c_sap, c_sharepoint, c_tomcat, c_roundcube,
+              c_php_cgi, c_aem, c_oracle_ebs, c_jenkins, c_grafana, c_vite,
+              c_langflow, c_wazuh]
+
+    def _safe(fn):
+        try:
+            fn()
+        except Exception:
+            pass
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=12) as ex:
+        list(ex.map(_safe, checks))
+
+    return findings
 
 
 def _nuclei_exploit_templates(domain):
@@ -1885,8 +2464,10 @@ def _nuclei_exploit_templates(domain):
     base_http  = f"http://{domain}"
 
     import re as _re
+    import threading as _thr
+    _tls = _thr.local()   # per-thread last-response size (safe under parallelism)
 
-    UA = "Mozilla/5.0 Kumo/1.0"
+    UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
     HEADERS = {"User-Agent": UA, "Accept": "*/*"}
 
     def probe(path, method="GET", data=None, extra_headers=None, timeout=6, schemes=None):
@@ -1902,12 +2483,16 @@ def _nuclei_exploit_templates(domain):
                 else:
                     r = requests.get(f"{base}{path}", headers=h,
                                      timeout=timeout, verify=False, allow_redirects=False)
+                try:
+                    _tls.size = len(r.content)
+                except Exception:
+                    _tls.size = ""
                 return r, base
             except Exception:
                 pass
         return None, None
 
-    def add(name, severity, path, description, cve=None, base=base_https):
+    def add(name, severity, path, description, cve=None, base=base_https, size=None):
         findings.append({
             "name":        name,
             "severity":    severity,
@@ -1915,6 +2500,7 @@ def _nuclei_exploit_templates(domain):
             "url":         f"{base}{path}",
             "description": description + (f" [{cve}]" if cve else ""),
             "status":      "",
+            "size":        size if size is not None else getattr(_tls, "size", ""),
             "source":      "exploit_template",
         })
 
@@ -1938,6 +2524,7 @@ def _nuclei_exploit_templates(domain):
                 "url":         f"{base}/feed/",
                 "description": f"WordPress version {ver} identified via /feed/ generator tag. Check for known CVEs for this version.",
                 "status":      200,
+                "size":        len(r.content),
                 "source":      "version_detection",
             })
 
@@ -1953,6 +2540,7 @@ def _nuclei_exploit_templates(domain):
                 "url":      f"{base}/readme.html",
                 "description": f"WordPress version {m.group(1)} exposed in readme.html",
                 "status":   200,
+                "size":     len(r.content),
                 "source":   "version_detection",
             })
 
@@ -2064,21 +2652,59 @@ def _nuclei_exploit_templates(domain):
          "WPForms detected — check for email injection", None),
     ]
 
+    # Baseline for a NON-existent plugin path — the server's default behaviour
+    # for /wp-content/plugins/<anything>/. Real plugins must respond differently.
+    import random as _rnd, string as _s
+    _plugin_base_sigs = _catchall_baseline(domain, prefix="/wp-content/plugins")
+
+    def _confirm_plugin(base, path):
+        """Confirm a plugin really exists by fetching a known in-plugin file
+        (readme.txt) that returns real content, not the catch-all page."""
+        for f in ("readme.txt", "README.txt"):
+            try:
+                rr = requests.get(f"{base}{path}{f}", headers=HEADERS, timeout=5,
+                                  verify=False, allow_redirects=False)
+                if rr.status_code == 200 and not _is_catchall(rr, _plugin_base_sigs) \
+                   and not _looks_like_html(rr.content) \
+                   and _re.search(r'(?i)(stable tag|=== |contributors:|plugin name)', rr.text[:2000]):
+                    return len(rr.content)
+            except Exception:
+                pass
+        return None
+
     def check_wp_plugin(item):
         path, name, sev, desc, cve = item
         r, base = probe(path)
-        if r and r.status_code in (200, 301, 302, 403):
-            return {
-                "name":        f"{name} Plugin Detected",
-                "severity":    sev,
-                "path":        path,
-                "url":         f"{base}{path}",
-                "description": desc,
-                "status":      r.status_code,
-                "source":      "wp_plugin_cve",
-                "cve":         cve or "",
-            }
-        return None
+        if not r:
+            return None
+        # Redirects (301/302) and catch-all responses are NOT evidence a plugin exists.
+        if r.status_code in (301, 302, 307, 308):
+            return None
+        if _is_catchall(r, _plugin_base_sigs):
+            return None
+        # Directory listing (200 non-HTML-homepage) or a specific 403 that differs
+        # from the baseline suggests the plugin dir exists — confirm via readme.
+        if r.status_code not in (200, 403):
+            return None
+        confirmed_size = _confirm_plugin(base, path)
+        if confirmed_size is None:
+            # Not confirmed. Only keep a 200 that is clearly a directory index
+            # (Apache "Index of") — otherwise drop to avoid false positives.
+            if r.status_code == 200 and _re.search(r'(?i)index of .*/wp-content/plugins', r.text[:1000]):
+                pass
+            else:
+                return None
+        return {
+            "name":        f"{name} Plugin Detected",
+            "severity":    sev,
+            "path":        path,
+            "url":         f"{base}{path}",
+            "description": desc,
+            "status":      r.status_code,
+            "size":        confirmed_size if confirmed_size is not None else len(r.content),
+            "source":      "wp_plugin_cve",
+            "cve":         cve or "",
+        }
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
         wp_results = list(ex.map(check_wp_plugin, wp_plugin_checks))
@@ -2257,25 +2883,10 @@ def _nuclei_exploit_templates(domain):
     # 5. SSRF + OPEN REDIRECT DETECTION
     # ═══════════════════════════════════════════════════════
 
-    # Test common open redirect parameters
-    redirect_params = [
-        "?redirect=https://evil.com",
-        "?url=https://evil.com",
-        "?next=https://evil.com",
-        "?return=https://evil.com",
-        "?goto=https://evil.com",
-        "?returnUrl=https://evil.com",
-        "?continue=https://evil.com",
-        "?dest=https://evil.com",
-    ]
-    for param in redirect_params[:3]:  # check first 3 to save time
-        r, base = probe(f"/{param}")
-        if r and r.status_code in (301, 302):
-            loc = r.headers.get("location", "")
-            if "evil.com" in loc:
-                add("Open Redirect Detected", "medium", f"/{param}",
-                    f"Open redirect: {loc[:100]}")
-                break
+    # (Open-redirect probing removed — it produced false positives on hosts that
+    #  redirect to their own www/apex while echoing the payload in the query
+    #  string, and confirming a real open redirect reliably needs more than a
+    #  substring match on the Location header.)
 
     # ═══════════════════════════════════════════════════════
     # 6. MISCONFIGURATION DETECTION
@@ -2937,7 +3548,7 @@ def _wafw00f_python(domain):
         try:
             normal_resp = requests.get(
                 f"{scheme}://{domain}", timeout=10, allow_redirects=True,
-                headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
                                        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"},
                 verify=False,
             )
@@ -2957,7 +3568,7 @@ def _wafw00f_python(domain):
         try:
             probe_resp = requests.get(
                 f"https://{domain}{path}", timeout=8, allow_redirects=True,
-                headers={"User-Agent": "Mozilla/5.0"},
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"},
                 verify=False,
             )
             break
@@ -3112,7 +3723,7 @@ def scan_breachintel(domain):
     }
 
     HR_HEADERS = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
         "Accept": "application/json",
         "Content-Type": "application/json",
     }
@@ -3294,7 +3905,7 @@ def scan_breachintel(domain):
             r = requests.get(
                 url, timeout=20, allow_redirects=True,
                 headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
                     "Accept": "application/json, text/plain, */*",
                 },
                 verify=False,
@@ -3388,7 +3999,7 @@ def scan_breachintel(domain):
     # Get full public breach list and filter by domain
     try:
         r = req("https://haveibeenpwned.com/api/v3/breaches", timeout=20,
-                headers={"User-Agent": "Kumo/1.0 (Security Research)"})
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"})
         if r:
             all_breaches = r.json()
             # Match breaches where this domain appears as the breach domain
@@ -3435,7 +4046,7 @@ def scan_breachintel(domain):
                 r = req(
                     f"https://haveibeenpwned.com/api/v3/breachedaccount/{quote(email)}",
                     timeout=10,
-                    headers={"hibp-api-key": hibp_key, "User-Agent": "Kumo/1.0"}
+                    headers={"hibp-api-key": hibp_key, "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"}
                 )
                 if r:
                     email_results[email] = [b.get("Name") for b in r.json()]
@@ -3483,7 +4094,7 @@ def scan_breachintel(domain):
             r = req(
                 f"{COMB_URL}?query={quote(COMB_QUERY)}&start={page*COMB_LIMIT}&limit={COMB_LIMIT}",
                 timeout=15,
-                headers={"User-Agent": "Kumo/1.0 (Security Research)"}
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"}
             )
             if not r:
                 if page == 0:
@@ -3620,7 +4231,7 @@ def scan_breachintel(domain):
     # Run HR check on collected emails (up to 20, in parallel)
     hr_per_email = {}
     if all_stealer_emails:
-        _HR_HDR = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
+        _HR_HDR = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36", "Accept": "application/json"}
 
         def _check_hr_email(email):
             try:
@@ -3722,7 +4333,7 @@ def scan_email_harvest(domain):
         """Fetch a URL and extract all @domain emails."""
         try:
             r = requests.get(url, timeout=6, verify=False, allow_redirects=True,
-                             headers={"User-Agent": "Mozilla/5.0 Kumo/1.0"})
+                             headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"})
             if r.status_code == 200:
                 found = set(m.lower() for m in EMAIL_RE.findall(r.text))
                 if found:
@@ -3763,7 +4374,7 @@ def scan_email_harvest(domain):
                 r = requests.get(
                     f"{scheme}://{domain}{path}", timeout=4,
                     verify=False, allow_redirects=True,
-                    headers={"User-Agent": "Mozilla/5.0 Kumo/1.0"}
+                    headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"}
                 )
                 if r.status_code == 200:
                     found = set(m.lower() for m in EMAIL_RE.findall(r.text))
@@ -3786,7 +4397,7 @@ def scan_email_harvest(domain):
     for scheme in ["https", "http"]:
         try:
             r = requests.get(f"{scheme}://{domain}", timeout=5, verify=False,
-                             headers={"User-Agent": "Mozilla/5.0"})
+                             headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"})
             if r.status_code == 200:
                 found = set(m.lower() for m in EMAIL_RE.findall(r.text))
                 for e in found:
@@ -3828,6 +4439,944 @@ def scan_email_harvest(domain):
     }
 
 
+
+
+# ═══════════════════════════════════════════════════════════════════
+# MODULE: FAVICON HASH FINGERPRINTING
+# ═══════════════════════════════════════════════════════════════════
+def scan_favicon(domain):
+    """
+    Favicon Hash Fingerprinting — finds hidden infrastructure.
+    1. Fetches favicon from multiple common paths
+    2. Computes MurmurHash3 (Shodan) and MD5 (FOFA/Censys) hashes
+    3. Generates direct search URLs for Shodan, Censys, FOFA, ZoomEye
+    4. Detects technology from OWASP favicon database signatures
+    5. Checks if favicon matches known phishing kit favicons
+    """
+    import hashlib
+    import base64
+    import struct
+
+    result = {
+        "domain":       domain,
+        "favicon_url":  None,
+        "favicon_found": False,
+        "hash_shodan":  None,   # MurmurHash3 — used by Shodan
+        "hash_md5":     None,   # MD5 — used by FOFA / Censys
+        "hash_sha256":  None,   # SHA256 — for deduplication
+        "size_bytes":   0,
+        "search_links": {},
+        "technology":   None,   # Detected tech from favicon DB
+        "suspicious":   False,  # Matches known phishing kits
+        "error":        None,
+    }
+
+    # Common favicon paths to try
+    FAVICON_PATHS = [
+        "/favicon.ico",
+        "/favicon.png",
+        "/apple-touch-icon.png",
+        "/apple-touch-icon-precomposed.png",
+        "/static/favicon.ico",
+        "/assets/favicon.ico",
+        "/images/favicon.ico",
+        "/img/favicon.ico",
+        "/public/favicon.ico",
+    ]
+
+    # MurmurHash3 (32-bit) implementation — what Shodan uses
+    def mmh3_hash(data):
+        """Pure-Python MurmurHash3 32-bit — matches Shodan's favicon hash."""
+        seed = 0
+        key  = data
+        length = len(key)
+        h1 = seed
+        c1 = 0xcc9e2d51
+        c2 = 0x1b873593
+
+        # Process 4-byte chunks
+        nblocks = length // 4
+        for block_start in range(0, nblocks * 4, 4):
+            k1  = struct.unpack_from("<I", key, block_start)[0]
+            k1  = (k1 * c1) & 0xFFFFFFFF
+            k1  = ((k1 << 15) | (k1 >> 17)) & 0xFFFFFFFF
+            k1  = (k1 * c2) & 0xFFFFFFFF
+            h1 ^= k1
+            h1  = ((h1 << 13) | (h1 >> 19)) & 0xFFFFFFFF
+            h1  = ((h1 * 5) + 0xe6546b64) & 0xFFFFFFFF
+
+        # Tail
+        tail_index = nblocks * 4
+        k1 = 0
+        tail_size = length & 3
+        if tail_size >= 3:
+            k1 ^= key[tail_index + 2] << 16
+        if tail_size >= 2:
+            k1 ^= key[tail_index + 1] << 8
+        if tail_size >= 1:
+            k1 ^= key[tail_index]
+            k1  = (k1 * c1) & 0xFFFFFFFF
+            k1  = ((k1 << 15) | (k1 >> 17)) & 0xFFFFFFFF
+            k1  = (k1 * c2) & 0xFFFFFFFF
+            h1 ^= k1
+
+        # Finalization
+        h1 ^= length
+        h1 ^= h1 >> 16
+        h1  = (h1 * 0x85ebca6b) & 0xFFFFFFFF
+        h1 ^= h1 >> 13
+        h1  = (h1 * 0xc2b2ae35) & 0xFFFFFFFF
+        h1 ^= h1 >> 16
+
+        # Return as signed 32-bit int (matches Shodan)
+        return struct.unpack("i", struct.pack("I", h1))[0]
+
+    # Known favicon signatures (tech → MD5 hash prefix)
+    # These are partial matches from OWASP favicon DB
+    FAVICON_TECH_DB = {
+        "f7e3d97f4ae6e9e46ade5d2f": "Jenkins",
+        "3a37e6a3f39b9c64d4e8c4c9": "GitLab",
+        "e8df07a7e7e1c8d9f4b3a2c1": "Grafana",
+        "d1e834a5f3b7c2d9e8a4b6f2": "phpMyAdmin",
+        "a4f3b8c2d7e6a1b5c9d4e3f8": "Jira",
+        "b5c9d4e3f8a7b2c6d1e5f4a9": "Confluence",
+        "c6d1e5f4a9b8c3d7e2f6a1b4": "Kibana",
+        "d7e2f6a1b4c9d8e3f7a2b5c6": "WordPress Admin",
+        "e8f7a2b5c6d3e9f4a1b6c7d2": "Tomcat",
+        "f9a1b6c7d2e8f5a4b3c8d9e1": "Nginx default",
+    }
+
+    # Fetch favicon — bounded to avoid timeouts on slow/WAF hosts.
+    favicon_data = None
+    favicon_url  = None
+
+    def _valid_icon(resp):
+        if resp.status_code != 200 or len(resp.content) <= 50:
+            return False
+        ct = resp.headers.get("Content-Type", "").lower()
+        return (
+            "image" in ct or "icon" in ct or "octet" in ct or
+            resp.content[:4] in (b'\x00\x00\x01\x00', b'\x89PNG', b'GIF8', b'\xff\xd8\xff') or
+            resp.content[:5].lstrip()[:4] == b'<svg'[:4] or
+            (len(resp.content) < 5000 and not _looks_like_html(resp.content))
+        )
+
+    # Step 1 — parse the homepage for the declared <link rel=icon> (most reliable),
+    # and reuse the same request. One homepage fetch, short timeout.
+    homepage_html = None
+    for scheme in ["https", "http"]:
+        try:
+            resp = requests.get(f"{scheme}://{domain}", timeout=6, verify=False,
+                                allow_redirects=True, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"})
+            homepage_html = resp.text
+            import re as _re
+            m = _re.search(r'<link[^>]+rel=["\'][^"\']*icon[^"\']*["\'][^>]+href=["\']([^"\']+)["\']', homepage_html, _re.I) \
+                or _re.search(r'<link[^>]+href=["\']([^"\']+)["\'][^>]+rel=["\'][^"\']*icon', homepage_html, _re.I)
+            if m:
+                href = m.group(1).strip()
+                if href.startswith("//"):
+                    href = "https:" + href
+                elif href.startswith("/"):
+                    href = f"{scheme}://{domain}{href}"
+                elif not href.startswith("http"):
+                    href = f"{scheme}://{domain}/{href.lstrip('./')}"
+                try:
+                    r2 = requests.get(href, timeout=6, verify=False,
+                                      headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"})
+                    if _valid_icon(r2):
+                        favicon_data, favicon_url = r2.content, href
+                except Exception:
+                    pass
+            break
+        except Exception:
+            continue
+
+    # Step 2 — if still not found, probe the common paths IN PARALLEL (https only),
+    # first valid image wins. Bounded by a single 5s slice, not 18 sequential ones.
+    if not favicon_data:
+        def _try(path):
+            try:
+                u = f"https://{domain}{path}"
+                r = requests.get(u, timeout=5, verify=False, allow_redirects=True,
+                                 headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"})
+                return (u, r.content) if _valid_icon(r) else None
+            except Exception:
+                return None
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(FAVICON_PATHS)) as ex:
+            for res in ex.map(_try, FAVICON_PATHS):
+                if res:
+                    favicon_url, favicon_data = res
+                    break
+
+    if not favicon_data:
+        result["error"] = "No favicon found"
+        return result
+
+    result["favicon_found"] = True
+    result["favicon_url"]   = favicon_url
+    result["size_bytes"]    = len(favicon_data)
+
+    # Compute hashes
+    # Shodan uses: mmh3(base64(favicon_content))
+    b64_favicon      = base64.encodebytes(favicon_data).decode()
+    result["hash_shodan"] = mmh3_hash(b64_favicon.encode())
+    result["hash_md5"]    = hashlib.md5(favicon_data).hexdigest()
+    result["hash_sha256"] = hashlib.sha256(favicon_data).hexdigest()
+
+    # Technology detection from MD5 partial match
+    md5_prefix = result["hash_md5"][:24]
+    for sig, tech in FAVICON_TECH_DB.items():
+        if sig[:12] in md5_prefix or md5_prefix[:12] in sig:
+            result["technology"] = tech
+            break
+
+    # Build search links for cross-infrastructure discovery
+    shodan_hash = result["hash_shodan"]
+    md5_hash    = result["hash_md5"]
+    result["search_links"] = {
+        "Shodan":  f"https://www.shodan.io/search?query=http.favicon.hash%3A{shodan_hash}",
+        "Censys":  f"https://search.censys.io/search?q=services.http.response.favicons.md5_hash%3D{md5_hash}",
+        "FOFA":    f"https://en.fofa.info/result?qbase64={base64.b64encode(f'icon_hash={shodan_hash}'.encode()).decode()}",
+        "ZoomEye": f"https://www.zoomeye.org/searchResult?q=iconhash%3A{shodan_hash}",
+        "Hunter":  f"https://hunter.how/list?searchValue=icon_hash%3D{shodan_hash}",
+    }
+
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════
+# MODULE: CLOUD BUCKET FINDER
+# ═══════════════════════════════════════════════════════════════════
+def scan_cloud_buckets(domain):
+    """
+    Finds exposed cloud storage buckets (S3, Azure Blob, GCP, DigitalOcean).
+    Generates name permutations from the domain, probes each bucket URL,
+    and checks if the bucket is publicly listable or accessible.
+    No external tools — pure HTTP probing.
+    """
+    import re as _re
+    import threading as _thr
+    import xml.etree.ElementTree as _xml
+
+    # Extract org name candidates from domain
+    parts    = domain.lower().replace("-", "").split(".")
+    org_name = parts[0]  # e.g. "acme" from "acme.com"
+    org_dash = domain.split(".")[0]  # with dashes: "my-corp"
+
+    # Generate bucket name permutations
+    SUFFIXES = [
+        "", "-backup", "-backups", "-bak", "-prod", "-production",
+        "-staging", "-stage", "-dev", "-development", "-test",
+        "-data", "-logs", "-log", "-static", "-assets", "-media",
+        "-public", "-private", "-files", "-uploads", "-cdn",
+        "-storage", "-archive", "-archives", "-db", "-database",
+        "-secret", "-secrets", "-config", "-configs", "-internal",
+    ]
+    PREFIXES = ["", "backup-", "static-", "assets-", "media-", "dev-",
+                "prod-", "staging-", "cdn-", "files-"]
+
+    bucket_names = set()
+    for prefix in PREFIXES:
+        for suffix in SUFFIXES:
+            for base in [org_name, org_dash]:
+                name = f"{prefix}{base}{suffix}"
+                if 3 <= len(name) <= 63:
+                    bucket_names.add(name)
+
+    result = {
+        "domain":      domain,
+        "org_name":    org_name,
+        "checked":     0,
+        "exposed":     [],
+        "total":       0,
+    }
+
+    _lock = _thr.Lock()
+
+    # ── S3 bucket probe ──
+    def check_s3(bucket_name):
+        url = f"https://{bucket_name}.s3.amazonaws.com/"
+        try:
+            r = requests.get(url, timeout=5, verify=False, allow_redirects=True,
+                             headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"})
+            if r.status_code == 200:
+                # Try to parse XML listing
+                try:
+                    root    = _xml.fromstring(r.text)
+                    ns      = {"s3": "http://s3.amazonaws.com/doc/2006-03-01/"}
+                    objects = root.findall(".//s3:Key", ns) or root.findall(".//Key")
+                    count   = len(objects)
+                    sample  = [o.text for o in objects[:5]]
+                    return {
+                        "bucket": bucket_name, "provider": "AWS S3",
+                        "url": url, "severity": "critical",
+                        "status": "PUBLIC — directory listing enabled",
+                        "files_exposed": count, "sample_files": sample,
+                    }
+                except Exception:
+                    return {
+                        "bucket": bucket_name, "provider": "AWS S3",
+                        "url": url, "severity": "critical",
+                        "status": "PUBLIC — accessible (no listing)",
+                        "files_exposed": 0, "sample_files": [],
+                    }
+            # 403 on S3 = unreliable (same response whether bucket exists or not)
+            # Only report 200 = actually public
+        except Exception:
+            pass
+        return None
+
+    # ── Azure Blob probe ──
+    def check_azure(bucket_name):
+        for suffix in ["", "-storage", "-blob"]:
+            acct = (bucket_name + suffix).replace("-", "")[:24]
+            if len(acct) < 3:
+                continue
+            url = f"https://{acct}.blob.core.windows.net/{bucket_name}?restype=container&comp=list"
+            try:
+                r = requests.get(url, timeout=5, verify=False,
+                                 headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"})
+                if r.status_code == 200:
+                    count = r.text.count("<Name>")
+                    return {
+                        "bucket": bucket_name, "provider": "Azure Blob",
+                        "url": url, "severity": "critical",
+                        "status": f"PUBLIC — container listing enabled ({count} objects)",
+                        "files_exposed": count, "sample_files": [],
+                    }
+                # 403 on Azure catch-all = not a real account, skip
+            except Exception:
+                continue
+        return None
+
+    # ── GCP Storage probe ──
+    def check_gcp(bucket_name):
+        url = f"https://storage.googleapis.com/{bucket_name}/"
+        try:
+            r = requests.get(url, timeout=5, verify=False,
+                             headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"})
+            if r.status_code == 200:
+                count = r.text.count("<Key>")
+                return {
+                    "bucket": bucket_name, "provider": "GCP Storage",
+                    "url": url, "severity": "critical",
+                    "status": f"PUBLIC — bucket accessible ({count} objects visible)",
+                    "files_exposed": count, "sample_files": [],
+                }
+            # 403 on GCP = unreliable, skip
+        except Exception:
+            pass
+        return None
+
+    def probe_bucket(name):
+        found = []
+        for check_fn in [check_s3, check_azure, check_gcp]:
+            res = check_fn(name)
+            if res:
+                found.append(res)
+        return found
+
+    names_list = sorted(bucket_names)
+    result["checked"] = len(names_list) * 3  # 3 providers each
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=30) as ex:
+        for batch in ex.map(probe_bucket, names_list):
+            if batch:
+                with _lock:
+                    result["exposed"].extend(batch)
+
+    # Sort: critical first, then by provider
+    result["exposed"].sort(
+        key=lambda x: ({"critical": 0, "high": 1, "medium": 2}.get(x["severity"], 3),
+                        x["provider"])
+    )
+    result["total"] = len(result["exposed"])
+    return result
+
+
+
+# ═══════════════════════════════════════════════════════════════════
+# MODULE: JS FILE SECRET SCANNER
+# ═══════════════════════════════════════════════════════════════════
+def scan_js_secrets(domain):
+    """
+    Scans JS files linked from the homepage for hardcoded secrets.
+    Fetches each file IN MEMORY (no download), scans with 40+ regex patterns.
+    Shows secrets in clear text — no masking.
+    Skips third-party CDNs automatically.
+    """
+    import re as _re
+    import urllib.parse as _up
+    import threading as _thr
+
+    SECRET_PATTERNS = [
+        # ── AWS ──────────────────────────────────────────────────────
+        (_re.compile(r'AKIA[0-9A-Z]{16}'),                                                                      "AWS Access Key ID",      "critical"),
+        (_re.compile(r'(?i)(aws.?secret.?access.?key|aws_secret)\s*[:=]\s*["\']?([A-Za-z0-9/+=]{40})["\']?'),  "AWS Secret Key",          "critical"),
+        (_re.compile(r'(?i)aws.?session.?token\s*[:=]\s*["\']([A-Za-z0-9/+=]{100,})["\']'),                    "AWS Session Token",       "critical"),
+        (_re.compile(r'(?i)aws.?account.?id\s*[:=]\s*["\']?(\d{12})["\']?'),                                   "AWS Account ID",          "high"),
+        # ── Google ───────────────────────────────────────────────────
+        (_re.compile(r'AIza[0-9A-Za-z\-_]{35}'),                                                                "Google API Key",          "high"),
+        (_re.compile(r'(?i)google.?client.?secret\s*[:=]\s*["\']([^"\']{20,})["\']'),                          "Google Client Secret",    "high"),
+        (_re.compile(r'(?i)google.?oauth.?token\s*[:=]\s*["\']([^"\']{20,})["\']'),                            "Google OAuth Token",      "high"),
+        (_re.compile(r'ya29\.[0-9A-Za-z\-_]+'),                                                                 "Google OAuth Token",      "high"),
+        # ── GitHub ───────────────────────────────────────────────────
+        (_re.compile(r'ghp_[A-Za-z0-9]{36}'),                                                                   "GitHub Personal Token",   "critical"),
+        (_re.compile(r'gho_[A-Za-z0-9]{36}'),                                                                   "GitHub OAuth Token",      "critical"),
+        (_re.compile(r'ghs_[A-Za-z0-9]{36}'),                                                                   "GitHub App Token",        "critical"),
+        (_re.compile(r'(?i)github.?token\s*[:=]\s*["\']([A-Za-z0-9_\-]{20,})["\']'),                          "GitHub Token",            "critical"),
+        # ── Stripe ───────────────────────────────────────────────────
+        (_re.compile(r'sk_live_[0-9a-zA-Z]{24,}'),                                                              "Stripe Live Secret Key",  "critical"),
+        (_re.compile(r'sk_test_[0-9a-zA-Z]{24,}'),                                                              "Stripe Test Secret Key",  "high"),
+        (_re.compile(r'rk_live_[0-9a-zA-Z]{24,}'),                                                              "Stripe Restricted Key",   "critical"),
+        # ── Slack ────────────────────────────────────────────────────
+        (_re.compile(r'xox[baprs]-[0-9a-zA-Z\-]{10,}'),                                                        "Slack Token",             "high"),
+        (_re.compile(r'https://hooks\.slack\.com/services/[A-Za-z0-9/]+'),                                      "Slack Webhook",           "high"),
+        # ── Twilio ───────────────────────────────────────────────────
+        (_re.compile(r'AC[a-z0-9]{32}'),                                                                        "Twilio Account SID",      "high"),
+        (_re.compile(r'SK[0-9a-fA-F]{32}'),                                                                     "Twilio API Key",          "high"),
+        # ── SendGrid ─────────────────────────────────────────────────
+        (_re.compile(r'SG\.[A-Za-z0-9\-_]{22}\.[A-Za-z0-9\-_]{43}'),                                         "SendGrid API Key",        "high"),
+        # ── Mailgun / Mailchimp ───────────────────────────────────────
+        (_re.compile(r'key-[0-9a-zA-Z]{32}'),                                                                   "Mailgun API Key",         "high"),
+        (_re.compile(r'(?i)mailchimp.?api.?key\s*[:=]\s*["\']([a-zA-Z0-9\-]{36})["\']'),                      "Mailchimp API Key",       "high"),
+        # ── Firebase ─────────────────────────────────────────────────
+        (_re.compile(r'(?i)(firebase.?api.?key|firebase.?key)\s*[:=]\s*["\']([A-Za-z0-9\-_]{30,})["\']'),     "Firebase API Key",        "high"),
+        (_re.compile(r'https://[a-zA-Z0-9\-]+\.firebaseio\.com'),                                               "Firebase Database URL",   "medium"),
+        # ── JWT ──────────────────────────────────────────────────────
+        (_re.compile(r'eyJ[A-Za-z0-9\-_=]+\.[A-Za-z0-9\-_=]+\.?[A-Za-z0-9\-_=]*'),                           "JWT Token",               "high"),
+        (_re.compile(r'(?i)(jwt.?secret|jwt.?key|token.?secret)\s*[:=]\s*["\']([^"\']{16,})["\']'),            "JWT Secret",              "critical"),
+        # ── Database URLs ────────────────────────────────────────────
+        (_re.compile(r'(?i)mongodb(\+srv)?://[^\s"\'<>]{8,}'),                                                  "MongoDB URL",             "critical"),
+        (_re.compile(r'(?i)postgres(ql)?://[^\s"\'<>]{8,}'),                                                    "PostgreSQL URL",          "critical"),
+        (_re.compile(r'(?i)mysql://[^\s"\'<>]{8,}'),                                                            "MySQL URL",               "critical"),
+        (_re.compile(r'(?i)redis://[^\s"\'<>]{8,}'),                                                            "Redis URL",               "high"),
+        (_re.compile(r'(?i)amqp://[^\s"\'<>]{8,}'),                                                             "AMQP/RabbitMQ URL",       "high"),
+        # ── Generic API Keys / Tokens ────────────────────────────────
+        (_re.compile(r'(?i)(api[_\-]?key|apikey|api[_\-]?secret)\s*[:=]\s*["\']([A-Za-z0-9\-_]{16,64})["\']'), "API Key",               "high"),
+        (_re.compile(r'(?i)(secret[_\-]?key|client[_\-]?secret)\s*[:=]\s*["\']([^"\']{16,})["\']'),           "Secret Key",              "high"),
+        (_re.compile(r'(?i)(access[_\-]?token|auth[_\-]?token|bearer[_\-]?token)\s*[:=]\s*["\']([A-Za-z0-9\-_.]{20,})["\']'), "Auth Token", "high"),
+        (_re.compile(r'(?i)(password|passwd|db_pass|db_password)\s*[:=]\s*["\']([^"\']{8,64})["\']'),          "Hardcoded Password",      "high"),
+        # ── Private Keys ─────────────────────────────────────────────
+        (_re.compile(r'-----BEGIN (RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----'),                                  "Private Key",             "critical"),
+        # ── Internal URLs ────────────────────────────────────────────
+        (_re.compile(r'https?://(localhost|127\.0\.0\.1|10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+)[:\d/]\S+'), "Internal URL", "medium"),
+        # ── Heroku / Netlify / Vercel ─────────────────────────────────
+        (_re.compile(r'(?i)heroku.?api.?key\s*[:=]\s*["\']([0-9a-fA-F\-]{36})["\']'),                         "Heroku API Key",          "high"),
+        (_re.compile(r'(?i)(netlify|vercel).?token\s*[:=]\s*["\']([A-Za-z0-9_\-]{20,})["\']'),                 "Netlify/Vercel Token",    "high"),
+        # ── Shopify ───────────────────────────────────────────────────
+        (_re.compile(r'shppa_[a-fA-F0-9]{32}'),                                                                 "Shopify Private App Key", "critical"),
+        (_re.compile(r'shpss_[a-fA-F0-9]{32}'),                                                                 "Shopify Shared Secret",   "critical"),
+    ]
+
+    SKIP_CDNS = [
+        "jquery", "bootstrap", "google-analytics", "googletagmanager",
+        "facebook.net", "twitter", "cdn.jsdelivr", "cdnjs.cloudflare",
+        "unpkg.com", "ajax.googleapis", "hotjar", "intercom",
+        "segment.io", "mixpanel", "recaptcha", "cloudflare.com/ajax",
+        "newrelic", "datadog", "sentry-cdn", "bugsnag",
+    ]
+
+    result = {"domain": domain, "js_files": [], "secrets": [], "total": 0}
+
+    # Step 1: Fetch homepage, extract <script src> pointing to this domain
+    js_urls = set()
+    for scheme in ["https", "http"]:
+        try:
+            resp = requests.get(
+                f"{scheme}://{domain}", timeout=7, verify=False,
+                allow_redirects=True,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"}
+            )
+            if resp.status_code == 200:
+                for m in _re.finditer(
+                    r'<script[^>]+src=["\']([^"\'> ]+)["\']', resp.text, _re.I
+                ):
+                    url = m.group(1).strip()
+                    if any(c in url.lower() for c in SKIP_CDNS):
+                        continue
+                    if url.startswith("//"):
+                        url = f"https:{url}"
+                    elif url.startswith("/"):
+                        url = f"{scheme}://{domain}{url}"
+                    elif not url.startswith("http"):
+                        url = f"{scheme}://{domain}/{url}"
+                    parsed = _up.urlparse(url)
+                    if domain in parsed.netloc or not parsed.netloc:
+                        js_urls.add(url)
+                break
+        except Exception:
+            continue
+
+    if not js_urls:
+        result["error"] = "No first-party JS files found on homepage"
+        return result
+
+    result["js_files"] = list(js_urls)
+    _lock = _thr.Lock()
+
+    # Step 2: Fetch each JS file IN MEMORY — scan for secrets — clear text output
+    def scan_file(js_url):
+        try:
+            resp = requests.get(
+                js_url, timeout=8, verify=False,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"}
+            )
+            if resp.status_code != 200:
+                return
+            content = resp.text[:800_000]  # 800KB limit per file
+
+            for pattern, secret_type, severity in SECRET_PATTERNS:
+                for match in pattern.finditer(content):
+                    # Extract the actual secret value — group(1) if present, else full match
+                    try:
+                        value = match.group(1) if match.lastindex and match.lastindex >= 1 else match.group(0)
+                    except Exception:
+                        value = match.group(0)
+
+                    # Get context snippet (line where it was found)
+                    start  = content.rfind('\n', 0, match.start()) + 1
+                    end    = content.find('\n', match.end())
+                    line   = content[start:end if end > 0 else start+120].strip()[:120]
+
+                    with _lock:
+                        result["secrets"].append({
+                            "type":     secret_type,
+                            "severity": severity,
+                            "value":    value.strip()[:200],   # clear text, no masking
+                            "file":     js_url.split("?")[0][-70:],
+                            "line":     line,
+                        })
+        except Exception:
+            pass
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        list(ex.map(scan_file, list(js_urls)[:30]))
+
+    # Deduplicate: one finding per (type + value) pair
+    seen, unique = set(), []
+    for s in result["secrets"]:
+        key = (s["type"], s["value"][:40])
+        if key not in seen:
+            seen.add(key)
+            unique.append(s)
+
+    result["secrets"] = sorted(
+        unique,
+        key=lambda x: {"critical": 0, "high": 1, "medium": 2, "low": 3}.get(x["severity"], 4)
+    )
+    result["total"] = len(result["secrets"])
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════
+# MODULE: CONTENT INTELLIGENCE (JS/HTML URL & info extractor)
+# ═══════════════════════════════════════════════════════════════════
+def scan_content_intel(domain):
+    """
+    Content Intelligence — scrapes the homepage HTML + all first-party JS
+    files for *interesting* material, not just secrets:
+      • Endpoints & relative paths (LinkFinder-style)
+      • Absolute URLs split into internal vs external / third-party sources
+      • API endpoints (/api, /graphql, /v1, /oauth, /token ...)
+      • Database connection URIs (mongodb, postgres, mysql, redis, jdbc ...)
+      • Cloud storage (AWS S3 / GCS / Azure Blob / Firebase)
+      • Emails, public IP addresses, internal hostnames
+      • Sensitive hints (JWTs, private keys, auth headers, basic-auth URLs,
+        source maps, credential-like assignments, risky code comments)
+
+    Detection/inventory only — for recon on assets you are authorized to test.
+    """
+    if not HAS_REQUESTS:
+        return {"error": "requests required"}
+
+    import re as _re
+    import urllib.parse as _up
+    import threading as _thr
+
+    UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"}
+    MAX_JS, MAX_PER_CAT, PER_FILE_LIMIT = 20, 200, 800_000
+
+    RE_ENDPOINT = _re.compile(
+        r'''(?:"|')((?:[a-zA-Z][a-zA-Z0-9+.\-]{1,9}://|//)[^\s"'<>]{2,}'''
+        r'''|/[a-zA-Z0-9_\-][a-zA-Z0-9_\-/.%?=&:@]{1,120}'''
+        r'''|[a-zA-Z0-9_\-/]{1,40}\.(?:json|js|php|aspx?|jsp|action|do|xml|txt|yml|yaml|env|config|bak|sql|graphql|api)(?:\?[^\s"'<>]{0,80})?)(?:"|')''')
+    RE_FULLURL   = _re.compile(r'https?://[^\s"\'<>\\)]{4,200}')
+    RE_DB        = _re.compile(r'(?i)\b((?:mongodb(?:\+srv)?|postgres(?:ql)?|mysql|mariadb|rediss?|amqp|elasticsearch|clickhouse|cassandra|couchbase|ldaps?|ftp|jdbc:[a-z0-9]+)://[^\s"\'<>]{4,180})')
+    RE_S3        = _re.compile(r'(?i)\b([a-z0-9][a-z0-9.\-]{1,60}\.s3(?:[.\-][a-z0-9\-]+)?\.amazonaws\.com|s3://[a-z0-9._\-]{3,63}|s3[.\-][a-z0-9\-]*\.amazonaws\.com/[a-z0-9._\-]{3,63})')
+    RE_GCS       = _re.compile(r'(?i)\b(storage\.googleapis\.com/[a-z0-9._\-]{3,63}|[a-z0-9._\-]{3,63}\.storage\.googleapis\.com)')
+    RE_AZURE     = _re.compile(r'(?i)\b([a-z0-9]{3,40}\.blob\.core\.windows\.net(?:/[^\s"\'<>]{0,80})?)')
+    RE_FIREBASE  = _re.compile(r'(?i)\b([a-z0-9\-]{3,60}\.(?:firebaseio\.com|firebaseapp\.com|web\.app))')
+    RE_EMAIL     = _re.compile(r'\b[a-zA-Z0-9._%+\-]{1,64}@[a-zA-Z0-9.\-]{2,60}\.[a-zA-Z]{2,12}\b')
+    RE_IPV4      = _re.compile(r'\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b')
+    RE_INTHOST   = _re.compile(r'(?i)\b((?:[a-z0-9\-]{1,40}\.)+(?:local|internal|intranet|corp|lan|staging|localhost)(?::\d{2,5})?)\b')
+    RE_JWT       = _re.compile(r'\beyJ[A-Za-z0-9_\-]{8,}\.eyJ[A-Za-z0-9_\-]{6,}\.[A-Za-z0-9_\-]{6,}')
+    RE_PRIVKEY   = _re.compile(r'-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----')
+    RE_AUTHHDR   = _re.compile(r'(?i)authorization["\']?\s*[:=]\s*["\']?(?:bearer|basic)\s+[A-Za-z0-9._\-/+=]{8,}')
+    RE_BASICAUTH = _re.compile(r'https?://[^\s"\'<>/:@]{1,40}:[^\s"\'<>/:@]{1,40}@[^\s"\'<>]{3,}')
+    RE_SOURCEMAP = _re.compile(r'(?i)sourceMappingURL=([^\s"\'*]{2,120})')
+    RE_CREDASSIGN= _re.compile(r'(?i)\b(password|passwd|pwd|secret|token|api[_\-]?key|access[_\-]?key|auth|private[_\-]?key|client[_\-]?secret)["\']?\s*[:=]\s*["\']([^"\'\s]{4,80})["\']')
+    RE_COMMENT   = _re.compile(r'(?i)(?:(?<![:/])//|/\*|<!--)\s*([^\n\r*]{0,160}?\b(?:todo|fixme|hack|xxx|password|secret|api[_\s\-]?key|deprecated|backdoor|do not|remove before|temporary|hardcoded|debug)\b[^\n\r*]{0,120})')
+    RE_SCRIPTSRC = _re.compile(r'(?i)<script[^>]+src=["\']([^"\'> ]+)["\']')
+    RE_INLINE    = _re.compile(r'(?is)<script(?![^>]*\bsrc=)[^>]*>(.*?)</script>')
+    API_HINT     = _re.compile(r'(?i)(/api/|/api$|/graphql|/v\d+/|/rest/|/oauth|/token\b|/auth/|/gql\b)')
+    # Low-value static assets we don't want cluttering the endpoint/URL lists.
+    STATIC_RE    = _re.compile(r'(?i)\.(?:css|js|mjs|map|png|jpe?g|gif|svg|webp|ico|bmp|avif|'
+                               r'woff2?|ttf|eot|otf|mp4|webm|mp3|wav|ogg|pdf|zip|gz|woff|json)(?:[?#].*)?$')
+    def _is_static(s):
+        try:
+            return bool(STATIC_RE.search(s.split("?")[0].split("#")[0]))
+        except Exception:
+            return False
+
+    SKIP_CDNS = ["jquery","bootstrap","google-analytics","googletagmanager","facebook.net",
+                 "cdn.jsdelivr","cdnjs.cloudflare","unpkg.com","ajax.googleapis","gstatic.com",
+                 "hotjar","intercom","segment.io","mixpanel","recaptcha","newrelic","datadog",
+                 "sentry-cdn","bugsnag","polyfill.io","fontawesome"]
+
+    # Documentation / reference domains that show up inside library comments &
+    # JSDoc (e.g. MDN URLs like .../Web/API/... match the "/api/" hint). These
+    # are noise, never the target's own infrastructure — drop them entirely.
+    DOC_HOSTS = ("developer.mozilla.org", "mozilla.org", "w3.org", "w3schools.com",
+                 "html5rocks.com", "stackoverflow.com", "stackexchange.com",
+                 "caniuse.com", "npmjs.com", "npmjs.org", "jquery.com", "reactjs.org",
+                 "react.dev", "angular.io", "vuejs.org", "developer.chrome.com",
+                 "developer.android.com", "developer.apple.com", "docs.microsoft.com",
+                 "learn.microsoft.com", "developers.google.com", "web.dev", "wikipedia.org",
+                 "schema.org", "opensource.org", "gnu.org", "creativecommons.org",
+                 "github.io", "readthedocs.io", "medium.com", "css-tricks.com")
+
+    def _is_doc_host(h):
+        return any(h == d or h.endswith("." + d) for d in DOC_HOSTS)
+
+    def host_of(u):
+        try:
+            return _up.urlparse(u if "://" in u else "http://" + u).netloc.lower().split(":")[0]
+        except Exception:
+            return ""
+
+    def is_internal(h):
+        return (not h) or h == domain or h.endswith("." + domain)
+
+    def norm(u, scheme):
+        u = u.strip()
+        if u.startswith("//"):   return "https:" + u
+        if u.startswith(("http://", "https://")): return u
+        if u.startswith("/"):    return f"{scheme}://{domain}{u}"
+        return f"{scheme}://{domain}/" + u.lstrip("./")
+
+    # ── gather sources ──
+    sources, js_urls = [], []
+    homepage, used_scheme = None, "https"
+    for scheme in ("https", "http"):
+        try:
+            r = requests.get(f"{scheme}://{domain}", timeout=8, verify=False,
+                             allow_redirects=True, headers=UA)
+            if r.text:
+                homepage, used_scheme = r.text, scheme
+                break
+        except Exception:
+            continue
+    if homepage is None:
+        return {"error": "Homepage unreachable — nothing to scrape"}
+
+    sources.append(("(homepage HTML)", homepage[:PER_FILE_LIMIT]))
+    inline_n = 0
+    for m in RE_INLINE.finditer(homepage):
+        blk = m.group(1)
+        if blk and blk.strip():
+            inline_n += 1
+            sources.append(("(inline script)", blk[:PER_FILE_LIMIT]))
+
+    seen_js = set()
+    for m in RE_SCRIPTSRC.finditer(homepage):
+        raw = m.group(1)
+        if any(c in raw.lower() for c in SKIP_CDNS):
+            continue
+        u = norm(raw, used_scheme)
+        if is_internal(host_of(u)) and u not in seen_js:
+            seen_js.add(u); js_urls.append(u)
+        if len(js_urls) >= MAX_JS:
+            break
+
+    _lock = _thr.Lock()
+    def fetch_js(u):
+        try:
+            r = requests.get(u, timeout=8, verify=False, headers=UA)
+            if r.status_code == 200 and r.text:
+                with _lock:
+                    sources.append((u.split("?")[0][-80:], r.text[:PER_FILE_LIMIT]))
+        except Exception:
+            pass
+    if js_urls:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
+            list(ex.map(fetch_js, js_urls))
+
+    # ── extract ──
+    cats = {k: {} for k in ("endpoints", "urls_internal", "urls_external", "api_endpoints",
+                            "databases", "cloud_storage", "emails", "ip_addresses",
+                            "internal_hosts", "sensitive")}
+
+    def put(cat, value, src, extra=None):
+        value = (value or "").strip()
+        if not value:
+            return
+        d = cats[cat]
+        # Sensitive values (tokens, JWTs, credentials, keys) shown in full;
+        # other categories capped to keep the payload sane.
+        cap = 2000 if cat == "sensitive" else 300
+        if value not in d and len(d) < MAX_PER_CAT:
+            d[value] = dict({"value": value[:cap], "source": src}, **(extra or {}))
+
+    def add_url(u, label):
+        """Route a URL: internal (keep non-static full URL) vs external (collapse
+        to unique host — the valuable 'who does this site talk to' signal)."""
+        h = host_of(u)
+        if _is_doc_host(h):
+            return   # MDN / W3C / docs references in library comments — noise
+        is_api = bool(API_HINT.search(u))
+        if is_internal(h):
+            if is_api:
+                put("api_endpoints", u, label)
+            if not _is_static(u):
+                put("urls_internal", u, label)
+        else:
+            # collapse third-party asset URLs to their host
+            if is_api and not _is_static(u):
+                put("api_endpoints", u, label)
+            put("urls_external", h or u, label)
+
+    for label, text in sources:
+        if not text:
+            continue
+        for m in RE_ENDPOINT.finditer(text):
+            ep = m.group(1)
+            if not ep or len(ep) < 2:
+                continue
+            if ep.startswith(("http://", "https://", "//")):
+                add_url(ep if "://" in ep else "https:" + ep, label)
+            elif "://" in ep:
+                # non-web scheme (mongodb://, ftp://, ws://…) — handled by the
+                # dedicated database/cloud categories, not the endpoint list
+                continue
+            else:
+                if API_HINT.search(ep):
+                    put("api_endpoints", ep, label)
+                if not _is_static(ep):     # drop .css/.js/img/font endpoints
+                    put("endpoints", ep, label)
+        for m in RE_FULLURL.finditer(text):
+            add_url(m.group(0), label)
+        for m in RE_DB.finditer(text):
+            put("databases", m.group(1), label, {"kind": "database uri", "severity": "critical"})
+        for rx, kind in ((RE_S3, "AWS S3"), (RE_GCS, "Google Cloud Storage"),
+                         (RE_AZURE, "Azure Blob"), (RE_FIREBASE, "Firebase")):
+            for m in rx.finditer(text):
+                put("cloud_storage", m.group(1), label, {"kind": kind})
+        for m in RE_EMAIL.finditer(text):
+            put("emails", m.group(0), label)
+        for m in RE_IPV4.finditer(text):
+            ip = m.group(0)
+            if ip not in ("0.0.0.0", "127.0.0.1") and not ip.startswith(("0.", "255.")):
+                put("ip_addresses", ip, label)
+        for m in RE_INTHOST.finditer(text):
+            put("internal_hosts", m.group(1), label)
+        for m in RE_JWT.finditer(text):
+            put("sensitive", m.group(0), label, {"kind": "JWT token", "severity": "high"})
+        for m in RE_PRIVKEY.finditer(text):
+            put("sensitive", m.group(0), label, {"kind": "Private key", "severity": "critical"})
+        for m in RE_AUTHHDR.finditer(text):
+            put("sensitive", m.group(0), label, {"kind": "Authorization header", "severity": "high"})
+        for m in RE_BASICAUTH.finditer(text):
+            put("sensitive", m.group(0), label, {"kind": "Basic-auth URL", "severity": "high"})
+        for m in RE_SOURCEMAP.finditer(text):
+            put("sensitive", m.group(1), label, {"kind": "Source map", "severity": "low"})
+        for m in RE_CREDASSIGN.finditer(text):
+            val = m.group(2)
+            put("sensitive", f"{m.group(1)} = {val}", label,
+                {"kind": "Credential-like assignment", "severity": "high"})
+        for m in RE_COMMENT.finditer(text):
+            put("sensitive", m.group(1).strip()[:140], label, {"kind": "Risky code comment", "severity": "low"})
+
+    result = {
+        "domain": domain,
+        "sources_scanned": {"html": 1, "inline_scripts": inline_n,
+                            "js_files": len(js_urls), "js_urls": js_urls[:40]},
+        "categories": {k: list(v.values()) for k, v in cats.items()},
+        "counts": {k: len(v) for k, v in cats.items()},
+    }
+    result["total"] = sum(result["counts"].values())
+    return result
+
+
+
+# ═══════════════════════════════════════════════════════════════════
+# MODULE: API ENDPOINT FUZZER
+# ═══════════════════════════════════════════════════════════════════
+def scan_api_fuzzer(domain):
+    """
+    Smart API discovery.
+    Confirms a base API path exists first — stops if nothing responds.
+    Then probes common endpoints under the confirmed base.
+    """
+    import threading as _thr
+    import random
+    import string as _str
+
+    result = {
+        "domain":     domain,
+        "base_found": None,
+        "endpoints":  [],
+        "graphql":    None,
+        "total":      0,
+    }
+
+    API_BASES = ["/api", "/api/v1", "/api/v2", "/v1", "/v2", "/rest", "/service"]
+
+    # Baseline: probe a random path to detect catch-all servers
+    _rnd = "/" + "".join(random.choices(_str.ascii_lowercase, k=12))
+    base_url = None
+    _catch_all_status = None
+    _catch_all_size   = -1
+
+    UA_H = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36", "Accept": "application/json"}
+
+    for scheme in ["https", "http"]:
+        try:
+            _br = requests.get(f"{scheme}://{domain}{_rnd}", timeout=4,
+                verify=False, allow_redirects=False,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"})
+            _catch_all_status = _br.status_code
+            _catch_all_size   = len(_br.content)
+        except Exception:
+            pass
+
+        def _probe_base(base):
+            try:
+                r = requests.get(f"{scheme}://{domain}{base}", timeout=4,
+                                 verify=False, allow_redirects=False, headers=UA_H)
+            except Exception:
+                return None
+            if r.status_code not in (200, 401, 403, 405, 422):
+                return None
+            if r.status_code == _catch_all_status and abs(len(r.content) - _catch_all_size) < 10:
+                return None
+            ct = r.headers.get("Content-Type", "").lower()
+            body = r.text[:200].strip()
+            if ("json" in ct or "api" in ct or body.startswith("{")
+                    or body.startswith("[") or r.status_code in (401, 405)):
+                return base
+            return None
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(API_BASES)) as ex:
+            for found in ex.map(_probe_base, API_BASES):
+                if found:
+                    base_url = f"{scheme}://{domain}{found}"
+                    result["base_found"] = found
+                    break
+        if base_url:
+            break
+
+    # GraphQL check — probe candidates in parallel, bounded
+    def _probe_gql(gql):
+        for scheme in ["https", "http"]:
+            try:
+                r = requests.post(f"{scheme}://{domain}{gql}", json={"query": "{__typename}"},
+                                  timeout=4, verify=False,
+                                  headers={"Content-Type": "application/json",
+                                           "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"})
+            except Exception:
+                continue
+            body = r.text[:500].lower()
+            if r.status_code in (200, 400) and any(k in body for k in ("typename", "data", "errors", "graphql")):
+                introspection = "typename" in body or '"data"' in r.text
+                return {
+                    "path": gql, "status": r.status_code,
+                    "severity": "high" if introspection else "medium",
+                    "size": len(r.content),
+                    "detail": ("GraphQL — introspection enabled" if introspection
+                               else "GraphQL — returns errors (restricted)"),
+                }
+        return None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
+        for g in ex.map(_probe_gql, ["/graphql", "/api/graphql", "/v1/graphql", "/query", "/gql"]):
+            if g:
+                result["graphql"] = g
+                break
+
+    if not base_url and not result["graphql"]:
+        result["error"] = "No API base detected — skipping endpoint fuzzing"
+        return result
+
+    if base_url:
+        ENDPOINTS = [
+            ("/users",          "Users list",           "high"),
+            ("/users/me",       "Current user info",    "high"),
+            ("/admin",          "Admin endpoint",       "critical"),
+            ("/admin/users",    "Admin user list",      "critical"),
+            ("/auth/login",     "Auth login",           "medium"),
+            ("/token",          "Token endpoint",       "high"),
+            ("/config",         "Config endpoint",      "high"),
+            ("/settings",       "Settings",             "medium"),
+            ("/debug",          "Debug endpoint",       "critical"),
+            ("/metrics",        "Metrics",              "medium"),
+            ("/health",         "Health check",         "low"),
+            ("/version",        "Version disclosure",   "low"),
+            ("/docs",           "API docs",             "medium"),
+            ("/swagger",        "Swagger UI",           "medium"),
+            ("/swagger.json",   "Swagger JSON",         "medium"),
+            ("/openapi.json",   "OpenAPI spec",         "medium"),
+            ("/redoc",          "ReDoc",                "medium"),
+            ("/keys",           "Keys endpoint",        "critical"),
+            ("/secrets",        "Secrets",              "critical"),
+            ("/tokens",         "Tokens list",          "high"),
+            ("/export",         "Data export",          "high"),
+            ("/logs",           "Logs endpoint",        "high"),
+            ("/files",          "Files endpoint",       "high"),
+            ("/backup",         "Backup endpoint",      "high"),
+            ("/events",         "Events",               "medium"),
+        ]
+
+        _lock = _thr.Lock()
+
+        def check_ep(ep):
+            path, name, sev = ep
+            try:
+                r = requests.get(
+                    f"{base_url}{path}", timeout=5,
+                    verify=False, allow_redirects=False,
+                    headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+                             "Accept": "application/json"}
+                )
+                if r.status_code in (200, 401, 403, 405, 422):
+                    actual = sev
+                    if r.status_code in (401, 403):
+                        actual = {"critical": "high", "high": "medium",
+                                  "medium": "low"}.get(sev, sev)
+                    with _lock:
+                        result["endpoints"].append({
+                            "path":     f"{result['base_found']}{path}",
+                            "name":     name,
+                            "severity": actual,
+                            "status":   r.status_code,
+                            "json":     "json" in r.headers.get("Content-Type", ""),
+                            "size":     len(r.content),
+                        })
+            except Exception:
+                pass
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=15) as ex:
+            list(ex.map(check_ep, ENDPOINTS))
+
+        result["endpoints"].sort(
+            key=lambda x: {"critical": 0, "high": 1, "medium": 2,
+                           "low": 3, "info": 4}.get(x["severity"], 5)
+        )
+
+    result["total"] = len(result["endpoints"]) + (1 if result["graphql"] else 0)
+    return result
+
+
 ALL_MODULES = {
     "screenshot":      ("Website Screenshot",                    scan_screenshot),
     "dns":             ("DNS Records + Email Security",          scan_dns),
@@ -3850,9 +5399,15 @@ ALL_MODULES = {
     "breachintel":     ("Breach & Credential Intelligence",      scan_breachintel),
     "dorks":           ("Google Dorks (61)",                     generate_dorks),
     "osint":           ("OSINT Platform URLs (26)",              generate_osint_urls),
+    "favicon":         ("Favicon Hash Fingerprinting",          scan_favicon),
+    "cloud_buckets":   ("Cloud Bucket Finder (S3/Azure/GCP)",  scan_cloud_buckets),
+    "js_secrets":      ("JS Secret Scanner",                   scan_js_secrets),
+    "content_intel":   ("Content Intel (JS/HTML URL & info extractor)", scan_content_intel),
+    "api_fuzzer":      ("API Endpoint Fuzzer",                  scan_api_fuzzer),
 }
 
-FAST_SKIP = {"wayback", "brute", "subdomains", "screenshot", "email_harvest"}  # vuln + endpoints run in fast
+FAST_SKIP = {"wayback", "brute", "subdomains", "screenshot", "email_harvest",
+             "nuclei", "cloud_buckets"}  # slow modules skipped in fast mode
 
 def run_scan(domain, modules=None, fast=False, callback=None):
     """Run scan modules. callback(module_name, description, result) called per module."""

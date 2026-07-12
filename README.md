@@ -2,11 +2,21 @@
 
 
 <!-- fallback plain ASCII for viewers that block external images -->
-![Kumo Web UI](kumo_banner.png)
+
+```
+██╗  ██╗██╗   ██╗███╗   ███╗ ██████╗
+██║ ██╔╝██║   ██║████╗ ████║██╔═══██╗
+█████╔╝ ██║   ██║██╔████╔██║██║   ██║
+██╔═██╗ ██║   ██║██║╚██╔╝██║██║   ██║
+██║  ██╗╚██████╔╝██║ ╚═╝ ██║╚██████╔╝
+╚═╝  ╚═╝ ╚═════╝ ╚═╝     ╚═╝ ╚═════╝
+```
+
+**蜘蛛 — it crawls. you watch.**
 
 [![Python](https://img.shields.io/badge/Python-3.8+-3b82f6?style=flat-square&logo=python&logoColor=white)](https://python.org)
-[![Modules](https://img.shields.io/badge/Modules-21-22c55e?style=flat-square)](.)
-[![Vuln Checks](https://img.shields.io/badge/Vuln_Checks-130+-ef4444?style=flat-square)](.)
+[![Modules](https://img.shields.io/badge/Modules-26-22c55e?style=flat-square)](.)
+[![Vuln Checks](https://img.shields.io/badge/Vuln_Checks-150+-ef4444?style=flat-square)](.)
 [![No API Key](https://img.shields.io/badge/API_Key-Not_Required-22c55e?style=flat-square)](.)
 [![License](https://img.shields.io/badge/License-MIT-6b7280?style=flat-square)](LICENSE)
 
@@ -16,7 +26,7 @@
 
 ---
 
-Kumo is a domain OSINT & security reconnaissance framework. Drop a domain — get everything back in real time across **21 parallel modules**: DNS, open ports, leaked credentials, infostealer infections, vulnerable endpoints, subdomains, CVEs, malware families, and more.
+Kumo is a domain OSINT & security reconnaissance framework. Drop a domain — get everything back in real time across **26 parallel modules**: DNS, open ports, leaked credentials, infostealer infections, vulnerable endpoints, subdomains, CVEs, malware families, and more.
 
 ```bash
 pip install requests flask
@@ -30,14 +40,13 @@ python3 kumo.py --web               # web UI → http://localhost:8888
 
 ## Screenshots
 
-**Web UI** — 21 modules streaming in real time, results on the right, Google Dorks panel on the side:
+**Web UI** — 26 modules streaming in real time, results on the right, Google Dorks panel on the side:
 
-![Kumo Web UI](web_ui.png)
+![Kumo Web UI](screenshots/web_ui.png)
 
-![Kumo Web UI 2](web_ui2.png)
 **CLI** — the KUMO banner on launch:
 
-![Kumo CLI](cli_banner.png)
+![Kumo CLI](screenshots/cli.png)
 
 ---
 
@@ -66,7 +75,7 @@ Takes a live screenshot of the target and runs it against the **ransomware.live*
 Full DNS enumeration with a security grade on email protection. Detects missing DMARC, weak SPF policies, absent DKIM, and open zone transfers.
 
 ```
-  A         203.0.x.x
+  A         203.0.113.10
   MX        mail.corp.com  (priority 10)
   NS        ns1.corp.com · ns2.corp.com
   TXT       v=spf1 include:_spf.google.com ~all
@@ -245,9 +254,9 @@ Probes 80+ paths that are commonly left exposed: admin panels, backup files, con
 
 ---
 
-### 🔓 Vulnerability Scanner — 130+ built-in checks
+### 🔓 Vulnerability Scanner — 150+ built-in checks
 
-Pure Python, zero external tools. 130+ HTTP-based checks inspired by real Nuclei templates — covering known CVEs, CMS vulnerabilities, exposed admin panels, cloud metadata endpoints, CI/CD dashboards, CORS misconfigurations, and more.
+Pure Python, zero external tools. 150+ HTTP-based checks inspired by real Nuclei templates — covering known CVEs, CMS vulnerabilities, exposed admin panels, cloud metadata endpoints, CI/CD dashboards, CORS misconfigurations, and more. Every check is **catch-all / WAF aware**: a baseline is fingerprinted first, so the generic 403/404 page a host returns for every path is never reported as a finding. Raw-file checks (`.git`, `.env`, backups) require the *actual* file content, and 403 responses are downgraded — never reported as "exposed".
 
 ```
   CRITICAL: 2   HIGH: 5   MEDIUM: 7
@@ -260,10 +269,102 @@ Pure Python, zero external tools. 130+ HTTP-based checks inspired by real Nuclei
   HIGH      AWS Keys in HTTP Response               200
   MEDIUM    Spring Boot Actuator /env               200
   MEDIUM    Grafana Default Credentials             200
-  MEDIUM    Kibana Dashboard Exposed                200
 ```
 
-Checks include: **Log4Shell · Spring4Shell · Drupalgeddon2 · Confluence OGNL · Oracle WebLogic · 15 WordPress plugin CVEs · CORS misconfiguration · Host header injection · Clickjacking · open redirects** and many more.
+Checks include: **Log4Shell · Spring4Shell · Drupalgeddon2 · Confluence OGNL · Oracle WebLogic · 15 WordPress plugin CVEs · CORS misconfiguration · Host header injection · Clickjacking** and many more.
+
+**Recent CVE detection (2024–2026)** — a dedicated set of *detection-only* templates fingerprints exposure/version for the newest, actively-exploited CVEs (no exploitation, just correlation):
+
+```
+  RECENT CVE  cPanel / WHM Login Panel Exposed     CVE-2026-41940
+  RECENT CVE  Next.js Middleware Auth Bypass       CVE-2025-29927
+  RECENT CVE  SharePoint "ToolShell" RCE           CVE-2025-53770
+  RECENT CVE  SAP NetWeaver Visual Composer        CVE-2025-31324
+  RECENT CVE  Ivanti EPMM / Connect Secure         CVE-2025-4427
+  RECENT CVE  CrushFTP Auth Bypass                 CVE-2025-31161
+  ... 15 more (Fortinet · Palo Alto · Oracle EBS · Craft CMS · Vite · Langflow · Wazuh)
+```
+
+---
+
+### 🔌 API Endpoint Fuzzer
+
+Smart API discovery. Probes a random baseline first to detect catch-all servers, confirms a base API path actually exists before fuzzing, then discovers live endpoints and checks for **GraphQL introspection**. Every hit shows its HTTP status and response **byte size**.
+
+```
+  Base found   /api/v1
+  GraphQL      /graphql — introspection enabled   [200]  1.2 KB
+
+  API ENDPOINTS
+  HIGH      /api/v1/users            200   8.9 KB
+  HIGH      /api/v1/admin            401   512 B
+  MEDIUM    /api/v1/config           200   2.1 KB
+  MEDIUM    /api/swagger.json        200   14 KB
+```
+
+---
+
+### 🔑 JS Secret Scanner
+
+Pulls and scans first-party JavaScript for hardcoded secrets — API keys, tokens, cloud credentials, and private keys — with clear-text output and the exact source line for each hit.
+
+```
+  ⚠ Secrets Detected (clear text)
+
+  CRITICAL  AWS Access Key      AKIA................   app.min.js
+  HIGH      Google API Key      AIza................   main.js
+  HIGH      Stripe Live Key     sk_live_.............  checkout.js
+  MEDIUM    JWT Token           eyJhbGciOiJ.........   auth.js
+```
+
+---
+
+### 🧠 Content Intelligence — JS/HTML extraction
+
+Scrapes the homepage HTML, inline scripts, and every first-party JS file, then extracts the **valuable** signal — not just secrets. Endpoints, internal/external URLs, API routes, **database connection URIs**, cloud storage (S3 / GCS / Azure / Firebase), emails, internal hosts, JWTs, private keys, source maps, and risky code comments. Static assets (`.css`, `.js`, images, fonts) and documentation domains (MDN, W3C) are filtered out; external URLs are collapsed to unique third-party hosts.
+
+```
+  166 items extracted   ·   14 JS files   ·   3 inline
+
+  🗄️ DATABASE URIS
+     mongodb+srv://svc:****@cluster0.abcd.mongodb.net/prod
+  ☁️ CLOUD STORAGE
+     [AWS S3]  assets-prod.s3.amazonaws.com
+  🔌 API ENDPOINTS (12)
+     /api/v1/users   ·   /api/internal/config   ·   /graphql
+  🔐 SENSITIVE INFO (21)
+     [Credential-like assignment]  api_key = 7f3c9a12de...
+     [JWT token]                   eyJhbGciOiJIUzI1NiIs...
+     [Risky code comment]          // TODO: remove hardcoded admin creds
+  🌐 EXTERNAL SOURCES (19 unique hosts)
+     cdn.thirdparty.com · api.stripe.com · fonts.googleapis.com ...
+```
+
+---
+
+### 🎯 Favicon Hash — tech fingerprint
+
+Fetches the favicon (HTML-declared first, then common paths in parallel — bounded so it never hangs), computes the **MMH3 hash** used by Shodan/Censys, and maps known hashes to technologies. Handy for fingerprinting the stack and pivoting to other hosts running the same favicon.
+
+```
+  Favicon     https://corp.com/favicon.ico   (33.2 KB)
+  MMH3 hash   -1319625119
+  Shodan      http.favicon.hash:-1319625119
+  Match       GitLab
+```
+
+---
+
+### ☁️ Cloud Storage Buckets
+
+Enumerates likely **AWS S3 / GCP / Azure** bucket names derived from the domain and checks for public exposure. Only a confirmed **HTTP 200 (publicly readable)** is reported — unreliable 403 responses are never flagged as findings.
+
+```
+  Checked   42 candidate buckets
+
+  PUBLIC   corp-backups.s3.amazonaws.com          200  ← readable
+  PUBLIC   corp-assets.storage.googleapis.com     200
+```
 
 ---
 
@@ -500,10 +601,12 @@ Everything works without any key. These unlock richer data:
 | `HIBP_API_KEY` | Per-email HaveIBeenPwned lookup |
 | `CHIASMODON_API_KEY` | Chiasmodon pro tier — more results |
 | `RANSOMWARE_LIVE_API_KEY` | Ransomware.live pro feed |
+| `GOOGLE_CSE_KEY` + `GOOGLE_CSE_ID` | Execute Google dorks live |
 
 ```bash
 export SHODAN_API_KEY="your_key_here"
 export HIBP_API_KEY="your_key_here"
+# loaded at runtime — never hardcoded
 ```
 
 ---
