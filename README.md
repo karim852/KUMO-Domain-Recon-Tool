@@ -2,17 +2,7 @@
 
 
 <!-- fallback plain ASCII for viewers that block external images -->
-
-```
-██╗  ██╗██╗   ██╗███╗   ███╗ ██████╗
-██║ ██╔╝██║   ██║████╗ ████║██╔═══██╗
-█████╔╝ ██║   ██║██╔████╔██║██║   ██║
-██╔═██╗ ██║   ██║██║╚██╔╝██║██║   ██║
-██║  ██╗╚██████╔╝██║ ╚═╝ ██║╚██████╔╝
-╚═╝  ╚═╝ ╚═════╝ ╚═╝     ╚═╝ ╚═════╝
-```
-
-**蜘蛛 — it crawls. you watch.**
+![Kumo Web UI](kumo_banner.png)
 
 [![Python](https://img.shields.io/badge/Python-3.8+-3b82f6?style=flat-square&logo=python&logoColor=white)](https://python.org)
 [![Modules](https://img.shields.io/badge/Modules-26-22c55e?style=flat-square)](.)
@@ -42,12 +32,12 @@ python3 kumo.py --web               # web UI → http://localhost:8888
 
 **Web UI** — 26 modules streaming in real time, results on the right, Google Dorks panel on the side:
 
-![Kumo Web UI](screenshots/web_ui.png)
+![Kumo Web UI](web_ui.png)
 
+![Kumo Web UI 2](web_ui2.png)
 **CLI** — the KUMO banner on launch:
 
-![Kumo CLI](screenshots/cli.png)
-
+![Kumo CLI](cli_banner.png)
 ---
 
 ## Modules
