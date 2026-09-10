@@ -614,6 +614,14 @@ python3 kumo.py target.com --no-color         pipe-friendly output
 
 fast mode skips: wayback · brute · subdomains · email_harvest
 ```
+---
+
+## 🌐 Ecosystem
+
+| | Tool | Domain |
+|---|---|---|
+| ☁️ | [**Kumo** 蜘蛛](https://github.com/karim852/KUMO-Domain-Recon-Tool) | domain OSINT & reconnaissance |
+| 🌑 | [**Kage** 影](https://github.com/karim852/Kage-DFIR-toolkit) | DFIR host triage |
 
 ---
 
