@@ -873,6 +873,143 @@ def render_content_intel(data):
             dimprint(f"  + {len(items)-15} more…", 6)
 
 
+def render_http_inspect(data):
+    section("HTTP INSPECTOR (REQUEST / RESPONSE)", "🔎")
+    if data.get("error"):
+        fail(data["error"]); return
+    req = data.get("request", {}) or {}
+    res = data.get("response", {}) or {}
+
+    info("Final URL", res.get("final_url", ""))
+    info("Status", f"{res.get('status','')} {res.get('reason','')}")
+    info("Size / Time", f"{_human_bytes(res.get('size',0))} · {res.get('elapsed_ms',0)} ms")
+    if res.get("server"):
+        info("Server", res["server"])
+
+    chain = data.get("redirect_chain", [])
+    if len(chain) > 1:
+        print(f"\n    {C.Y}{C.BD}Redirect chain ({len(chain)-1} hop(s)):{C.RS}")
+        for i, hop in enumerate(chain, 1):
+            col = C.Y if 300 <= hop.get("status", 0) < 400 else C.G
+            print(f"      {C.GR}{i}.{C.RS} {col}[{hop.get('status')}]{C.RS} {C.W}{hop.get('url','')[:70]}{C.RS}")
+            if hop.get("location"):
+                dimprint(f"→ {hop['location'][:70]}", 9)
+
+    hdrs_out = req.get("headers", [])
+    if hdrs_out:
+        print(f"\n    {C.M}{C.BD}▶ Request headers sent ({len(hdrs_out)}):{C.RS}")
+        if req.get("http_line"):
+            print(f"      {C.G}{req['http_line']}{C.RS}")
+        for x in hdrs_out:
+            print(f"      {C.M}▶{C.RS} {C.Y}{x['name']}:{C.RS} {C.W}{str(x['value'])[:70]}{C.RS}")
+
+    hdrs_in = res.get("headers", [])
+    if hdrs_in:
+        print(f"\n    {C.CY}{C.BD}◀ Response headers received ({len(hdrs_in)}):{C.RS}")
+        for x in hdrs_in:
+            print(f"      {C.CY}◀{C.RS} {C.Y}{x['name']}:{C.RS} {C.W}{str(x['value'])[:70]}{C.RS}")
+
+    nh = data.get("notable_headers", [])
+    if nh:
+        sev_col = {"high": C.R, "medium": C.Y, "low": C.Y, "info": C.GR}
+        print(f"\n    {C.Y}{C.BD}⚠ Notable headers ({len(nh)}):{C.RS}")
+        for n in nh:
+            col = sev_col.get(n.get("severity", "info"), C.GR)
+            print(f"      {col}[{n.get('note','')}]{C.RS} {C.Y}{n['name']}:{C.RS} {C.W}{str(n['value'])[:60]}{C.RS}")
+
+    ck = data.get("cookies", [])
+    if ck:
+        print(f"\n    {C.M}{C.BD}🍪 Cookies ({len(ck)}):{C.RS}")
+        table_header(["NAME", "SECURE", "HTTPONLY", "SAMESITE", "ISSUES"], [22, 9, 10, 12, 30])
+        for c in ck:
+            table_row([c["name"][:20],
+                       "yes" if c["secure"] else "NO",
+                       "yes" if c["httponly"] else "NO",
+                       c.get("samesite") or "-",
+                       ", ".join(c.get("issues", []))[:28]],
+                      [22, 9, 10, 12, 30],
+                      [C.CY, C.G if c["secure"] else C.R,
+                       C.G if c["httponly"] else C.R, C.GR, C.Y])
+
+    m = data.get("methods", {}) or {}
+    if m.get("allowed"):
+        risky = set(m.get("risky", []))
+        rendered = " ".join((C.R + x + C.RS) if x in risky else (C.GR + x + C.RS) for x in m["allowed"])
+        print(f"\n    {C.Y}Allowed methods:{C.RS} {rendered}")
+        if risky:
+            warn(f"Risky methods enabled: {', '.join(sorted(risky))}", 6)
+
+    cors = data.get("cors", {}) or {}
+    if cors.get("allow_origin"):
+        print(f"    {C.Y}CORS Allow-Origin:{C.RS} {C.CY}{cors['allow_origin']}{C.RS}"
+              + (f" {C.R}← {cors['note']}{C.RS}" if cors.get("note") else ""))
+
+
+def render_js_secrets(data):
+    section("JS SECRET SCANNER", "🔑")
+    if data.get("error") and not data.get("secrets"):
+        fail(data["error"]); return
+    src = data.get("sources", {}) or {}
+    dimprint(f"Scanned: {src.get('html',0)} HTML · {src.get('inline_scripts',0)} inline · "
+             f"{src.get('js_files',0)} JS files ({src.get('chunks',0)} chunks)", 4)
+    secrets = data.get("secrets", [])
+    if not secrets:
+        ok("No hardcoded secrets found"); return
+    print(f"    {C.R}{C.BD}⚠ {len(secrets)} secret(s) detected — shown in clear text{C.RS}\n")
+    sev_color = {"critical": C.R, "high": C.Y, "medium": C.Y, "low": C.GR}
+    for s in secrets:
+        sc = sev_color.get(s.get("severity", ""), C.W)
+        print(f"    {sc}[{s.get('severity','').upper():<8}]{C.RS} {C.W}{C.BD}{s.get('type','')}{C.RS}")
+        print(f"       {C.CY}{s.get('value','')[:100]}{C.RS}")
+        dimprint(f"in {s.get('file','')}", 7)
+
+
+def render_api_fuzzer(data):
+    section("API ENDPOINT FUZZER", "🔌")
+    if data.get("error") and not data.get("total"):
+        warn(data["error"]); return
+    bases = data.get("bases_found", [])
+    if bases:
+        info("API bases", ", ".join(b["path"] for b in bases))
+    sev_color = {"critical": C.R, "high": C.Y, "medium": C.Y, "low": C.GR, "info": C.B}
+
+    gql = data.get("graphql")
+    if gql:
+        col = C.Y if gql.get("severity") == "high" else C.GR
+        print(f"\n    {col}{C.BD}⚡ GraphQL{C.RS} {C.W}{gql.get('path','')}{C.RS} "
+              f"{C.GR}[{gql.get('status','')}] {_human_bytes(gql.get('size',''))}{C.RS}")
+        dimprint(gql.get("detail", ""), 6)
+
+    specs = data.get("specs", [])
+    if specs:
+        print(f"\n    {C.M}{C.BD}📘 API specs & docs ({len(specs)}):{C.RS}")
+        for s in specs:
+            sc = sev_color.get(s.get("severity", ""), C.W)
+            print(f"      {sc}[{s.get('severity','').upper():<8}]{C.RS} {C.CY}{s.get('path',''):<34}{C.RS}"
+                  f"{C.W}{s.get('name','')}{C.RS} {C.GR}[{s.get('status','')}] "
+                  f"{_human_bytes(s.get('size',''))}{C.RS}")
+
+    disc = data.get("discovered", [])
+    if disc:
+        print(f"\n    {C.G}{C.BD}🔗 Routes discovered in JavaScript ({len(disc)}):{C.RS}")
+        for d in disc:
+            sc = sev_color.get(d.get("severity", ""), C.W)
+            print(f"      {sc}[{d.get('severity','').upper():<8}]{C.RS} {C.CY}{d.get('path','')[:52]}{C.RS} "
+                  f"{C.GR}[{d.get('status','')}] {_human_bytes(d.get('size',''))}{C.RS}")
+
+    eps = data.get("endpoints", [])
+    if eps:
+        print(f"\n    {C.CY}{C.BD}API endpoints ({len(eps)}):{C.RS}")
+        for e in eps:
+            sc = sev_color.get(e.get("severity", ""), C.W)
+            print(f"      {sc}[{e.get('severity','').upper():<8}]{C.RS} {C.CY}{e.get('path',''):<26}{C.RS}"
+                  f"{C.W}{e.get('name','')}{C.RS} {C.GR}[{e.get('status','')}] "
+                  f"{_human_bytes(e.get('size',''))}{C.RS}")
+
+    if not (gql or specs or disc or eps):
+        ok("No API surface detected")
+
+
 RENDERERS = {
     "dns": render_dns, "whois": render_whois, "ssl": render_ssl,
     "crtsh": render_crtsh, "headers": render_headers, "ports": render_ports,
@@ -884,6 +1021,9 @@ RENDERERS = {
     "nuclei": render_nuclei,
     "endpoints": render_endpoints,
     "content_intel": render_content_intel,
+    "http_inspect": render_http_inspect,
+    "js_secrets": render_js_secrets,
+    "api_fuzzer": render_api_fuzzer,
     "shodan": render_shodan,
     "censys": render_censys,
     "wafw00f": render_wafw00f,

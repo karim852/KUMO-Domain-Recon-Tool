@@ -33,20 +33,21 @@ _SCAN_LOCK = threading.Lock()
 # hostage waiting on a slow one.
 MODULE_TIMEOUTS = {
     # fast / cheap
-    'dns': 25, 'geo': 25, 'whois': 40, 'robots': 25, 'ssl': 35,
-    'headers': 30, 'favicon': 50, 'dorks': 20, 'osint': 20,
+    'dns': 60, 'geo': 45, 'whois': 75, 'robots': 45, 'ssl': 60,
+    'headers': 60, 'favicon': 90, 'dorks': 30, 'osint': 30,
     # medium (single API / moderate crawling)
-    'shodan': 45, 'censys': 50, 'whatweb': 75, 'wafw00f': 75,
-    'ports': 120, 'endpoints': 120, 'wayback': 120,
-    'email_harvest': 120, 'screenshot': 90,
+    'shodan': 90, 'censys': 90, 'whatweb': 150, 'wafw00f': 150,
+    'ports': 240, 'endpoints': 240, 'wayback': 210,
+    'email_harvest': 210, 'screenshot': 150, 'http_inspect': 90,
     # heavy (many parallel requests / brute / enumeration)
-    'js_secrets': 120, 'api_fuzzer': 120, 'content_intel': 120, 'cloud_buckets': 180,
-    'subdomains': 200, 'brute': 200, 'breachintel': 200,
-    # vulnerability scanner — 145 checks + ~38 sequential exploit probes
-    'nuclei': 360,
+    'js_secrets': 300, 'api_fuzzer': 300, 'content_intel': 300,
+    'cloud_buckets': 300,
+    'subdomains': 360, 'brute': 360, 'breachintel': 360,
+    # vulnerability scanner — 145 path checks + exploit templates + recent CVEs
+    'nuclei': 600,
 }
-DEFAULT_TIMEOUT = 90    # anything unlisted
-ABS_CAP = 420           # hard safety ceiling per module (7 min)
+DEFAULT_TIMEOUT = 180    # anything unlisted
+ABS_CAP = 720            # hard safety ceiling per module (12 min)
 
 
 def _register_scan(scan_id):
@@ -480,6 +481,7 @@ const MODULES = __MODULES_JSON__;
 const PILL_LABELS = {
   'js_secrets':    'js secrets',
   'content_intel': 'content intel',
+  'http_inspect':  'http inspector',
   'api_fuzzer':    'api fuzzer',
   'favicon':       'favicon',
   'cloud_buckets': 'cloud buckets',
@@ -499,7 +501,7 @@ const SCAN_ORDER = [
   'nuclei','shodan','censys',
   'subdomains','brute','wayback',
   'breachintel','email_harvest',
-  'js_secrets','content_intel','api_fuzzer',
+  'js_secrets','content_intel','http_inspect','api_fuzzer',
   'favicon','cloud_buckets',
   'dorks','osint'
 ];
@@ -1249,6 +1251,98 @@ function renderContent(id, data) {
     return h;
   }
 
+  case 'http_inspect':{
+    if(data.error) return `<div class="alert a-yellow">${escH(data.error)}</div>`;
+    const req=data.request||{}, res=data.response||{}, s=data.summary||{};
+    let h='';
+    h+=`<div class="stat-row" style="margin-bottom:10px">
+      <div class="stat-box"><div class="stat-n ${res.status>=200&&res.status<300?'c-green':'c-yellow'}" style="font-size:24px">${res.status||'—'}</div><div class="stat-l">Status</div></div>
+      <div class="stat-box"><div class="stat-n c-dim">${fmtBytes(res.size)}</div><div class="stat-l">Size</div></div>
+      <div class="stat-box"><div class="stat-n c-dim">${res.elapsed_ms||0}ms</div><div class="stat-l">Time</div></div>
+      <div class="stat-box"><div class="stat-n c-dim">${s.resp_headers||0}</div><div class="stat-l">Headers</div></div>
+    </div>`;
+
+    const hdrTable=(list,dir)=>{
+      if(!list||!list.length) return '';
+      return '<div style="display:flex;flex-direction:column;gap:2px;font-family:monospace;font-size:10px">'+
+        list.map(x=>`<div style="display:flex;gap:6px;background:var(--bg3);border:1px solid var(--border);border-radius:4px;padding:3px 7px">
+          <span style="color:${dir==='out'?'var(--purple)':'var(--cyan)'};flex-shrink:0">${dir==='out'?'▶':'◀'}</span>
+          <span style="color:var(--yellow);flex-shrink:0">${escH(x.name)}:</span>
+          <span style="color:var(--text);overflow-wrap:anywhere">${escH(x.value)}</span>
+        </div>`).join('')+'</div>';
+    };
+
+    // Redirect chain
+    const chain=data.redirect_chain||[];
+    if(chain.length>1){
+      h+=`<div class="sec" style="color:var(--orange)">↪ Redirect Chain (${chain.length-1} hop${chain.length>2?'s':''})</div>`;
+      h+='<div style="display:flex;flex-direction:column;gap:3px;margin-bottom:8px">';
+      chain.forEach((hop,i)=>{
+        const sc=hop.status>=300&&hop.status<400?'var(--yellow)':(hop.status<300?'var(--green)':'var(--red)');
+        h+=`<div style="font-family:monospace;font-size:10px;background:var(--bg3);border:1px solid var(--border);border-radius:4px;padding:4px 8px">
+          <span class="c-dim">${i+1}.</span> <span style="color:${sc};font-weight:700">[${hop.status}]</span>
+          <span style="color:var(--text);overflow-wrap:anywhere">${escH(hop.url)}</span>
+          ${hop.location?`<div class="c-dim" style="font-size:9px;margin-top:2px">→ ${escH(hop.location)}</div>`:''}
+        </div>`;
+      });
+      h+='</div>';
+    }
+
+    h+=`<div class="sec" style="color:var(--purple)">▶ Request Headers Sent <span class="c-dim" style="font-weight:400">(${(req.headers||[]).length})</span></div>`;
+    if(req.http_line) h+=`<div class="mono" style="font-size:10px;color:var(--green);background:var(--bg3);border:1px solid var(--border);border-radius:4px;padding:4px 8px;margin-bottom:4px">${escH(req.http_line)}</div>`;
+    h+=hdrTable(req.headers,'out');
+
+    h+=`<div class="sec" style="color:var(--cyan);margin-top:10px">◀ Response Headers Received <span class="c-dim" style="font-weight:400">(${(res.headers||[]).length})</span></div>`;
+    h+=hdrTable(res.headers,'in');
+
+    // Notable headers
+    const nh=data.notable_headers||[];
+    if(nh.length){
+      const sc={high:'var(--red)',medium:'var(--orange)',low:'var(--yellow)',info:'var(--text2)'};
+      h+=`<div class="sec" style="color:var(--orange);margin-top:10px">⚠ Notable Headers (${nh.length})</div>`;
+      h+='<div style="display:flex;flex-direction:column;gap:3px">';
+      nh.forEach(n=>{h+=`<div style="font-family:monospace;font-size:10px;background:var(--bg3);border:1px solid var(--border);border-radius:4px;padding:4px 8px">
+        <span class="badge" style="font-size:8px;background:var(--bg);border:1px solid var(--border);color:${sc[n.severity]||'var(--text2)'}">${escH(n.note)}</span>
+        <div style="margin-top:3px"><span style="color:var(--yellow)">${escH(n.name)}:</span> <span style="color:var(--text);overflow-wrap:anywhere">${escH(n.value)}</span></div>
+      </div>`;});
+      h+='</div>';
+    }
+
+    // Cookies
+    const ck=data.cookies||[];
+    if(ck.length){
+      h+=`<div class="sec" style="margin-top:10px">🍪 Cookies (${ck.length})</div>`;
+      h+='<table class="tbl"><thead><tr><th>Name</th><th>Secure</th><th>HttpOnly</th><th>SameSite</th><th>Issues</th></tr></thead><tbody>';
+      ck.forEach(c=>{h+=`<tr>
+        <td class="mono" style="font-size:10px;color:var(--cyan)">${escH(c.name)}</td>
+        <td>${c.secure?'<span class="c-green">✓</span>':'<span class="c-red">✗</span>'}</td>
+        <td>${c.httponly?'<span class="c-green">✓</span>':'<span class="c-red">✗</span>'}</td>
+        <td class="mono c-dim" style="font-size:9px">${escH(c.samesite||'—')}</td>
+        <td class="c-dim" style="font-size:9px">${escH((c.issues||[]).join(', ')||'—')}</td>
+      </tr>`;});
+      h+='</tbody></table>';
+    }
+
+    // Methods + CORS
+    const m=data.methods||{}, cors=data.cors||{};
+    if((m.allowed&&m.allowed.length)||cors.allow_origin){
+      h+='<div class="sec" style="margin-top:10px">🔧 Methods & CORS</div>';
+      if(m.allowed&&m.allowed.length){
+        h+=`<div style="font-size:10px;margin-bottom:4px"><span class="c-dim">Allowed:</span> `+
+           m.allowed.map(x=>`<span class="badge" style="font-size:8px;background:var(--bg3);border:1px solid var(--border);color:${(m.risky||[]).includes(x)?'var(--red)':'var(--text2)'}">${escH(x)}</span>`).join(' ')+`</div>`;
+      }
+      if(cors.allow_origin){
+        h+=`<div style="font-size:10px"><span class="c-dim">Access-Control-Allow-Origin:</span> <span class="mono c-cyan">${escH(cors.allow_origin)}</span>${cors.note?` <span style="color:var(--orange)">— ${escH(cors.note)}</span>`:''}</div>`;
+      }
+    }
+
+    if(res.body_preview){
+      h+='<div class="sec" style="margin-top:10px">📄 Body Preview</div>';
+      h+=`<pre style="font-family:monospace;font-size:9px;color:var(--text2);background:var(--bg3);border:1px solid var(--border);border-radius:4px;padding:7px;max-height:180px;overflow:auto;white-space:pre-wrap;word-break:break-all">${escH(res.body_preview)}</pre>`;
+    }
+    return h;
+  }
+
   case 'content_intel':{
     let h='';
     if(data.error) return `<div class="alert a-yellow">${escH(data.error)}</div>`;
@@ -1311,9 +1405,41 @@ function renderContent(id, data) {
         <div style="font-size:10px;color:var(--text2);margin-top:3px">${escH(gql.detail)}</div>
       </div>`;
     }
-    if(!eps.length&&!gql) return h+'<div class="alert a-green">✓ No API endpoints found</div>';
+    const sc={'critical':'var(--red)','high':'var(--orange)','medium':'var(--yellow)','low':'var(--text2)','info':'var(--text3)'};
+    const specs=data.specs||[], disc=data.discovered||[], bases=data.bases_found||[];
+
+    if(bases.length>1){
+      h+=`<div style="font-size:10px;margin-bottom:6px"><span class="c-dim">API bases responding:</span> `+
+         bases.map(b=>`<span class="badge" style="font-size:8px;background:var(--bg3);border:1px solid var(--border);color:var(--cyan)">${escH(b.path)}</span>`).join(' ')+`</div>`;
+    }
+
+    if(specs.length){
+      h+=`<div class="sec" style="color:var(--purple)">📘 API Specs & Docs (${specs.length})</div>`;
+      h+='<table class="tbl"><thead><tr><th>SEV</th><th>Path</th><th>What</th><th>Status</th><th>Size</th></tr></thead><tbody>';
+      specs.forEach(s=>{h+=`<tr>
+        <td style="color:${sc[s.severity]||'var(--text)'};font-weight:700;font-size:9px">${(s.severity||'').toUpperCase()}</td>
+        <td class="mono" style="font-size:10px;color:var(--cyan)">${escH(s.path)}</td>
+        <td style="font-size:10px">${escH(s.name)}</td>
+        <td><span class="badge" style="background:var(--bg3);border:1px solid var(--border);font-size:9px">[${s.status}]</span></td>
+        <td class="mono c-dim" style="font-size:9px;white-space:nowrap">${fmtBytes(s.size)}</td>
+      </tr>`;});
+      h+='</tbody></table>';
+    }
+
+    if(disc.length){
+      h+=`<div class="sec" style="color:var(--green)">🔗 Routes Discovered in JavaScript (${disc.length})</div>`;
+      h+='<table class="tbl"><thead><tr><th>SEV</th><th>Endpoint</th><th>Status</th><th>Size</th></tr></thead><tbody>';
+      disc.forEach(d=>{h+=`<tr>
+        <td style="color:${sc[d.severity]||'var(--text)'};font-weight:700;font-size:9px">${(d.severity||'').toUpperCase()}</td>
+        <td class="mono" style="font-size:10px;color:var(--cyan);overflow-wrap:anywhere">${escH(d.path)}</td>
+        <td><span class="badge" style="background:var(--bg3);border:1px solid var(--border);font-size:9px">[${d.status}]</span></td>
+        <td class="mono c-dim" style="font-size:9px;white-space:nowrap">${fmtBytes(d.size)}</td>
+      </tr>`;});
+      h+='</tbody></table>';
+    }
+
+    if(!eps.length&&!gql&&!specs.length&&!disc.length) return h+'<div class="alert a-green">✓ No API endpoints found</div>';
     if(eps.length){
-      const sc={'critical':'var(--red)','high':'var(--orange)','medium':'var(--yellow)','low':'var(--text2)'};
       h+='<div class="sec">API Endpoints</div>';
       h+='<table class="tbl"><thead><tr><th>SEV</th><th>Endpoint</th><th>Name</th><th>Status</th><th>Size</th></tr></thead><tbody>';
       eps.forEach(e=>{
@@ -1863,14 +1989,15 @@ function generateReport() {
   }
 
   // ── per-module adaptive detail ──
-  const MODORDER = ['dns','geo','whois','ssl','headers','wafw00f','ports','whatweb','robots','security_txt',
+  const MODORDER = ['dns','geo','whois','ssl','headers','http_inspect','wafw00f','ports','whatweb','robots','security_txt',
     'shodan','censys','subdomains','brute','wayback','email_harvest','breachintel','favicon','cloud_buckets',
     'js_secrets','screenshot','dorks','osint'];
   const CURATED = new Set(['nuclei','endpoints','api_fuzzer','content_intel']);
   const modName = id => (typeof MODULES!=='undefined' && MODULES[id]) || id.replace(/_/g,' ');
   const modIcon = {dns:'📡',geo:'📍',whois:'🌐',ssl:'🔒',headers:'🛡️',wafw00f:'🧱',ports:'🚪',whatweb:'🕵️',
     robots:'🤖',shodan:'🔭',censys:'🔬',subdomains:'🗺️',brute:'🔨',wayback:'📚',email_harvest:'📧',
-    breachintel:'💀',favicon:'🎯',cloud_buckets:'☁️',js_secrets:'🔑',screenshot:'🖼️',dorks:'🔍',osint:'🔗'};
+    breachintel:'💀',favicon:'🎯',cloud_buckets:'☁️',js_secrets:'🔑',screenshot:'🖼️',dorks:'🔍',osint:'🔗',
+    http_inspect:'🔎'};
   const seen = new Set();
   const order = MODORDER.filter(id => R[id] !== undefined);
   Object.keys(R).forEach(id => { if(!order.includes(id) && !CURATED.has(id)) order.push(id); });

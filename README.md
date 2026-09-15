@@ -5,8 +5,8 @@
 ![Kumo Web UI](kumo_banner.png)
 
 [![Python](https://img.shields.io/badge/Python-3.8+-3b82f6?style=flat-square&logo=python&logoColor=white)](https://python.org)
-[![Modules](https://img.shields.io/badge/Modules-26-22c55e?style=flat-square)](.)
-[![Vuln Checks](https://img.shields.io/badge/Vuln_Checks-150+-ef4444?style=flat-square)](.)
+[![Modules](https://img.shields.io/badge/Modules-27-22c55e?style=flat-square)](.)
+[![Vuln Checks](https://img.shields.io/badge/Vuln_Checks-490+-ef4444?style=flat-square)](.)
 [![No API Key](https://img.shields.io/badge/API_Key-Not_Required-22c55e?style=flat-square)](.)
 [![License](https://img.shields.io/badge/License-MIT-6b7280?style=flat-square)](LICENSE)
 
@@ -16,7 +16,7 @@
 
 ---
 
-Kumo is a domain OSINT & security reconnaissance framework. Drop a domain — get everything back in real time across **26 parallel modules**: DNS, open ports, leaked credentials, infostealer infections, vulnerable endpoints, subdomains, CVEs, malware families, and more.
+Kumo is a domain OSINT & security reconnaissance framework. Drop a domain — get everything back in real time across **27 parallel modules**: DNS, open ports, leaked credentials, infostealer infections, vulnerable endpoints, subdomains, CVEs, malware families, and more.
 
 ```bash
 pip install requests flask
@@ -30,7 +30,7 @@ python3 kumo.py --web               # web UI → http://localhost:8888
 
 ## Screenshots
 
-**Web UI** — 26 modules streaming in real time, results on the right, Google Dorks panel on the side:
+**Web UI** — 27 modules streaming in real time, results on the right, Google Dorks panel on the side:
 
 ![Kumo Web UI](web_ui.png)
 
@@ -168,7 +168,7 @@ Or when detected:
 
 ### 🚪 Port Scan — 70+ ports + banners
 
-Scans 70+ common ports and grabs service banners for each open one. Enriched with data from Shodan and Censys when available.
+Scans 70+ common ports and grabs service banners for each open one. **False-positive hardened**: the host is first probed on random unused ports — if it answers those too (tarpit, transparent proxy, or firewall that accepts everything), only ports with real application-layer evidence (a service banner, a TLS handshake, or a valid HTTP reply) are reported. Every open port is also re-verified before being listed. Enriched with data from Shodan and Censys when available.
 
 ```
   PORT     STATE    SERVICE     BANNER
@@ -246,7 +246,7 @@ Probes 80+ paths that are commonly left exposed: admin panels, backup files, con
 
 ### 🔓 Vulnerability Scanner — 150+ built-in checks
 
-Pure Python, zero external tools. 150+ HTTP-based checks inspired by real Nuclei templates — covering known CVEs, CMS vulnerabilities, exposed admin panels, cloud metadata endpoints, CI/CD dashboards, CORS misconfigurations, and more. Every check is **catch-all / WAF aware**: a baseline is fingerprinted first, so the generic 403/404 page a host returns for every path is never reported as a finding. Raw-file checks (`.git`, `.env`, backups) require the *actual* file content, and 403 responses are downgraded — never reported as "exposed".
+Pure Python, zero external tools. A **nuclei-style rule playbook of 342 rules** with real `matchers` / `matchers-condition: and`, each pairing *product identification* with *vulnerability evidence* — never a bare status code. 30 rules are hand-written; **312 are ported directly from the official [nuclei-templates](https://github.com/projectdiscovery/nuclei-templates) repository**, covering Drupal, Joomla, Magento, TYPO3, Sitecore, Umbraco, OpenCart, Confluence, SharePoint, Jira, Airflow, Jupyter, etcd, Consul, Keycloak, Rancher, Portainer, Artifactory, Zabbix, Nagios, Spring, Symfony, Django, Laravel, Tomcat, Redis, Elasticsearch, Kubernetes and Docker. Every ported rule is replayed against eight decoy responses (soft-404, WAF 403, marketing homepage, SPA shell, empty 200, JSON error, redirect, generic login) and discarded if it fires on any of them. Plus 150+ HTTP-based checks inspired by real Nuclei templates — covering known CVEs, CMS vulnerabilities, exposed admin panels, cloud metadata endpoints, CI/CD dashboards, CORS misconfigurations, and more. Every check is **catch-all / WAF aware**: a baseline is fingerprinted first, so the generic 403/404 page a host returns for every path is never reported as a finding. Raw-file checks (`.git`, `.env`, backups) require the *actual* file content, and 403 responses are downgraded — never reported as "exposed". **Soft-404 aware**: sites that answer unknown paths with HTTP 200 and a friendly "page not found" page (very common on e-commerce and SPAs) are detected and discarded, and the requested path is scrubbed from the response before product matching — so a URL echoed back in an error page or redirect can never be mistaken for the product itself.
 
 ```
   CRITICAL: 2   HIGH: 5   MEDIUM: 7
@@ -305,6 +305,43 @@ Pulls and scans first-party JavaScript for hardcoded secrets — API keys, token
   HIGH      Google API Key      AIza................   main.js
   HIGH      Stripe Live Key     sk_live_.............  checkout.js
   MEDIUM    JWT Token           eyJhbGciOiJ.........   auth.js
+```
+
+---
+
+### 🔎 HTTP Inspector — request/response headers
+
+Your browser's DevTools *Network* tab, headless. Shows exactly what Kumo sent and exactly what came back — the full request headers, every response header verbatim, the complete redirect chain, cookie security flags, allowed HTTP methods, CORS behaviour, and any non-standard or leaky headers worth a second look.
+
+```
+Final URL   https://corp.com/
+Status      200 OK          561 KB · 89 ms
+
+↪ REDIRECT CHAIN (2 hops)
+  1. [301] http://corp.com/        → https://corp.com/
+  2. [200] https://corp.com/
+
+▶ REQUEST HEADERS SENT (6)
+  ▶ User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/125.0.0.0
+  ▶ Accept: text/html,application/xhtml+xml,...
+
+◀ RESPONSE HEADERS RECEIVED (19)
+  ◀ server: nginx/1.24.0
+  ◀ strict-transport-security: max-age=31536000
+  ◀ set-cookie: session=abc123; Path=/
+
+⚠ NOTABLE HEADERS (3)
+  [Backend stack disclosed]      x-powered-by: PHP/8.1.2
+  [Internal backend leaked]      x-backend-server: web03.internal
+  [Symfony profiler exposed]     x-debug-token-link: /_profiler/a1b2c3
+
+🍪 COOKIES (2)
+  NAME       SECURE  HTTPONLY  SAMESITE  ISSUES
+  session    yes     yes       Lax       -
+  tracking   NO      NO        -         no Secure, no HttpOnly, no SameSite
+
+Allowed methods: GET POST OPTIONS PUT DELETE   ← PUT/DELETE risky
+CORS Allow-Origin: *   ← Wildcard origin allowed
 ```
 
 ---
@@ -614,14 +651,6 @@ python3 kumo.py target.com --no-color         pipe-friendly output
 
 fast mode skips: wayback · brute · subdomains · email_harvest
 ```
----
-
-## 🌐 Ecosystem
-
-| | Tool | Domain |
-|---|---|---|
-| ☁️ | [**Kumo** 蜘蛛](https://github.com/karim852/KUMO-Domain-Recon-Tool) | domain OSINT & reconnaissance |
-| 🌑 | [**Kage** 影](https://github.com/karim852/Kage-DFIR-toolkit) | DFIR host triage |
 
 ---
 

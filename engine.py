@@ -4,6 +4,7 @@ Kumo v1.0 — Core Recon Engine
 All scanning modules, separated from CLI/Web presentation.
 """
 
+import os
 import socket
 import ssl
 import concurrent.futures
@@ -333,6 +334,12 @@ def scan_whois(domain):
 # ═══════════════════════════════════════════════════════════════
 
 def scan_ssl(domain):
+    # A security scanner must still be able to inspect a certificate that fails
+    # validation — self-signed, expired, or hostname-mismatched certs are
+    # findings in themselves, not reasons to give up. We therefore try a strict
+    # handshake first and, if it fails, retry unverified and record WHY.
+    validation_error = None
+    cert = cipher = proto = None
     try:
         ctx = ssl.create_default_context()
         with ctx.wrap_socket(socket.socket(), server_hostname=domain) as s:
@@ -341,7 +348,34 @@ def scan_ssl(domain):
             cert = s.getpeercert()
             cipher = s.cipher()
             proto = s.version()
+    except Exception as e:
+        validation_error = str(e)
+        try:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            with ctx.wrap_socket(socket.socket(), server_hostname=domain) as s:
+                s.settimeout(10)
+                s.connect((domain, 443))
+                cipher = s.cipher()
+                proto = s.version()
+                der = s.getpeercert(binary_form=True)
+            # Parse the DER we just retrieved without validation
+            cert = {}
+            try:
+                import tempfile
+                with tempfile.NamedTemporaryFile("w", suffix=".pem", delete=False) as fh:
+                    fh.write(ssl.DER_cert_to_PEM_cert(der))
+                    pem_path = fh.name
+                cert = ssl._ssl._test_decode_cert(pem_path)
+                os.unlink(pem_path)
+            except Exception:
+                cert = {}
+        except Exception as e2:
+            return {"error": f"TLS handshake failed: {str(e2)[:120]}"}
 
+    try:
+        cert = cert or {}
         subj = dict(x[0] for x in cert.get("subject", ()))
         iss = dict(x[0] for x in cert.get("issuer", ()))
         sans = [v for t, v in cert.get("subjectAltName", ()) if t == "DNS"]
@@ -353,6 +387,29 @@ def scan_ssl(domain):
         except Exception:
             pass
 
+        # Turn validation failures into explicit, reportable issues
+        issues = []
+        if validation_error:
+            ve = validation_error.lower()
+            if "self-signed" in ve or "self signed" in ve:
+                issues.append({"issue": "Self-signed certificate", "severity": "high"})
+            elif "expired" in ve or "certificate_expired" in ve:
+                issues.append({"issue": "Certificate expired", "severity": "high"})
+            elif "hostname mismatch" in ve or "doesn't match" in ve:
+                issues.append({"issue": "Hostname mismatch", "severity": "high"})
+            elif "unable to get local issuer" in ve or "unable to verify" in ve:
+                issues.append({"issue": "Incomplete certificate chain / untrusted issuer", "severity": "medium"})
+            else:
+                issues.append({"issue": f"Certificate validation failed: {validation_error[:80]}",
+                               "severity": "medium"})
+        if days_left is not None:
+            if days_left < 0:
+                issues.append({"issue": f"Certificate expired {abs(days_left)} days ago", "severity": "high"})
+            elif days_left < 30:
+                issues.append({"issue": f"Certificate expires in {days_left} days", "severity": "medium"})
+        if proto in ("TLSv1", "TLSv1.1", "SSLv3"):
+            issues.append({"issue": f"Obsolete protocol negotiated ({proto})", "severity": "high"})
+
         return {
             "common_name": subj.get("commonName", "N/A"),
             "issuer": iss.get("organizationName", "N/A"),
@@ -363,6 +420,9 @@ def scan_ssl(domain):
             "sans": sans,
             "wildcards": [s for s in sans if s.startswith("*.")],
             "serial": cert.get("serialNumber", ""),
+            "valid": validation_error is None,
+            "validation_error": validation_error[:160] if validation_error else None,
+            "issues": issues,
             "protocol": proto,
             "cipher": cipher[0] if cipher else "",
             "cipher_bits": cipher[2] if cipher else 0,
@@ -593,13 +653,39 @@ def scan_ports(domain, extra_ports=None):
         if p not in ports_to_scan:
             ports_to_scan[p] = ("Unknown (Shodan/Censys)", "medium")
 
+    # ── Resolve ONCE and scan the IP directly ──
+    # Reconnecting by hostname re-resolves on every socket, so round-robin DNS
+    # can hit different servers and produce inconsistent "open" results.
+    _ips = resolve(domain)
+    target_ip = _ips["v4"][0] if _ips.get("v4") else domain
+
+    # ── Detect "answers on every port" hosts BEFORE scanning ──
+    # Probe random high ports that no real service would be listening on. If
+    # they hand back a SYN-ACK, a middlebox/tarpit is answering everything and
+    # a plain connect() result is meaningless.
+    def _probe_raw(port, timeout=1.5):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(timeout)
+            ok = s.connect_ex((target_ip, port)) == 0
+            s.close()
+            return ok
+        except Exception:
+            return False
+
+    import random as _rnd
+    decoy_ports = _rnd.sample([p for p in range(20000, 64000) if p not in ports_to_scan], 5)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex0:
+        decoy_open = sum(1 for r in ex0.map(_probe_raw, decoy_ports) if r)
+    port_catchall = decoy_open >= 3   # majority of impossible ports "open"
+
     def scan_one(item):
         port, (svc, risk) = item
         source = "shodan_censys" if port in shodan_censys_ports and port not in KNOWN_PORTS else "scan"
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(1.5)
-            result = s.connect_ex((domain, port))
+            result = s.connect_ex((target_ip, port))
             if result == 0:
                 # Port is open — try to grab banner
                 banner = ""
@@ -641,12 +727,2891 @@ def scan_ports(domain, extra_ports=None):
         results = sorted(ex.map(scan_one, ports_to_scan.items()), key=lambda x: x["port"])
 
     open_ports = [r for r in results if r["open"]]
+
+    # ── Anti-false-positive pass ──────────────────────────────────────────
+    # Some networks (transparent proxies, load balancers, IPS/tarpits, certain
+    # hosting providers) answer the TCP handshake on EVERY port, which makes an
+    # ordinary scan report all 70+ ports as "open". We detected that above by
+    # probing random unused high ports. When it happens, a bare SYN-ACK proves
+    # nothing, so only ports backed by real evidence are kept.
+    if port_catchall:
+        verified, filtered = [], []
+        for p in open_ports:
+            if _verify_port(target_ip, domain, p["port"], p.get("banner", "")):
+                p["confidence"] = "confirmed"
+                verified.append(p)
+            else:
+                p["confidence"] = "unverified"
+                filtered.append(p)
+        for p in results:
+            if p["open"] and p not in verified:
+                p["open"] = False
+                p["filtered_reason"] = "host answers on every port (catch-all) — no service evidence"
+        open_ports = verified
+    else:
+        # Normal host: re-check each open port once to drop transient/flaky hits.
+        def recheck(p):
+            if p.get("banner"):
+                p["confidence"] = "confirmed"
+                return True
+            try:
+                s2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s2.settimeout(2.0)
+                ok = s2.connect_ex((target_ip, p["port"])) == 0
+                s2.close()
+                p["confidence"] = "confirmed" if ok else "unverified"
+                return ok
+            except Exception:
+                p["confidence"] = "unverified"
+                return False
+
+        if open_ports:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(20, len(open_ports))) as ex2:
+                keep = list(ex2.map(recheck, open_ports))
+            confirmed = [p for p, k in zip(open_ports, keep) if k]
+            dropped = {p["port"] for p, k in zip(open_ports, keep) if not k}
+            for p in results:
+                if p["port"] in dropped:
+                    p["open"] = False
+                    p["filtered_reason"] = "did not respond on re-check (transient)"
+            open_ports = confirmed
+
     return {
         "results":       results,
         "open":          open_ports,
         "total_scanned": len(ports_to_scan),
         "from_intel":    len(shodan_censys_ports),
+        "target_ip":     target_ip,
+        "port_catchall": port_catchall,
+        "catchall_note": ("Host answered on random unused ports — a firewall/proxy "
+                          "accepts every connection. Only ports with real service "
+                          "evidence are reported.") if port_catchall else "",
     }
+
+
+def _verify_port(ip, hostname, port, banner=""):
+    """
+    Prove a port really hosts a service (used when the host answers on every
+    port). A bare TCP handshake is not enough — we need application-layer
+    evidence: a service banner, a TLS handshake, or a valid HTTP reply.
+    """
+    if banner and len(banner.strip()) >= 4:
+        return True
+    # TLS-capable ports: a successful handshake proves a real TLS service
+    if port in (443, 465, 636, 993, 995, 8443, 9443, 4443, 2083, 2087, 2096):
+        try:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            with socket.create_connection((ip, port), timeout=3) as raw:
+                with ctx.wrap_socket(raw, server_hostname=hostname) as ss:
+                    return bool(ss.version())
+        except Exception:
+            return False
+    # HTTP-ish ports: require a real HTTP status line
+    if port in (80, 81, 591, 2082, 2086, 2095, 7080, 8000, 8008, 8080, 8081,
+                8181, 8888, 9000, 3000, 5000, 5601, 9090, 9200, 15672, 10000):
+        try:
+            with socket.create_connection((ip, port), timeout=3) as raw:
+                raw.sendall(b"GET / HTTP/1.1\r\nHost: " + hostname.encode() +
+                            b"\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n")
+                data = raw.recv(256)
+            return data.startswith(b"HTTP/")
+        except Exception:
+            return False
+    # Anything else: try to read a banner directly
+    try:
+        with socket.create_connection((ip, port), timeout=3) as raw:
+            raw.settimeout(2.5)
+            data = raw.recv(128)
+        return len(data.strip()) >= 4
+    except Exception:
+        return False
+
+
+# ═══════════════════════════════════════════════════════════════
+# NUCLEI-STYLE MATCHER ENGINE + RULE PLAYBOOK
+# ═══════════════════════════════════════════════════════════════
+# Mirrors the matcher model used by ProjectDiscovery's nuclei templates:
+#   matchers: [{type: status|word|regex|size|dsl, part: body|header|all,
+#               words/regex/status/size, condition: and|or, negative: bool}]
+#   matchers_condition: and|or
+#
+# Following nuclei's own guidance, a rule must never rely on a status code
+# alone — every rule pairs a *product identification* matcher with a
+# *vulnerability indication* matcher, combined with `matchers_condition: and`.
+
+def _resp_part(resp, part, scrub=None):
+    """
+    Extract the requested part of a response, nuclei-style.
+
+    `scrub` removes the requested path (and its segments) from the text first,
+    so a server echoing the URL back can never satisfy a product matcher.
+    """
+    try:
+        if part == "header":
+            text = "\n".join(f"{k}: {v}" for k, v in resp.headers.items())
+        elif part == "body":
+            text = resp.text or ""
+        elif part == "all":
+            hdr = "\n".join(f"{k}: {v}" for k, v in resp.headers.items())
+            text = hdr + "\n\n" + (resp.text or "")
+        else:
+            return ""
+    except Exception:
+        return ""
+    if scrub:
+        for variant in scrub:
+            if variant:
+                text = text.replace(variant, " ")
+    return text
+
+
+def _match_one(resp, m, scrub=None):
+    """Evaluate a single matcher against a response. Returns True/False."""
+    mtype = m.get("type", "word")
+    result = False
+    try:
+        if mtype == "status":
+            result = resp.status_code in m.get("status", [])
+
+        elif mtype == "size":
+            sizes = m.get("size", [])
+            n = len(resp.content)
+            result = any(n == s for s in sizes) if sizes else False
+            if "min_size" in m:
+                result = n >= m["min_size"]
+            if "max_size" in m:
+                result = result and n <= m["max_size"] if "min_size" in m else n <= m["max_size"]
+
+        elif mtype == "word":
+            hay = _resp_part(resp, m.get("part", "body"), scrub)
+            if not m.get("case_sensitive"):
+                hay = hay.lower()
+                words = [w.lower() for w in m.get("words", [])]
+            else:
+                words = m.get("words", [])
+            cond = m.get("condition", "or")
+            hits = [w in hay for w in words]
+            result = all(hits) if cond == "and" else any(hits)
+
+        elif mtype == "regex":
+            import re as _r
+            hay = _resp_part(resp, m.get("part", "body"), scrub)
+            flags = 0 if m.get("case_sensitive") else _r.I
+            pats = m.get("regex", [])
+            cond = m.get("condition", "or")
+            hits = [bool(_r.search(p, hay, flags)) for p in pats]
+            result = all(hits) if cond == "and" else any(hits)
+
+        elif mtype == "dsl":
+            # Tiny safe DSL: supports the handful of expressions we need.
+            body = _resp_part(resp, "body", scrub)
+            ctx = {
+                "status_code": resp.status_code,
+                "content_length": len(resp.content),
+                "body": body,
+                "header": _resp_part(resp, "header"),
+                "contains": lambda h, n: n.lower() in (h or "").lower(),
+                "len": len,
+                "not_html": not _looks_like_html(resp.content),
+            }
+            hits = []
+            for expr in m.get("dsl", []):
+                try:
+                    hits.append(bool(eval(expr, {"__builtins__": {}}, ctx)))
+                except Exception:
+                    hits.append(False)
+            cond = m.get("condition", "or")
+            result = all(hits) if cond == "and" else any(hits)
+    except Exception:
+        result = False
+
+    return (not result) if m.get("negative") else result
+
+
+def _eval_rule(resp, rule, scrub=None):
+    """Evaluate all matchers of a rule with its matchers_condition."""
+    matchers = rule.get("matchers", [])
+    if not matchers:
+        return False
+    cond = rule.get("matchers_condition", "and")
+    results = [_match_one(resp, m, scrub) for m in matchers]
+    return all(results) if cond == "and" else any(results)
+
+
+# ── The playbook: each rule identifies the PRODUCT and the EXPOSURE ──
+VULN_RULES = [
+    {
+        "id": "git-config", "name": "Git Config Exposed", "severity": "high",
+        "path": "/.git/config", "matchers_condition": "and",
+        "description": "Exposed .git/config reveals repository URLs and may allow full source recovery",
+        "matchers": [
+            {"type": "status", "status": [200]},
+            {"type": "word", "part": "body", "words": ["[core]", "repositoryformatversion"], "condition": "and"},
+            {"type": "dsl", "dsl": ["not_html"]},
+        ],
+    },
+    {
+        "id": "git-head", "name": "Git HEAD Exposed", "severity": "high",
+        "path": "/.git/HEAD", "matchers_condition": "and",
+        "description": "Exposed .git/HEAD confirms a downloadable git repository",
+        "matchers": [
+            {"type": "status", "status": [200]},
+            {"type": "regex", "part": "body", "regex": [r"^ref:\s+refs/"]},
+            {"type": "dsl", "dsl": ["content_length < 200"]},
+        ],
+    },
+    {
+        "id": "env-file", "name": "Environment File Exposed", "severity": "critical",
+        "path": "/.env", "matchers_condition": "and",
+        "description": "A .env file with live credentials is publicly readable",
+        "matchers": [
+            {"type": "status", "status": [200]},
+            {"type": "regex", "part": "body",
+             "regex": [r"(?m)^\s*(APP_KEY|APP_ENV|DB_PASSWORD|DB_HOST|DB_DATABASE|SECRET_KEY|AWS_ACCESS_KEY_ID|MAIL_HOST|REDIS_HOST)\s*="]},
+            {"type": "dsl", "dsl": ["not_html"]},
+        ],
+    },
+    {
+        "id": "ds-store", "name": ".DS_Store Exposed", "severity": "medium",
+        "path": "/.DS_Store", "matchers_condition": "and",
+        "description": "macOS .DS_Store leaks the directory listing of the web root",
+        "matchers": [
+            {"type": "status", "status": [200]},
+            {"type": "word", "part": "body", "words": ["Bud1"]},
+        ],
+    },
+    {
+        "id": "phpinfo", "name": "phpinfo() Exposed", "severity": "high",
+        "path": "/phpinfo.php", "matchers_condition": "and",
+        "description": "phpinfo() discloses full PHP configuration, paths and environment",
+        "matchers": [
+            {"type": "status", "status": [200]},
+            {"type": "word", "part": "body",
+             "words": ["phpinfo()", "PHP Version", "Configuration File"], "condition": "and"},
+        ],
+    },
+    {
+        "id": "laravel-debug", "name": "Laravel Debug Mode / Ignition", "severity": "critical",
+        "path": "/_ignition/health-check", "matchers_condition": "and",
+        "description": "Laravel Ignition debug endpoint reachable (RCE vector in CVE-2021-3129)",
+        "matchers": [
+            {"type": "status", "status": [200]},
+            {"type": "word", "part": "body", "words": ["\"can_execute_commands\"", "ignition"], "condition": "or"},
+            {"type": "word", "part": "header", "words": ["application/json"]},
+        ],
+    },
+    {
+        "id": "wp-config-bak", "name": "WordPress Config Backup Exposed", "severity": "critical",
+        "path": "/wp-config.php.bak", "matchers_condition": "and",
+        "description": "wp-config backup exposes database credentials and auth salts",
+        "matchers": [
+            {"type": "status", "status": [200]},
+            {"type": "word", "part": "body", "words": ["DB_NAME", "DB_PASSWORD"], "condition": "and"},
+        ],
+    },
+    {
+        "id": "spring-actuator-env", "name": "Spring Actuator /env Exposed", "severity": "critical",
+        "path": "/actuator/env", "matchers_condition": "and",
+        "description": "Spring Boot Actuator env endpoint leaks configuration and secrets",
+        "matchers": [
+            {"type": "status", "status": [200]},
+            {"type": "word", "part": "body",
+             "words": ["propertySources", "systemEnvironment", "applicationConfig"], "condition": "or"},
+            {"type": "word", "part": "header", "words": ["json"]},
+        ],
+    },
+    {
+        "id": "spring-heapdump", "name": "Spring Actuator Heap Dump", "severity": "critical",
+        "path": "/actuator/heapdump", "matchers_condition": "and",
+        "description": "Heap dump download exposes in-memory credentials and tokens",
+        "matchers": [
+            {"type": "status", "status": [200]},
+            {"type": "word", "part": "header",
+             "words": ["application/octet-stream", "application/vnd"], "condition": "or"},
+            {"type": "dsl", "dsl": ["content_length > 100000"]},
+        ],
+    },
+    {
+        "id": "swagger-spec", "name": "Swagger/OpenAPI Spec Exposed", "severity": "medium",
+        "path": "/swagger.json", "matchers_condition": "and",
+        "description": "API specification publicly readable — maps the full API surface",
+        "matchers": [
+            {"type": "status", "status": [200]},
+            {"type": "word", "part": "body", "words": ["\"swagger\"", "\"openapi\""], "condition": "or"},
+            {"type": "word", "part": "body", "words": ["\"paths\""]},
+        ],
+    },
+    {
+        "id": "jenkins-panel", "name": "Jenkins Dashboard Exposed", "severity": "high",
+        "path": "/", "matchers_condition": "and",
+        "description": "Jenkins instance reachable — check for anonymous read/build access",
+        "matchers": [
+            {"type": "status", "status": [200, 403]},
+            {"type": "word", "part": "all", "words": ["X-Jenkins", "Dashboard [Jenkins]", "jenkins-session"], "condition": "or"},
+        ],
+    },
+    {
+        "id": "kibana-panel", "name": "Kibana Dashboard Exposed", "severity": "high",
+        "path": "/app/kibana", "matchers_condition": "and",
+        "description": "Kibana UI reachable without authentication",
+        "matchers": [
+            {"type": "status", "status": [200]},
+            {"type": "word", "part": "all", "words": ["kbn-name", "kibana-body", "\"kibana\""], "condition": "or"},
+        ],
+    },
+    {
+        "id": "elasticsearch", "name": "Elasticsearch Exposed", "severity": "critical",
+        "path": "/_cluster/health", "matchers_condition": "and",
+        "description": "Elasticsearch cluster API reachable without authentication",
+        "matchers": [
+            {"type": "status", "status": [200]},
+            {"type": "word", "part": "body",
+             "words": ["cluster_name", "number_of_nodes", "active_shards"], "condition": "and"},
+        ],
+    },
+    {
+        "id": "prometheus-metrics", "name": "Prometheus Metrics Exposed", "severity": "medium",
+        "path": "/metrics", "matchers_condition": "and",
+        "description": "Prometheus metrics leak internal service and host details",
+        "matchers": [
+            {"type": "status", "status": [200]},
+            {"type": "regex", "part": "body", "regex": [r"(?m)^# (HELP|TYPE) "]},
+        ],
+    },
+    {
+        "id": "phpmyadmin", "name": "phpMyAdmin Exposed", "severity": "high",
+        "path": "/phpmyadmin/", "matchers_condition": "and",
+        "description": "phpMyAdmin login reachable — database management interface",
+        "matchers": [
+            {"type": "status", "status": [200]},
+            {"type": "word", "part": "all",
+             "words": ["phpmyadmin", "pma_username", "phpMyAdmin"], "condition": "or"},
+            {"type": "word", "part": "body", "words": ["<html", "<form"], "condition": "or"},
+        ],
+    },
+    {
+        "id": "adminer", "name": "Adminer Exposed", "severity": "high",
+        "path": "/adminer.php", "matchers_condition": "and",
+        "description": "Adminer database client reachable",
+        "matchers": [
+            {"type": "status", "status": [200]},
+            {"type": "word", "part": "body", "words": ["Adminer", "adminer.org"], "condition": "or"},
+            {"type": "word", "part": "body", "words": ["login", "server"], "condition": "or"},
+        ],
+    },
+    {
+        "id": "docker-api", "name": "Docker Remote API Exposed", "severity": "critical",
+        "path": "/version", "matchers_condition": "and",
+        "description": "Docker Engine API reachable — full container control",
+        "matchers": [
+            {"type": "status", "status": [200]},
+            {"type": "word", "part": "body",
+             "words": ["ApiVersion", "GitCommit", "GoVersion"], "condition": "and"},
+        ],
+    },
+    {
+        "id": "kubernetes-api", "name": "Kubernetes API Exposed", "severity": "critical",
+        "path": "/api/v1/namespaces", "matchers_condition": "and",
+        "description": "Kubernetes API reachable — cluster enumeration possible",
+        "matchers": [
+            {"type": "status", "status": [200]},
+            {"type": "word", "part": "body", "words": ["\"kind\"", "NamespaceList"], "condition": "and"},
+        ],
+    },
+    {
+        "id": "traefik-dashboard", "name": "Traefik Dashboard Exposed", "severity": "high",
+        "path": "/dashboard/", "matchers_condition": "and",
+        "description": "Traefik routing dashboard reachable",
+        "matchers": [
+            {"type": "status", "status": [200]},
+            {"type": "word", "part": "body", "words": ["traefik", "Traefik"], "condition": "or"},
+        ],
+    },
+    {
+        "id": "grafana-panel", "name": "Grafana Login Exposed", "severity": "medium",
+        "path": "/login", "matchers_condition": "and",
+        "description": "Grafana reachable — check for default credentials",
+        "matchers": [
+            {"type": "status", "status": [200]},
+            {"type": "word", "part": "all", "words": ["grafana", "Grafana"], "condition": "or"},
+            {"type": "word", "part": "body", "words": ["grafana-app", "grafanaBootData", "loginForm"], "condition": "or"},
+        ],
+    },
+    {
+        "id": "rabbitmq-mgmt", "name": "RabbitMQ Management Exposed", "severity": "high",
+        "path": "/api/overview", "matchers_condition": "and",
+        "description": "RabbitMQ management API reachable",
+        "matchers": [
+            {"type": "status", "status": [200, 401]},
+            {"type": "word", "part": "all", "words": ["RabbitMQ", "rabbit_version", "management"], "condition": "or"},
+        ],
+    },
+    {
+        "id": "sql-dump", "name": "SQL Dump Exposed", "severity": "critical",
+        "path": "/dump.sql", "matchers_condition": "and",
+        "description": "A database dump is publicly downloadable",
+        "matchers": [
+            {"type": "status", "status": [200]},
+            {"type": "word", "part": "body",
+             "words": ["CREATE TABLE", "INSERT INTO", "DROP TABLE", "-- MySQL dump"], "condition": "or"},
+            {"type": "dsl", "dsl": ["not_html"]},
+        ],
+    },
+    {
+        "id": "htpasswd", "name": ".htpasswd Exposed", "severity": "critical",
+        "path": "/.htpasswd", "matchers_condition": "and",
+        "description": "HTTP basic-auth password hashes are publicly readable",
+        "matchers": [
+            {"type": "status", "status": [200]},
+            {"type": "regex", "part": "body", "regex": [r"(?m)^[\w.\-]+:(\$apr1\$|\$2[aby]\$|\{SHA\}|\$1\$)"]},
+        ],
+    },
+    {
+        "id": "npm-token", "name": ".npmrc Token Exposed", "severity": "critical",
+        "path": "/.npmrc", "matchers_condition": "and",
+        "description": "npm registry auth token is publicly readable",
+        "matchers": [
+            {"type": "status", "status": [200]},
+            {"type": "word", "part": "body", "words": ["_authToken", "//registry.npmjs.org/"], "condition": "or"},
+            {"type": "dsl", "dsl": ["not_html"]},
+        ],
+    },
+    {
+        "id": "aws-credentials", "name": "AWS Credentials File Exposed", "severity": "critical",
+        "path": "/.aws/credentials", "matchers_condition": "and",
+        "description": "AWS credentials file is publicly readable",
+        "matchers": [
+            {"type": "status", "status": [200]},
+            {"type": "word", "part": "body",
+             "words": ["aws_access_key_id", "aws_secret_access_key"], "condition": "or"},
+            {"type": "dsl", "dsl": ["not_html"]},
+        ],
+    },
+    {
+        "id": "ssh-private-key", "name": "SSH Private Key Exposed", "severity": "critical",
+        "path": "/id_rsa", "matchers_condition": "and",
+        "description": "An SSH private key is publicly downloadable",
+        "matchers": [
+            {"type": "status", "status": [200]},
+            {"type": "word", "part": "body", "words": ["-----BEGIN", "PRIVATE KEY-----"], "condition": "and"},
+        ],
+    },
+    {
+        "id": "docker-compose", "name": "docker-compose.yml Exposed", "severity": "high",
+        "path": "/docker-compose.yml", "matchers_condition": "and",
+        "description": "Compose file exposes services, ports and often credentials",
+        "matchers": [
+            {"type": "status", "status": [200]},
+            {"type": "word", "part": "body", "words": ["services:", "image:"], "condition": "and"},
+            {"type": "dsl", "dsl": ["not_html"]},
+        ],
+    },
+    {
+        "id": "graphql-introspection", "name": "GraphQL Introspection Enabled", "severity": "medium",
+        "path": "/graphql?query=%7B__schema%7BqueryType%7Bname%7D%7D%7D",
+        "matchers_condition": "and",
+        "description": "GraphQL introspection reveals the full schema",
+        "matchers": [
+            {"type": "status", "status": [200]},
+            {"type": "word", "part": "body", "words": ["__schema", "queryType"], "condition": "and"},
+            {"type": "word", "part": "header", "words": ["json"]},
+        ],
+    },
+    {
+        "id": "sonarqube", "name": "SonarQube Exposed", "severity": "medium",
+        "path": "/api/system/status", "matchers_condition": "and",
+        "description": "SonarQube system status reachable without auth",
+        "matchers": [
+            {"type": "status", "status": [200]},
+            {"type": "word", "part": "body", "words": ["\"status\"", "\"version\""], "condition": "and"},
+            {"type": "word", "part": "body", "words": ["UP", "STARTING", "DOWN"], "condition": "or"},
+        ],
+    },
+    {
+        "id": "wp-user-enum", "name": "WordPress User Enumeration", "severity": "medium",
+        "path": "/wp-json/wp/v2/users", "matchers_condition": "and",
+        "description": "WordPress REST API exposes usernames and slugs",
+        "matchers": [
+            {"type": "status", "status": [200]},
+            {"type": "word", "part": "body", "words": ["\"slug\"", "\"id\""], "condition": "and"},
+            {"type": "word", "part": "header", "words": ["json"]},
+        ],
+    },
+]
+
+
+
+# ── Extended playbook: rules ported from the official nuclei-templates repo ──
+# Generated from projectdiscovery/nuclei-templates (GET-only templates carrying real
+# word-matcher evidence — regex matchers are deliberately not ported, see gen_rules.py).
+# Every rule was then replayed against decoy responses — soft-404, WAF 403, marketing
+# homepage, SPA shell, empty 200, JSON error, redirect and a generic login page — and
+# any rule that fired on a decoy was discarded.
+VULN_RULES_EXTENDED = [
+    {
+        "id": 'axiom-digitalocean-key-exposure', "name": 'DigitalOcean Key Exposure via Axiom',
+        "severity": 'critical', "path": '/.axiom/accounts/do.json',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'DigitalOcean Key Exposure via Axiom (ported from nuclei template http/exposures/tokens/digitalocean/axiom-digitalocean-key-exposure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['"do_key"', '"region"', '"provider"'], 'condition': 'or'}],
+    },
+    {
+        "id": 'tugboat-config-exposure', "name": 'Tugboat Configuration File Exposure',
+        "severity": 'critical', "path": '/.tugboat',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Tugboat Configuration File Exposure (ported from nuclei template http/exposures/tokens/digitalocean/tugboat-config-exposure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['authentication', 'access_token', 'ssh_user'], 'condition': 'or'}],
+    },
+    {
+        "id": 'bitbucket-auth-bypass', "name": 'Bitbucket Server > 4.8 - Authentication Bypass',
+        "severity": 'critical', "path": '/admin%20/db',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Bitbucket Server > 4.8 - Authentication Bypass (ported from nuclei template http/misconfiguration/bitbucket-auth-bypass.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['<h2>Database</h2>', 'Migrate database'], 'condition': 'or'}],
+    },
+    {
+        "id": 'getsimple-installation', "name": 'GetSimple CMS - Installer',
+        "severity": 'critical', "path": '/admin/install.php',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'GetSimple CMS - Installer (ported from nuclei template http/misconfiguration/installer/getsimple-installation.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['<title>GetSimple &raquo; Installation</title>', 'PHP Version'], 'condition': 'or'}],
+    },
+    {
+        "id": 'aem-groovyconsole', "name": 'AEM Groovy Console Discovery',
+        "severity": 'critical', "path": '/groovyconsole',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'AEM Groovy Console Discovery (ported from nuclei template http/misconfiguration/aem/aem-groovyconsole.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['<title>Groovy Console</title>', 'Run Script', 'Groovy Web Console'], 'condition': 'or'}],
+    },
+    {
+        "id": 'circarlife-installer', "name": 'CirCarLife - Installer',
+        "severity": 'critical', "path": '/html/setup.html',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'CirCarLife - Installer (ported from nuclei template http/misconfiguration/installer/circarlife-setup.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['CirCarLife Scada', '<title>- setup</title>', 'Network setup', 'Modem setup', 'Security setup'], 'condition': 'or'}],
+    },
+    {
+        "id": 'misconfigured-docker', "name": 'Docker Container - Misconfiguration Exposure',
+        "severity": 'critical', "path": '/images/json',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Docker Container - Misconfiguration Exposure (ported from nuclei template http/misconfiguration/misconfigured-docker.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['"ParentId":', '"Containers":', '"Labels":'], 'condition': 'or'}],
+    },
+    {
+        "id": 'jupyter-ipython-unauth', "name": 'Jupyter ipython - Authorization Bypass',
+        "severity": 'critical', "path": '/ipython/tree',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Jupyter ipython - Authorization Bypass (ported from nuclei template http/misconfiguration/jupyter-ipython-unauth.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['ipython/static/components', 'ipython/kernelspecs'], 'condition': 'or'}],
+    },
+    {
+        "id": 'zipline-installer', "name": 'Zipline - Installer',
+        "severity": 'critical', "path": '/setup',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Zipline - Installer (ported from nuclei template http/misconfiguration/installer/zipline-installer.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Setup Zipline', 'Configuration', 'Create a super-admin account'], 'condition': 'or'}],
+    },
+    {
+        "id": 'wp-install', "name": 'WordPress Exposed Installation',
+        "severity": 'critical', "path": '/wp-admin/install.php?step=1',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'WordPress Exposed Installation (ported from nuclei template http/misconfiguration/installer/wp-install.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['<title>WordPress &rsaquo; Installation</title>', 'Site Title'], 'condition': 'or'}],
+    },
+    {
+        "id": 'asus-rtn16-default-login', "name": 'ASUS RT-N16 - Default Login',
+        "severity": 'high', "path": '/',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'ASUS RT-N16 - Default Login (ported from nuclei template http/default-logins/asus/asus-rtn16-default-login.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['ASUS', 'RT-N16', 'System Status', 'Network Map'], 'condition': 'or'}],
+    },
+    {
+        "id": 'wpconfig-aws-keys', "name": 'AWS S3 keys Leak',
+        "severity": 'high', "path": '/%c0',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'AWS S3 keys Leak (ported from nuclei template http/exposures/configs/wpconfig-aws-keys.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['access-key-id', 'secret-access-key', 'DB_NAME', 'DB_PASSWORD'], 'condition': 'or'}],
+    },
+    {
+        "id": 'dockercfg-config', "name": 'Detect .dockercfg',
+        "severity": 'high', "path": '/.dockercfg',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Detect .dockercfg (ported from nuclei template http/exposures/configs/dockercfg-config.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['"email":', '"auth":'], 'condition': 'or'}],
+    },
+    {
+        "id": 'detect-drone-config', "name": 'Drone - Configuration Detection',
+        "severity": 'high', "path": '/.drone.yml',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Drone - Configuration Detection (ported from nuclei template http/exposures/configs/detect-drone-config.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['kind:'], 'condition': 'or'}],
+    },
+    {
+        "id": 'esmtprc-config', "name": 'eSMTP - Config Discovery',
+        "severity": 'high', "path": '/.esmtprc',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'eSMTP - Config Discovery (ported from nuclei template http/exposures/configs/esmtprc-config.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['hostname'], 'condition': 'or'}],
+    },
+    {
+        "id": 'ftpconfig', "name": 'Atom remote-ssh ftpconfig Exposure',
+        "severity": 'high', "path": '/.ftpconfig',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Atom remote-ssh ftpconfig Exposure (ported from nuclei template http/exposures/files/ftpconfig.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['"protocol":', '"host":', '"user":', '"passphrase":'], 'condition': 'or'}],
+    },
+    {
+        "id": 'htpasswd-detection', "name": 'Apache htpasswd Config - Detect',
+        "severity": 'high', "path": '/.htpasswd',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Apache htpasswd Config - Detect (ported from nuclei template http/exposures/configs/htpasswd-detection.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': [':{SHA}', ':$apr1$', ':$2y$'], 'condition': 'or'}],
+    },
+    {
+        "id": 'mysql-config-exposure', "name": 'MySQL Conifg - Exposure',
+        "severity": 'high', "path": '/.my.cnf',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'MySQL Conifg - Exposure (ported from nuclei template http/exposures/configs/mysql-config-exposure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['[client]'], 'condition': 'or'}],
+    },
+    {
+        "id": 'atom-sync-remote', "name": 'Atom Synchronization Exposure',
+        "severity": 'high', "path": '/.remote-sync.json',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Atom Synchronization Exposure (ported from nuclei template http/exposures/files/atom-sync-remote.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['"hostname":', '"username":', 'passphrase'], 'condition': 'or'}],
+    },
+    {
+        "id": 's3cfg-config', "name": 'S3CFG Configuration - Detect',
+        "severity": 'high', "path": '/.s3cfg',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'S3CFG Configuration - Detect (ported from nuclei template http/exposures/configs/s3cfg-config.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['access_key', 'bucket_location', 'secret_key'], 'condition': 'or'}],
+    },
+    {
+        "id": 'rack-mini-profiler', "name": 'rack-mini-profiler - Environment Information Disclosure',
+        "severity": 'high', "path": '/?pp=env',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'rack-mini-profiler - Environment Information Disclosure (ported from nuclei template http/misconfiguration/rack-mini-profiler.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Rack Environment'], 'condition': 'or'}],
+    },
+    {
+        "id": 'clickhouse-unauth-api', "name": 'ClickHouse API Database Interface - Improper Authorization',
+        "severity": 'high', "path": '/?query=SHOW%20DATABASES',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'ClickHouse API Database Interface - Improper Authorization (ported from nuclei template http/misconfiguration/clickhouse-unauth-api.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['default', 'system', 'text/tab-separated-values'], 'condition': 'or'}],
+    },
+    {
+        "id": 'manage-engine-ad-search', "name": 'Manage Engine AD Search',
+        "severity": 'high', "path": '/ADSearch.cc?methodToCall=search',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Manage Engine AD Search (ported from nuclei template http/misconfiguration/manage-engine-ad-search.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['ManageEngine', 'Showing Objects Of', 'Export as', 'This search has been disabled'], 'condition': 'or'}],
+    },
+    {
+        "id": 'unauthenticated-lansweeper', "name": 'Unauthenticated Lansweeper Instance',
+        "severity": 'high', "path": '/Default.aspx',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Unauthenticated Lansweeper Instance (ported from nuclei template http/misconfiguration/unauthenticated-lansweeper.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Main page - Lansweeper'], 'condition': 'or'}],
+    },
+    {
+        "id": 'brickcom-camera-unauth-snapshot', "name": 'Brickcom Camera - Unauthenticated Snapshot Access',
+        "severity": 'high', "path": '/ONVIF/media.cgi?action=getSnapshot',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Brickcom Camera - Unauthenticated Snapshot Access (ported from nuclei template http/misconfiguration/brickcom-camera-unauth-snapshot.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['image/jpeg'], 'condition': 'or'}],
+    },
+    {
+        "id": 'simatic-dashboard-exposed', "name": 'Siemens SIMATIC 300 Dashboard - Exposed',
+        "severity": 'high', "path": '/Portal0000.htm',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Siemens SIMATIC 300 Dashboard - Exposed (ported from nuclei template http/misconfiguration/simatic-dashboard-exposed.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['alt="Simatic S7 CP"'], 'condition': 'or'}],
+    },
+    {
+        "id": 'rexify-config-exposure', "name": 'Rexify Configuration - Exposure',
+        "severity": 'high', "path": '/Rexfile',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Rexify Configuration - Exposure (ported from nuclei template http/exposures/configs/rexify-config-exposure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['use Rex', 'task', 'group', 'desc'], 'condition': 'or'}],
+    },
+    {
+        "id": 'unauthorized-hp-printer', "name": 'Unauthorized HP Printer',
+        "severity": 'high', "path": '/SSI/Auth/ip_snmp.htm',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Unauthorized HP Printer (ported from nuclei template http/misconfiguration/hp/unauthorized-hp-printer.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['<h1>SNMP</h1>'], 'condition': 'or'}],
+    },
+    {
+        "id": 'connectwise-setup', "name": 'ConnectWise Setup Wizard - Exposure',
+        "severity": 'high', "path": '/SetupWizard.aspx',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'ConnectWise Setup Wizard - Exposure (ported from nuclei template http/misconfiguration/installer/connectwise-setup.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['SetupWizardPage', 'ContentPanel SetupWizard'], 'condition': 'or'}],
+    },
+    {
+        "id": 'jackett-unauth', "name": 'Jackett UI - Unauthenticated',
+        "severity": 'high', "path": '/UI/Dashboard',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Jackett UI - Unauthenticated (ported from nuclei template http/misconfiguration/jackett-unauth.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Jackett', 'API Key:'], 'condition': 'or'}],
+    },
+    {
+        "id": 'onlyoffice-installer', "name": 'OnlyOffice Wizard Page - Exposure',
+        "severity": 'high', "path": '/Wizard.aspx',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'OnlyOffice Wizard Page - Exposure (ported from nuclei template http/misconfiguration/installer/onlyoffice-installer.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Portal Setup', 'onlyoffice'], 'condition': 'or'}],
+    },
+    {
+        "id": 'clockwork-dashboard-exposure', "name": 'Clockwork Dashboard Exposure',
+        "severity": 'high', "path": '/__clockwork/latest',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Clockwork Dashboard Exposure (ported from nuclei template http/misconfiguration/clockwork-dashboard-exposure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['"id":', '"version":', '"method":', '"url":', '"time":'], 'condition': 'or'}],
+    },
+    {
+        "id": 'symfony-profiler', "name": 'Symfony Profiler - Detect',
+        "severity": 'high', "path": '/_profiler/empty/search/results?limit=10',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Symfony Profiler - Detect (ported from nuclei template http/exposures/configs/symfony-profiler.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Symfony Profiler', '<title>Profiler</title>', 'Symfony-Debug-Toolbar'], 'condition': 'or'}],
+    },
+    {
+        "id": 'service-pwd', "name": 'service.pwd - Sensitive Information Disclosure',
+        "severity": 'high', "path": '/_vti_pvt/service.pwd',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'service.pwd - Sensitive Information Disclosure (ported from nuclei template http/misconfiguration/service-pwd.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['# -FrontPage-'], 'condition': 'or'}],
+    },
+    {
+        "id": 'secnet-info-leak', "name": 'Secnet Intelligent Routing System actpt_5g.data - Information Leak',
+        "severity": 'high', "path": '/actpt_5g.data',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Secnet Intelligent Routing System actpt_5g.data - Information Leak (ported from nuclei template http/misconfiguration/secnet-info-leak.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['"http_username":', '"http_passwd":'], 'condition': 'or'}],
+    },
+    {
+        "id": 'administrate-dashboard', "name": 'Administrate Dashboard Exposure',
+        "severity": 'high', "path": '/admin',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Administrate Dashboard Exposure (ported from nuclei template http/misconfiguration/administrate-dashboard.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Search Customers', 'Administrate', 'New customer</a>'], 'condition': 'or'}],
+    },
+    {
+        "id": 'unauthenticated-airflow-instance', "name": 'Unauthenticated Airflow Instance',
+        "severity": 'high', "path": '/admin/',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Unauthenticated Airflow Instance (ported from nuclei template http/misconfiguration/airflow/unauthenticated-airflow.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['<title>Airflow - DAGs</title>'], 'condition': 'or'}],
+    },
+    {
+        "id": 'poste-io-installer', "name": 'Poste.io - Installer',
+        "severity": 'high', "path": '/admin/install/server',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Poste.io - Installer (ported from nuclei template http/misconfiguration/installer/poste-io-installer.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Initial server configuration', 'poste'], 'condition': 'or'}],
+    },
+    {
+        "id": 'filestash-admin-config', "name": 'Filestash Admin Password Configuration',
+        "severity": 'high', "path": '/admin/setup',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Filestash Admin Password Configuration (ported from nuclei template http/exposures/configs/filestash-admin-config.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['<title>Admin Console</title>', 'component-loader'], 'condition': 'or'}],
+    },
+    {
+        "id": 'fusionauth-admin-setup', "name": 'FusionAuth Exposed Admin Setup',
+        "severity": 'high', "path": '/admin/setup-wizard',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'FusionAuth Exposed Admin Setup (ported from nuclei template http/misconfiguration/fusionauth-admin-setup.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['<title>FusionAuth Setup Wizard', 'FusionAuth is now installed and running'], 'condition': 'or'}],
+    },
+    {
+        "id": 'ruckus-unleashed-install', "name": 'Ruckus Unleashed Exposed Installation',
+        "severity": 'high', "path": '/admin/wizard.jsp',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Ruckus Unleashed Exposed Installation (ported from nuclei template http/misconfiguration/installer/ruckus-unleashed-install.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['<title>Setup Wizard', '/ruckus'], 'condition': 'or'}],
+    },
+    {
+        "id": 'symfony-debug', "name": 'Symfony Debug Mode',
+        "severity": 'high', "path": '/admin_dev.php',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Symfony Debug Mode (ported from nuclei template http/misconfiguration/symfony/symfony-debug.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['x-debug-token-link:', '/_profiler/', 'debug mode</a> is enabled.', 'id="sfWebDebugSymfony"'], 'condition': 'or'}],
+    },
+    {
+        "id": 'ruckus-smartzone-install', "name": 'Ruckus SmartZone Exposed Installation',
+        "severity": 'high', "path": '/adminweb/',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Ruckus SmartZone Exposed Installation (ported from nuclei template http/misconfiguration/installer/ruckus-smartzone-install.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Welcome to the Ruckus', 'Setup Wizard'], 'condition': 'or'}],
+    },
+    {
+        "id": 'mlflow-unauth', "name": 'Mlflow - Unauthenticated Access',
+        "severity": 'high', "path": '/ajax-api/2.0/preview/mlflow/experiments/get?experiment_id=0',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Mlflow - Unauthenticated Access (ported from nuclei template http/misconfiguration/mlflow-unauth.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['experiment_id', 'artifact_location'], 'condition': 'or'}],
+    },
+    {
+        "id": 'phalcon-framework-source', "name": 'Phalcon Framework - Source Code Leakage',
+        "severity": 'high', "path": '/anything_here',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Phalcon Framework - Source Code Leakage (ported from nuclei template http/exposures/configs/phalcon-framework-source.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Phalcon Framework', 'AnythingHereController'], 'condition': 'or'}],
+    },
+    {
+        "id": 'apache-zeppelin-unauth', "name": 'Apache Zeppelin - Unauthenticated Access',
+        "severity": 'high', "path": '/api/security/ticket',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Apache Zeppelin - Unauthenticated Access (ported from nuclei template http/misconfiguration/apache/apache-zeppelin-unauth.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['status":"OK', '"ticket":"anonymous"'], 'condition': 'or'}],
+    },
+    {
+        "id": 'saltbo-zpan-installer', "name": 'Saltbo/zpan Installer - Exposure',
+        "severity": 'high', "path": '/api/system/options/core.email',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Saltbo/zpan Installer - Exposure (ported from nuclei template http/misconfiguration/installer/saltbo-zpan-installer.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['<title>ZPan', 'system is not initialized'], 'condition': 'or'}],
+    },
+    {
+        "id": 'photoprism-unauth-exposure', "name": 'PhotoPrism - Unauthenticated Exposure',
+        "severity": 'high', "path": '/api/v1/config',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'PhotoPrism - Unauthenticated Exposure (ported from nuclei template http/misconfiguration/photoprism-unauth-exposure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['PhotoPrism'], 'condition': 'or'}],
+    },
+    {
+        "id": 'magento-config-disclosure', "name": 'Magento Configuration Panel - Detect',
+        "severity": 'high', "path": '/app/etc/local.xml',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Magento Configuration Panel - Detect (ported from nuclei template http/exposures/configs/magento-config-disclosure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['* Magento', '<dbname>'], 'condition': 'or'}],
+    },
+    {
+        "id": 'wazuh-default-login', "name": 'Wazuh - Default Login',
+        "severity": 'high', "path": '/app/login',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Wazuh - Default Login (ported from nuclei template http/default-logins/wazuh-default-login.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['"username":', '"roles":'], 'condition': 'or'}],
+    },
+    {
+        "id": 'hikvision-env', "name": 'Hikvision Springboot Env Actuator - Detect',
+        "severity": 'high', "path": '/artemis/env',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Hikvision Springboot Env Actuator - Detect (ported from nuclei template http/misconfiguration/hikvision-env.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['applicationConfig', 'activeProfiles', 'server.port', 'local.server.port', 'application/vnd.spring-boot.actuator', 'application/vnd.spring-boot.actuator.v1+json', 'application/vnd.spring-boot.actuator.v2+json', 'application/vnd.spring-boot.actuator.v3+json'], 'condition': 'or'}],
+    },
+    {
+        "id": 'artifactory-anonymous-deploy', "name": 'Artifactory anonymous deploy',
+        "severity": 'high', "path": '/artifactory/ui/repodata?deploy=true',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Artifactory anonymous deploy (ported from nuclei template http/misconfiguration/artifactory-anonymous-deploy.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['"repoKey"'], 'condition': 'or'}],
+    },
+    {
+        "id": 'laravel-terminal-exposure', "name": 'Laravel Terminal - Exposed',
+        "severity": 'high', "path": '/asf/terminal',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Laravel Terminal - Exposed (ported from nuclei template http/misconfiguration/laravel-terminal-exposure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Laravel Terminal', 'terminal.endpoint'], 'condition': 'or'}],
+    },
+    {
+        "id": 'auth-json', "name": 'Auth.json File - Disclosure',
+        "severity": 'high', "path": '/auth.json',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Auth.json File - Disclosure (ported from nuclei template http/exposures/files/auth-json.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['"http-basic": {', '"username":', '"password":', '"github-oauth": {', '"github.com":', '"bitbucket-oauth":', '"consumer-key":', '"consumer-secret":'], 'condition': 'or'}],
+    },
+    {
+        "id": 'call-com-installer', "name": 'Call.com Setup Page - Exposure',
+        "severity": 'high', "path": '/auth/setup',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Call.com Setup Page - Exposure (ported from nuclei template http/misconfiguration/installer/call-com-installer.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Setup | Cal.com', 'Minimum 15 characters long</li>'], 'condition': 'or'}],
+    },
+    {
+        "id": 'socks5-vpn-config', "name": 'Socks5 VPN - Sensitive File Disclosure',
+        "severity": 'high', "path": '/backup/config.xml',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Socks5 VPN - Sensitive File Disclosure (ported from nuclei template http/exposures/files/socks5-vpn-config.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['<config>', 'password=', 'username='], 'condition': 'or'}],
+    },
+    {
+        "id": 'avaya-phone-default-login', "name": 'Avaya Phone Web Interface - Default Login',
+        "severity": 'high', "path": '/cgi-bin/J100WebServer.cgi?Operation=0',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Avaya Phone Web Interface - Default Login (ported from nuclei template http/default-logins/avaya-phone-default-login.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['/cgi-bin/J100WebServer.cgi?Operation=211', 'id=\\', 'Invalid username or password'], 'condition': 'or'}],
+    },
+    {
+        "id": 'unauth-ckfinder', "name": 'CKFinder - Unauthenticated Exposure',
+        "severity": 'high', "path": '/ckfinder/ckfinder.html',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'CKFinder - Unauthenticated Exposure (ported from nuclei template http/misconfiguration/unauth-ckfinder.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['<title>CKFinder</title>', 'CKFinderFrameWindow', 'var ckfinder = new CKFinder', 'CKFinder.start()'], 'condition': 'or'}],
+    },
+    {
+        "id": 'deos-openview-panel', "name": 'DEOS OPENview Admin Panel Unauthenticated Access',
+        "severity": 'high', "path": '/client/index.html',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'DEOS OPENview Admin Panel Unauthenticated Access (ported from nuclei template http/misconfiguration/deos-openview-admin.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['<title>OPENview</title>'], 'condition': 'or'}],
+    },
+    {
+        "id": 'collibra-properties', "name": 'Collibra Properties Exposure',
+        "severity": 'high', "path": '/collibra.properties',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Collibra Properties Exposure (ported from nuclei template http/exposures/configs/collibra-properties.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['collibra.url', 'collibra.port', 'collibra.user', 'collibra.password', 'bytes'], 'condition': 'or'}],
+    },
+    {
+        "id": 'prometheus-unauth', "name": 'Prometheus Monitoring System - Unauthenticated',
+        "severity": 'high', "path": '/config',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Prometheus Monitoring System - Unauthenticated (ported from nuclei template http/misconfiguration/prometheus/prometheus-unauth.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['global:', 'scrape_configs:', 'scrape_interval'], 'condition': 'or'}],
+    },
+    {
+        "id": 'unauthenticated-zipkin', "name": 'Zipkin Discovery',
+        "severity": 'high', "path": '/config.json',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Zipkin Discovery (ported from nuclei template http/misconfiguration/unauthenticated-zipkin.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['environment', 'defaultLookback'], 'condition': 'or'}],
+    },
+    {
+        "id": 'config-properties', "name": 'Config Properties Exposure',
+        "severity": 'high', "path": '/config.properties',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Config Properties Exposure (ported from nuclei template http/exposures/configs/config-properties.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['bytes'], 'condition': 'or'}],
+    },
+    {
+        "id": 'rails-database-config', "name": 'Ruby on Rails Database Configuration File - Detect',
+        "severity": 'high', "path": '/config/database.yml',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Ruby on Rails Database Configuration File - Detect (ported from nuclei template http/exposures/configs/rails-database-config.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['adapter:', 'database:', 'production:'], 'condition': 'or'}],
+    },
+    {
+        "id": 'symfony-database-config', "name": 'Symfony Database Configuration File - Detect',
+        "severity": 'high', "path": '/config/databases.yml',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Symfony Database Configuration File - Detect (ported from nuclei template http/exposures/configs/symfony-database-config.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['class:', 'param:'], 'condition': 'or'}],
+    },
+    {
+        "id": 'sphinxsearch-config', "name": 'Sphinx Search Config - Exposure',
+        "severity": 'high', "path": '/config/development.sphinx.conf',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Sphinx Search Config - Exposure (ported from nuclei template http/exposures/configs/sphinxsearch-config.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['sql_user', 'sql_pass', 'indexer'], 'condition': 'or'}],
+    },
+    {
+        "id": 'pcoweb-unauth', "name": 'pCOWeb - Unauth',
+        "severity": 'high', "path": '/config/pw_left_bar.html',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'pCOWeb - Unauth (ported from nuclei template http/misconfiguration/pcoweb-unauth.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['System is using', 'pCOWeb', 'Configuration'], 'condition': 'or'}],
+    },
+    {
+        "id": 'redmine-config', "name": 'Redmine Configuration File - Detect',
+        "severity": 'high', "path": '/configuration.yml',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Redmine Configuration File - Detect (ported from nuclei template http/exposures/files/redmine-config.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['user_name', 'Redmine'], 'condition': 'or'}],
+    },
+    {
+        "id": 'jackett-installer', "name": 'Jackett - Installer',
+        "severity": 'high', "path": '/configure',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Jackett - Installer (ported from nuclei template http/misconfiguration/installer/jackett-installer.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Jackett', 'Install</a>'], 'condition': 'or'}],
+    },
+    {
+        "id": 'aem-explorer-nodetypes', "name": 'Adobe AEM Explorer NodeTypes Exposure',
+        "severity": 'high', "path": '/crx/explorer/nodetypes/index.jsp',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Adobe AEM Explorer NodeTypes Exposure (ported from nuclei template http/misconfiguration/aem/aem-explorer-nodetypes.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['nodetypeadmin', 'Registered Node Types'], 'condition': 'or'}],
+    },
+    {
+        "id": 'darkstat-detect', "name": 'Detect Darkstat Reports',
+        "severity": 'high', "path": '/darkstat/',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Detect Darkstat Reports (ported from nuclei template http/exposures/logs/darkstat-detect.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['darkstat', '<title>Graphs', 'Measuring for', 'hosts</a>'], 'condition': 'or'}],
+    },
+    {
+        "id": 'robomongo-credential', "name": 'RoboMongo Credential - Exposure',
+        "severity": 'high', "path": '/db/robomongo.json',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'RoboMongo Credential - Exposure (ported from nuclei template http/exposures/configs/robomongo-credential.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['databaseName', 'userPassword', 'serverHost'], 'condition': 'or'}],
+    },
+    {
+        "id": 'openbmcs-secret-disclosure', "name": 'OpenBMCS 2.4 - Information Disclosure',
+        "severity": 'high', "path": '/debug/',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'OpenBMCS 2.4 - Information Disclosure (ported from nuclei template http/misconfiguration/openbmcs/openbmcs-secret-disclosure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['change_password_sqls', 'Index of /debug'], 'condition': 'or'}],
+    },
+    {
+        "id": 'sftp-deployment-config', "name": 'Atom SFTP Configuration File - Detect',
+        "severity": 'high', "path": '/deployment-config.json',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Atom SFTP Configuration File - Detect (ported from nuclei template http/exposures/configs/sftp-deployment-config.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['"host":', '"username":', '"password":', '"remotePath":'], 'condition': 'or'}],
+    },
+    {
+        "id": 'druid-monitor', "name": 'Alibaba Druid Monitor Unauthorized Access',
+        "severity": 'high', "path": '/druid/index.html',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Alibaba Druid Monitor Unauthorized Access (ported from nuclei template http/misconfiguration/druid-monitor.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Druid Stat Index</title>'], 'condition': 'or'}],
+    },
+    {
+        "id": 'spip-install', "name": 'SPIP Install - Exposure',
+        "severity": 'high', "path": '/ecrire/?exec=install',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'SPIP Install - Exposure (ported from nuclei template http/misconfiguration/installer/spip-install.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Installing publication system...', 'SPIP'], 'condition': 'or'}],
+    },
+    {
+        "id": 'elmah-log-file', "name": 'ELMAH Exposure',
+        "severity": 'high', "path": '/elmah',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'ELMAH Exposure (ported from nuclei template http/exposures/logs/elmah-log-file.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Error Log for'], 'condition': 'or'}],
+    },
+    {
+        "id": 'ftp-credentials-exposure', "name": 'FTP Credentials Exposure',
+        "severity": 'high', "path": '/ftpsync.settings',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'FTP Credentials Exposure (ported from nuclei template http/exposures/configs/ftp-credentials-exposure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['FTPSync', 'overwrite_newer_prevention', 'default_folder_permissions'], 'condition': 'or'}],
+    },
+    {
+        "id": 'gocd-cruise-configuration', "name": 'GoCd Cruise Configuration disclosure',
+        "severity": 'high', "path": '/go/add-on/business-continuity/api/cruise_config',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'GoCd Cruise Configuration disclosure (ported from nuclei template http/misconfiguration/gocd/gocd-cruise-configuration.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['server agentAutoRegisterKey', 'webhookSecret', 'tokenGenerationKey'], 'condition': 'or'}],
+    },
+    {
+        "id": 'unauth-axyom-network-manager', "name": 'Unauthenticated Axyom Network Manager',
+        "severity": 'high', "path": '/home',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Unauthenticated Axyom Network Manager (ported from nuclei template http/misconfiguration/unauth-axyom-network-manager.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Axyom Network Manager'], 'condition': 'or'}],
+    },
+    {
+        "id": 'freshrss-unauth', "name": 'Freshrss Admin Dashboard - Exposed',
+        "severity": 'high', "path": '/i/?a=logs',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Freshrss Admin Dashboard - Exposed (ported from nuclei template http/misconfiguration/freshrss-unauth.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['a=logout', 'FreshRSS', 'c=user&amp;a=profile'], 'condition': 'or'}],
+    },
+    {
+        "id": 'freshrss-installer', "name": 'FreshRSS - Installation',
+        "severity": 'high', "path": '/i/?rid',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'FreshRSS - Installation (ported from nuclei template http/misconfiguration/installer/freshrss-installer.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Installation · FreshRSS'], 'condition': 'or'}],
+    },
+    {
+        "id": 'icinga-installer', "name": 'Icinga Web 2 Installer Exposure',
+        "severity": 'high', "path": '/icingaweb2/setup',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Icinga Web 2 Installer Exposure (ported from nuclei template http/misconfiguration/installer/icinga-installer.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Welcome to the configuration of Icinga Web 2', 'Setup Token'], 'condition': 'or'}],
+    },
+    {
+        "id": 'concrete-installer', "name": 'Concrete Installer',
+        "severity": 'high', "path": '/index.php/install',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Concrete Installer (ported from nuclei template http/misconfiguration/installer/concrete-installer.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['install concrete', 'choose language'], 'condition': 'or'}],
+    },
+    {
+        "id": 'magento-installer', "name": 'Magento Installation Wizard',
+        "severity": 'high', "path": '/index.php/install/',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Magento Installation Wizard (ported from nuclei template http/misconfiguration/installer/magento-installer.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Magento Installation Wizard', "Welcome to Magento's Installation Wizard!"], 'condition': 'or'}],
+    },
+    {
+        "id": 'testrail-install', "name": 'TestRail Installation Wizard',
+        "severity": 'high', "path": '/index.php?/installer',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'TestRail Installation Wizard (ported from nuclei template http/misconfiguration/installer/testrail-install.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['TestRail Installation Wizard'], 'condition': 'or'}],
+    },
+    {
+        "id": 'phpipam-installer', "name": 'PHP IPAM Installation Page - Exposed',
+        "severity": 'high', "path": '/index.php?page=install',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'PHP IPAM Installation Page - Exposed (ported from nuclei template http/misconfiguration/installer/phpipam-installer.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['<title>phpipam installation</title>'], 'condition': 'or'}],
+    },
+    {
+        "id": 'freescout-installer', "name": 'FreeScout Installer Exposure',
+        "severity": 'high', "path": '/install',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'FreeScout Installer Exposure (ported from nuclei template http/misconfiguration/installer/freescout-installer.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['FreeScout Installer', 'Easy Installation and Setup Wizard'], 'condition': 'or'}],
+    },
+    {
+        "id": 'adguard-installer', "name": 'AdGuard - Installation',
+        "severity": 'high', "path": '/install.html',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'AdGuard - Installation (ported from nuclei template http/misconfiguration/installer/adguard-installer.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Setup AdGuard Home'], 'condition': 'or'}],
+    },
+    {
+        "id": 'emlog-installer', "name": 'Emlog Pro - Installation',
+        "severity": 'high', "path": '/install.php',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Emlog Pro - Installation (ported from nuclei template http/misconfiguration/installer/emlog-installer.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['>MySQL', 'install.php?action=install', 'emlog'], 'condition': 'or'}],
+    },
+    {
+        "id": 'drupal-install', "name": 'Drupal Install',
+        "severity": 'high', "path": '/install.php?profile=default',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Drupal Install (ported from nuclei template http/misconfiguration/installer/drupal-install.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['<title>Choose language | Drupal</title>'], 'condition': 'or'}],
+    },
+    {
+        "id": 'tasmota-install', "name": 'Tasmota Installer Exposure',
+        "severity": 'high', "path": '/install/',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Tasmota Installer Exposure (ported from nuclei template http/misconfiguration/installer/tasmota-install.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Install Tasmota', 'Tasmota Installer'], 'condition': 'or'}],
+    },
+    {
+        "id": 'phpbb-installer', "name": 'phpBB Installation File Exposure',
+        "severity": 'high', "path": '/install/app.php',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'phpBB Installation File Exposure (ported from nuclei template http/misconfiguration/installer/phpbb-installer.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Installation Panel', 'Introduction'], 'condition': 'or'}],
+    },
+    {
+        "id": 'librenms-installer', "name": 'LibreNMS Installation Page - Exposure',
+        "severity": 'high', "path": '/install/checks',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'LibreNMS Installation Page - Exposure (ported from nuclei template http/misconfiguration/installer/librenms-installer.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['LibreNMS Install'], 'condition': 'or'}],
+    },
+    {
+        "id": 'strongshop-installer', "name": 'StrongShop Installer - Exposure',
+        "severity": 'high', "path": '/install/index.html',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'StrongShop Installer - Exposure (ported from nuclei template http/misconfiguration/installer/strongshop-installer.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['StrongShop', 'id="install'], 'condition': 'or'}],
+    },
+    {
+        "id": 'eyoucms-installer', "name": 'EyouCMS - Installation',
+        "severity": 'high', "path": '/install/index.php',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'EyouCMS - Installation (ported from nuclei template http/misconfiguration/installer/eyoucms-installer.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['EyouCms', '/install/index.php?step=2', '使用协议</p>'], 'condition': 'or'}],
+    },
+    {
+        "id": 'easy-wi-installer', "name": 'Easy-WI Installation Page - Exposure',
+        "severity": 'high', "path": '/install/install.php',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Easy-WI Installation Page - Exposure (ported from nuclei template http/misconfiguration/installer/easy-wi-installer.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Welcome to the Easy-WI installer!'], 'condition': 'or'}],
+    },
+    {
+        "id": 'growi-installer', "name": 'GROWI Installer - Exposure',
+        "severity": 'high', "path": '/installer',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'GROWI Installer - Exposure (ported from nuclei template http/misconfiguration/installer/growi-installer.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['<title>Installer - GROWI</title>'], 'condition': 'or'}],
+    },
+    {
+        "id": 'orangehrm-installer', "name": 'OrangeHrm Installer',
+        "severity": 'high', "path": '/installer/installerUI.php',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'OrangeHrm Installer (ported from nuclei template http/misconfiguration/installer/orangehrm-installer.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['OrangeHRM Web Installation Wizard', 'admin user creation'], 'condition': 'or'}],
+    },
+    {
+        "id": 'webmethod-integration-default-login', "name": 'WebMethod Integration Server Default Login',
+        "severity": 'high', "path": '/invoke/pub.file/getFile',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'WebMethod Integration Server Default Login (ported from nuclei template http/default-logins/webmethod/webmethod-integration-default-login.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['com.wm.app.b2b.server', 'No filename supplied', 'com.wm.app.b2b.server.AccessException', 'Invalid credentials'], 'condition': 'or'}],
+    },
+    {
+        "id": 'elasticsearch-default-login', "name": 'ElasticSearch - Default Login',
+        "severity": 'high', "path": '/login',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'ElasticSearch - Default Login (ported from nuclei template http/default-logins/elasticsearch/elasticsearch-default-login.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Set-Cookie: sid=', 'kbn-license-sig:'], 'condition': 'or'}],
+    },
+    {
+        "id": 'servicenow-title-injection', "name": 'Service Now - Title Injection',
+        "severity": 'high', "path": '/login.do?jvar_page_title=<style><foo>Injected Title</foo></style>',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Service Now - Title Injection (ported from nuclei template http/misconfiguration/servicenow-title-injection.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['<title><style><foo>Injected Title</foo></style></title>'], 'condition': 'or'}],
+    },
+    {
+        "id": 'dell-idrac-default-login', "name": 'Dell iDRAC6/7/8 Default Login',
+        "severity": 'high', "path": '/login.html',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Dell iDRAC6/7/8 Default Login (ported from nuclei template http/default-logins/dell/dell-idrac-default-login.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['<authResult>0</authResult>'], 'condition': 'or'}],
+    },
+    {
+        "id": 'django-secret-key', "name": 'Django Secret Key Exposure',
+        "severity": 'high', "path": '/manage.py',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Django Secret Key Exposure (ported from nuclei template http/exposures/files/django-secret-key.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['SECRET_KEY ='], 'condition': 'or'}],
+    },
+    {
+        "id": 'unifi-wizard-install', "name": 'UniFi Wizard Installer',
+        "severity": 'high', "path": '/manage/wizard/',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'UniFi Wizard Installer (ported from nuclei template http/misconfiguration/installer/unifi-wizard-install.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['UniFi Wizard', 'app-unifi-wizard'], 'condition': 'or'}],
+    },
+    {
+        "id": 'nagios-logserver-installer', "name": 'Nagios Log Server - Install',
+        "severity": 'high', "path": '/nagioslogserver/install',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Nagios Log Server - Install (ported from nuclei template http/misconfiguration/installer/nagios-logserver-installer.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Nagios Log Server', 'Install</a>'], 'condition': 'or'}],
+    },
+    {
+        "id": 'apache-nifi-unauth', "name": 'Apache NiFi - Unauthenticated Access',
+        "severity": 'high', "path": '/nifi-api/access/config',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Apache NiFi - Unauthenticated Access (ported from nuclei template http/misconfiguration/apache/apache-nifi-unauth.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['"supportsLogin":false}'], 'condition': 'or'}],
+    },
+    {
+        "id": 'private-key-exposure', "name": 'Private key exposure via helper detector',
+        "severity": 'high', "path": '/node_modules/mqtt/test/helpers/',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Private key exposure via helper detector (ported from nuclei template http/misconfiguration/private-key-exposure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Index of /node_modules/mqtt/test/helpers', 'Parent Directory'], 'condition': 'or'}],
+    },
+    {
+        "id": 'laravel-nova-unauth', "name": 'Laravel Nova - Unauthenticated Admin Panel Access',
+        "severity": 'high', "path": '/nova/dashboards/main',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Laravel Nova - Unauthenticated Admin Panel Access (ported from nuclei template http/misconfiguration/laravel-nova-unauth.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Nova.booting', 'nova-resources', 'nova-login', '/nova/login'], 'condition': 'or'}],
+    },
+    {
+        "id": 'parameters-config', "name": 'Parameters.yml - File Discovery',
+        "severity": 'high', "path": '/parameters.yml',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Parameters.yml - File Discovery (ported from nuclei template http/exposures/configs/parameters-config.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['parameters:', 'database_user', 'database_password'], 'condition': 'or'}],
+    },
+    {
+        "id": 'pmm-installer', "name": 'PMM Installation Wizard',
+        "severity": 'high', "path": '/password-page/ovf/account-credentials-ovf',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'PMM Installation Wizard (ported from nuclei template http/misconfiguration/installer/pmm-installer.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['PMM Installation Wizard'], 'condition': 'or'}],
+    },
+    {
+        "id": 'shopware-installer', "name": 'Shopware Installer',
+        "severity": 'high', "path": '/public/recovery/install/index.php',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Shopware Installer (ported from nuclei template http/misconfiguration/installer/shopware-installer.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Setup | Shopware', 'install'], 'condition': 'or'}],
+    },
+    {
+        "id": 'servicestack-requestlogs', "name": 'ServiceStack Request Logs - Unauthenticated Access',
+        "severity": 'high', "path": '/requestlogs',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'ServiceStack Request Logs - Unauthenticated Access (ported from nuclei template http/exposures/logs/servicestack-requestlogs.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['"Results":[', '"Usage":{'], 'condition': 'or'}],
+    },
+    {
+        "id": 'sabnzbd-installer', "name": 'SABnzbd Quick-Start Wizard - Exposure',
+        "severity": 'high', "path": '/sabnzbd/wizard/',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'SABnzbd Quick-Start Wizard - Exposure (ported from nuclei template http/misconfiguration/installer/sabnzbd-installer.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['SABnzbd Quick-Start Wizard'], 'condition': 'or'}],
+    },
+    {
+        "id": 'searchreplacedb2-exposure', "name": 'Safe Search Replace Exposure',
+        "severity": 'high', "path": '/searchreplacedb2.php',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Safe Search Replace Exposure (ported from nuclei template http/misconfiguration/searchreplacedb2-exposure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Database details', 'Safe Search Replace'], 'condition': 'or'}],
+    },
+    {
+        "id": 'unauthenticated-prtg', "name": 'PRTG Traffic Grapher - Unauthenticated Access',
+        "severity": 'high', "path": '/sensorlist.htm',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'PRTG Traffic Grapher - Unauthenticated Access (ported from nuclei template http/misconfiguration/unauthenticated-prtg.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['PRTG Traffic Grapher'], 'condition': 'or'}],
+    },
+    {
+        "id": 'openemr-setup-installer', "name": 'OpenEMR Setup Installation Page - Exposure',
+        "severity": 'high', "path": '/setup.php',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'OpenEMR Setup Installation Page - Exposure (ported from nuclei template http/misconfiguration/installer/openemr-setup-installer.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['<title>OpenEMR Setup Tool</title>'], 'condition': 'or'}],
+    },
+    {
+        "id": 'modx-installer', "name": 'ModX CMS - Unfinished Installation',
+        "severity": 'high', "path": '/setup/',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'ModX CMS - Unfinished Installation (ported from nuclei template http/misconfiguration/installer/modx-installer.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['ModX Revolution', 'installer-steps'], 'condition': 'or'}],
+    },
+    {
+        "id": 'openfire-setup', "name": 'Openfire Setup - Exposure',
+        "severity": 'high', "path": '/setup/index.jsp',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Openfire Setup - Exposure (ported from nuclei template http/misconfiguration/installer/openfire-setup.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Welcome to Openfire Setup'], 'condition': 'or'}],
+    },
+    {
+        "id": 'phpmyfaq-installer', "name": 'phpMyFAQ Installation - Exposure',
+        "severity": 'high', "path": '/setup/index.php',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'phpMyFAQ Installation - Exposure (ported from nuclei template http/misconfiguration/installer/phpmyfaq-installer.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['<title>phpMyFAQ', 'Setup</title>', 'phpmyfaq-setup'], 'condition': 'or'}],
+    },
+    {
+        "id": 'profittrailer-installer', "name": 'ProfitTrailer Setup Page - Exposure',
+        "severity": 'high', "path": '/setup/license',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'ProfitTrailer Setup Page - Exposure (ported from nuclei template http/misconfiguration/installer/profittrailer-installer.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['ProfitTrailer Setup'], 'condition': 'or'}],
+    },
+    {
+        "id": 'azuracast-installer', "name": 'AzuraCast - Unfinished Installation',
+        "severity": 'high', "path": '/setup/register',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'AzuraCast - Unfinished Installation (ported from nuclei template http/misconfiguration/installer/azuracast-installer.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Set Up AzuraCast', 'SetupRegister'], 'condition': 'or'}],
+    },
+    {
+        "id": 'confluence-installer', "name": 'Confluence Installation Page - Exposure',
+        "severity": 'high', "path": '/setup/setupcluster-start.action',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Confluence Installation Page - Exposure (ported from nuclei template http/misconfiguration/installer/confluence-installer.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Choose your deployment type - Confluence'], 'condition': 'or'}],
+    },
+    {
+        "id": 'sftp-credentials-exposure', "name": 'SFTP Configuration File - Credentials Exposure',
+        "severity": 'high', "path": '/sftp-config.json',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'SFTP Configuration File - Credentials Exposure (ported from nuclei template http/exposures/configs/sftp-credentials-exposure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['"host":', '"user":', '"password":', '"remote_path":', 'file_permissions', 'extra_list_connections'], 'condition': 'or'}],
+    },
+    {
+        "id": 'laravel-sessions-exposure', "name": 'Laravel Sessions Folder Exposure',
+        "severity": 'high', "path": '/storage/framework/sessions/',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Laravel Sessions Folder Exposure (ported from nuclei template http/misconfiguration/laravel-sessions-exposure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Index of', 'Parent Directory', '<title>Index of', 'Directory listing for'], 'condition': 'or'}],
+    },
+    {
+        "id": 'laravel-log-file', "name": 'Laravel log file publicly accessible',
+        "severity": 'high', "path": '/storage/logs/laravel.log',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Laravel log file publicly accessible (ported from nuclei template http/exposures/logs/laravel-log-file.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['InvalidArgumentException', 'local.ERROR', 'ErrorException', 'syntax error', 'text/x-log'], 'condition': 'or'}],
+    },
+    {
+        "id": 'aem-felix-console', "name": 'Adobe Experience Manager Felix Console - Default Login',
+        "severity": 'high', "path": '/system/console/bundles',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Adobe Experience Manager Felix Console - Default Login (ported from nuclei template http/default-logins/aem/aem-felix-console.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['<title>Adobe Experience Manager Web Console - Bundles</title>'], 'condition': 'or'}],
+    },
+    {
+        "id": 'osticket-installer', "name": 'osTicket Installer Panel - Detect',
+        "severity": 'high', "path": '/upload/setup/install.php',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'osTicket Installer Panel - Detect (ported from nuclei template http/misconfiguration/installer/osticket-installer.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['<title>osTicket Installer', 'already installed'], 'condition': 'or'}],
+    },
+    {
+        "id": 'openstack-user-secrets', "name": 'OpenStack User Secrets Exposure',
+        "severity": 'high', "path": '/user_secrets.yml',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'OpenStack User Secrets Exposure (ported from nuclei template http/exposures/files/openstack-user-secrets.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['_password:', 'OpenStack environment'], 'condition': 'or'}],
+    },
+    {
+        "id": 'gitlab-uninitialized-password', "name": 'Uninitialized GitLab instances',
+        "severity": 'high', "path": '/users/sign_in',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Uninitialized GitLab instances (ported from nuclei template http/misconfiguration/gitlab/gitlab-uninitialized-password.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Change your password', 'New password', 'Confirm new password', 'gitlab_session'], 'condition': 'or'}],
+    },
+    {
+        "id": 'http-etcd-unauthenticated-api-data-leak', "name": 'etcd Unauthenticated HTTP API Leak',
+        "severity": 'high', "path": '/v2/auth/roles',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'etcd Unauthenticated HTTP API Leak (ported from nuclei template http/misconfiguration/etcd-unauthenticated-api.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['"roles"', '"permissions"', '"role"', '"kv"'], 'condition': 'or'}],
+    },
+    {
+        "id": 'unauth-etcd-server', "name": 'Etcd Server - Unauthenticated Access',
+        "severity": 'high', "path": '/v2/keys/',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Etcd Server - Unauthenticated Access (ported from nuclei template http/misconfiguration/kubernetes/unauth-etcd-server.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['"node":', '"key":'], 'condition': 'or'}],
+    },
+    {
+        "id": 'ventrilo-config', "name": 'Ventrilo Configuration File - Detect',
+        "severity": 'high', "path": '/ventrilo_srv.ini',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Ventrilo Configuration File - Detect (ported from nuclei template http/exposures/configs/ventrilo-config.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['[Server]', 'Phonetic'], 'condition': 'or'}],
+    },
+    {
+        "id": 'selenium-exposure', "name": 'Selenium - Node Exposure',
+        "severity": 'high', "path": '/wd/hub',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Selenium - Node Exposure (ported from nuclei template http/misconfiguration/selenium-exposure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['WebDriverRequest', '<title>WebDriver Hub</title>'], 'condition': 'or'}],
+    },
+    {
+        "id": 'sftpgo-admin-setup', "name": 'SFTPGo Admin - Setup',
+        "severity": 'high', "path": '/web/admin/setup',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'SFTPGo Admin - Setup (ported from nuclei template http/misconfiguration/sftpgo-admin-setup.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['SFTPGo - Setup', 'SFTPGo you need to create an admin user'], 'condition': 'or'}],
+    },
+    {
+        "id": 'lvmeng-uts-disclosure', "name": 'Lvmeng - UTS Disclosure',
+        "severity": 'high', "path": '/webapi/v1/system/accountmanage/account',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Lvmeng - UTS Disclosure (ported from nuclei template http/exposures/configs/lvmeng-uts-disclosure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['nsfocus_uts', 'MANAGER_IP'], 'condition': 'or'}],
+    },
+    {
+        "id": 'tautulli-install', "name": 'Tautulli - Exposed Installation',
+        "severity": 'high', "path": '/welcome',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Tautulli - Exposed Installation (ported from nuclei template http/misconfiguration/installer/tautulli-install.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['<title>Tautulli - Welcome', 'Tautulli Setup Wizard'], 'condition': 'or'}],
+    },
+    {
+        "id": 'invicti-enterprise-installer', "name": 'Invicti Enterprise Installation Page - Exposure',
+        "severity": 'high', "path": '/wizard/database/',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Invicti Enterprise Installation Page - Exposure (ported from nuclei template http/misconfiguration/installer/invicti-enterprise-installer.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Invicti Enterprise - Installation Wizard'], 'condition': 'or'}],
+    },
+    {
+        "id": 'cube-105-install', "name": 'Cube-105 - Exposed Installation',
+        "severity": 'high', "path": '/wizard/wizard.cs',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Cube-105 - Exposed Installation (ported from nuclei template http/misconfiguration/installer/cube-105-install.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Cube-105 Setup Wizard', 'initial setup'], 'condition': 'or'}],
+    },
+    {
+        "id": 'revive-adserver-installer', "name": 'Revive Adserver - Exposed Installer',
+        "severity": 'high', "path": '/www/admin/install.php?action=welcome',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Revive Adserver - Exposed Installer (ported from nuclei template http/misconfiguration/installer/revive-adserver-installer.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Installing Revive Adserver', 'installer'], 'condition': 'or'}],
+    },
+    {
+        "id": 'appveyor-configuration-file', "name": 'AppVeyor Configuration Page - Detect',
+        "severity": 'medium', "path": '/.appveyor.yml',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'AppVeyor Configuration Page - Detect (ported from nuclei template http/exposures/configs/appveyor-configuration-file.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['install:', 'test_script:'], 'condition': 'or'}],
+    },
+    {
+        "id": 'aws-config', "name": 'AWS Configuration - Detect',
+        "severity": 'medium', "path": '/.aws/config',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'AWS Configuration - Detect (ported from nuclei template http/exposures/configs/aws-config.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['[default]'], 'condition': 'or'}],
+    },
+    {
+        "id": 'azure-pipelines-exposed', "name": 'Azure Pipelines Configuration File Disclosure',
+        "severity": 'medium', "path": '/.azure-pipelines.yml',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Azure Pipelines Configuration File Disclosure (ported from nuclei template http/exposures/files/azure-pipelines-exposed.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['trigger:', 'pool:', 'variables:'], 'condition': 'or'}],
+    },
+    {
+        "id": 'circleci-ssh-config', "name": 'CircleCI SSH Configuration - Detect',
+        "severity": 'medium', "path": '/.circleci/ssh-config',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'CircleCI SSH Configuration - Detect (ported from nuclei template http/exposures/configs/circleci-ssh-config.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Host', 'HostName', 'IdentityFile'], 'condition': 'or'}],
+    },
+    {
+        "id": 'claude-settings-exposure', "name": 'Claude Code Project Settings Exposure',
+        "severity": 'medium', "path": '/.claude/settings.json',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Claude Code Project Settings Exposure (ported from nuclei template http/exposures/configs/claude-settings-exposure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['text/json'], 'condition': 'or'}],
+    },
+    {
+        "id": 'karma-config-js', "name": 'Karma Configuration File - Detect',
+        "severity": 'medium', "path": '/.config/karma.conf.js',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Karma Configuration File - Detect (ported from nuclei template http/exposures/configs/karma-config-js.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['// Karma configuration', 'module.exports'], 'condition': 'or'}],
+    },
+    {
+        "id": 'flow-config-exposure', "name": 'Flow Configuration - Exposure',
+        "severity": 'medium', "path": '/.flowconfig',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Flow Configuration - Exposure (ported from nuclei template http/exposures/configs/flow-config-exposure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['[include]', '[ignore]', 'build'], 'condition': 'or'}],
+    },
+    {
+        "id": 'git-credentials-disclosure', "name": 'Git Credentials - Detect',
+        "severity": 'medium', "path": '/.git-credentials',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Git Credentials - Detect (ported from nuclei template http/exposures/configs/git-credentials-disclosure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['https://', '@github.com'], 'condition': 'or'}],
+    },
+    {
+        "id": 'git-config', "name": 'Git Configuration - Detect',
+        "severity": 'medium', "path": '/.git/config',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Git Configuration - Detect (ported from nuclei template http/exposures/configs/git-config.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['[credentials]', '[core]'], 'condition': 'or'}],
+    },
+    {
+        "id": 'gitlab-ci-yml', "name": 'GitLab CI YAML - Exposure',
+        "severity": 'medium', "path": '/.gitlab-ci.yml',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'GitLab CI YAML - Exposure (ported from nuclei template http/exposures/files/gitlab-ci-yml.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['variables:', 'before_script:', 'stage: build', 'script:', 'image:', 'releasePath:', 'sshUser:'], 'condition': 'or'}],
+    },
+    {
+        "id": 'exposed-hg', "name": 'HG Configuration - Detect',
+        "severity": 'medium', "path": '/.hg/hgrc',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'HG Configuration - Detect (ported from nuclei template http/exposures/configs/exposed-hg.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['[paths]', 'default'], 'condition': 'or'}],
+    },
+    {
+        "id": 'ssh-authorized-keys', "name": 'SSH Authorized Keys File - Detect',
+        "severity": 'medium', "path": '/.ssh/authorized_keys',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'SSH Authorized Keys File - Detect (ported from nuclei template http/exposures/configs/ssh-authorized-keys.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['ssh-dss', 'ssh-ed25519', 'ssh-rsa', 'ecdsa-sha2-nistp256'], 'condition': 'or'}],
+    },
+    {
+        "id": 'svn-wc-db', "name": 'SVN wc.db File Exposure',
+        "severity": 'medium', "path": '/.svn/wc.db',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'SVN wc.db File Exposure (ported from nuclei template http/exposures/files/svn-wc-db.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['SQLite format', 'WCROOT'], 'condition': 'or'}],
+    },
+    {
+        "id": 'espeasy-installer', "name": 'ESPEasy Installation Exposure',
+        "severity": 'medium', "path": '/ESPEasy',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'ESPEasy Installation Exposure (ported from nuclei template http/misconfiguration/installer/espeasy-installer.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Install ESPEasy'], 'condition': 'or'}],
+    },
+    {
+        "id": 'aspnet-launchsettings-exposure', "name": 'ASP.NET Launch Settings - Exposure',
+        "severity": 'medium', "path": '/Properties/launchSettings.json',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'ASP.NET Launch Settings - Exposure (ported from nuclei template http/exposures/files/aspnet-launchsettings-exposure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['profiles', 'iisSettings', 'commandName', 'launchBrowser'], 'condition': 'or'}],
+    },
+    {
+        "id": 'jellyfin-public-users-exposure', "name": 'Jellyfin Public Users - Exposure',
+        "severity": 'medium', "path": '/Users/Public',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Jellyfin Public Users - Exposure (ported from nuclei template http/misconfiguration/jellyfin-public-users-exposure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['"Name"', '"ServerId"', '"Id"', '"Policy"', '"Configuration"'], 'condition': 'or'}],
+    },
+    {
+        "id": 'laravel-clockwork-exposure', "name": 'Laravel Clockwork - Sensitive Information Exposure',
+        "severity": 'medium', "path": '/__clockwork',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Laravel Clockwork - Sensitive Information Exposure (ported from nuclei template http/misconfiguration/laravel-clockwork-exposure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['"__meta":', '"toolbar":'], 'condition': 'or'}],
+    },
+    {
+        "id": 'pyramid-debug-toolbar', "name": 'Pyramid Debug Toolbar',
+        "severity": 'medium', "path": '/_debug_toolbar/',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Pyramid Debug Toolbar (ported from nuclei template http/exposures/logs/pyramid-debug-toolbar.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['<title>Pyramid Debug Toolbar</title>', 'Pyramid DebugToolbar</a>'], 'condition': 'or'}],
+    },
+    {
+        "id": 'laravel-debugbar-exposure', "name": 'Laravel Debugbar - Sensitive Information Exposure',
+        "severity": 'medium', "path": '/_debugbar/open',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Laravel Debugbar - Sensitive Information Exposure (ported from nuclei template http/misconfiguration/laravel-debugbar-exposure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['debugbar'], 'condition': 'or'}],
+    },
+    {
+        "id": 'laravel-debug-enabled', "name": 'Laravel Debug Enabled',
+        "severity": 'medium', "path": '/_ignition/health-check',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Laravel Debug Enabled (ported from nuclei template http/misconfiguration/laravel-debug-enabled.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['can_execute_commands'], 'condition': 'or'}],
+    },
+    {
+        "id": 'laravel-ignition-log-viewer', "name": 'Laravel Ignition - Log Viewer Information Disclosure',
+        "severity": 'medium', "path": '/_ignition/logs',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Laravel Ignition - Log Viewer Information Disclosure (ported from nuclei template http/exposures/logs/laravel-ignition-log-viewer.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['{"log_messages"', 'exception'], 'condition': 'or'}],
+    },
+    {
+        "id": 'vercel-source-exposure', "name": 'Vercel Source Code Exposure',
+        "severity": 'medium', "path": '/_src',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Vercel Source Code Exposure (ported from nuclei template http/misconfiguration/vercel-source-exposure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Deployment Source</title>', 'Deployment Source – Dashboard – Vercel', '<title>Login – Vercel</title>'], 'condition': 'or'}],
+    },
+    {
+        "id": 'exposed-sharepoint-list', "name": 'Sharepoint List - Detect',
+        "severity": 'medium', "path": '/_vti_bin/lists.asmx?WSDL',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Sharepoint List - Detect (ported from nuclei template http/exposures/configs/exposed-sharepoint-list.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['GetListResponse', 'GetList'], 'condition': 'or'}],
+    },
+    {
+        "id": 'gcloud-access-token', "name": 'Google Cloud Access Token',
+        "severity": 'medium', "path": '/access_tokens.db',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Google Cloud Access Token (ported from nuclei template http/exposures/files/gcloud-access-token.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['SQLite', 'access_token'], 'condition': 'or'}],
+    },
+    {
+        "id": 'amr-printer-management-unauth', "name": 'AMR Printer Management Dashboard - Exposure',
+        "severity": 'medium', "path": '/amr',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'AMR Printer Management Dashboard - Exposure (ported from nuclei template http/misconfiguration/amr-printer-management-unauth.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['AMR Printer Management', '<span>Basic Setup', '<span>Log'], 'condition': 'or'}],
+    },
+    {
+        "id": 'sonarqube-projects-disclosure', "name": 'SonarQube - Information Disclosure',
+        "severity": 'medium', "path": '/api/components/search_projects',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'SonarQube - Information Disclosure (ported from nuclei template http/misconfiguration/sonarqube-projects-disclosure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['"visibility":"public"', '{"organization'], 'condition': 'or'}],
+    },
+    {
+        "id": 'laravel-horizon-unauth', "name": 'Laravel Horizon Dashboard - Unauthenticated',
+        "severity": 'medium', "path": '/api/stats',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Laravel Horizon Dashboard - Unauthenticated (ported from nuclei template http/misconfiguration/laravel-horizon-unauth.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['queueWithMaxRuntime', 'recentJobs'], 'condition': 'or'}],
+    },
+    {
+        "id": 'mailpit-app-info-disclosure', "name": 'Mailpit App - Information Disclosure',
+        "severity": 'medium', "path": '/api/v1/messages',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Mailpit App - Information Disclosure (ported from nuclei template http/misconfiguration/mailpit-app-info-disclosure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['"messages":', '"ID":'], 'condition': 'or'}],
+    },
+    {
+        "id": 'apache-pinot-config', "name": 'Apache Pinot - Exposure',
+        "severity": 'medium', "path": '/appconfigs',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Apache Pinot - Exposure (ported from nuclei template http/exposures/configs/apache-pinot-config.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['"systemConfig"', '"pinotConfig"', '"jvmConfig"'], 'condition': 'or'}],
+    },
+    {
+        "id": 'apollo-adminservice-unauth', "name": 'Apollo Admin Service - Unauthenticated Access',
+        "severity": 'medium', "path": '/apps',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Apollo Admin Service - Unauthenticated Access (ported from nuclei template http/misconfiguration/apollo-adminservice-unauth.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['appId', 'orgName', 'ownerName', 'dataChangeCreatedBy'], 'condition': 'or'}],
+    },
+    {
+        "id": 'azure-instrumentation-key-exposure', "name": 'Azure Instrumentation Key - Exposure',
+        "severity": 'medium', "path": '/appsettings.json',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Azure Instrumentation Key - Exposure (ported from nuclei template http/exposures/tokens/azure/azure-instrumentation-key-exposure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['InstrumentationKey', 'APPINSIGHTS_INSTRUMENTATIONKEY', '<InstrumentationKey>'], 'condition': 'or'}],
+    },
+    {
+        "id": 'appspec-yml-disclosure', "name": 'Appspec YML/YAML - Detect',
+        "severity": 'medium', "path": '/appspec.yml',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Appspec YML/YAML - Detect (ported from nuclei template http/exposures/configs/appspec-yml-disclosure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['version:', 'files:'], 'condition': 'or'}],
+    },
+    {
+        "id": 'jfrog-artifactory-build-exposure', "name": 'JFrog Artifactory Build - Exposure',
+        "severity": 'medium', "path": '/artifactory/api/build',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'JFrog Artifactory Build - Exposure (ported from nuclei template http/exposures/configs/jfrog-artifactory-build-exposure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['"builds"', '"uri"', '"lastStarted"', 'application/vnd.org.jfrog'], 'condition': 'or'}],
+    },
+    {
+        "id": 'service-account-credentials', "name": 'Service Account Credentials File Disclosure',
+        "severity": 'medium', "path": '/assets/other/service-account-credentials.json',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Service Account Credentials File Disclosure (ported from nuclei template http/exposures/files/service-account-credentials.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['"private_key_id":', '"private_key":'], 'condition': 'or'}],
+    },
+    {
+        "id": 'behat-config', "name": 'Behat Configuration File - Detect',
+        "severity": 'medium', "path": '/behat.yml',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Behat Configuration File - Detect (ported from nuclei template http/exposures/configs/behat-config.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['default:', 'paths:', 'suites:'], 'condition': 'or'}],
+    },
+    {
+        "id": 'bitrix-log-file-disclosure', "name": 'Bitrix Site Manager - Log File Disclosure',
+        "severity": 'medium', "path": '/bitrix/modules/updater.log',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Bitrix Site Manager - Log File Disclosure (ported from nuclei template http/exposures/logs/bitrix-log-file-disclosure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['LICENSE_KEY', 'CUpdateClient', 'UPD_SUCCESS', 'UPD_ERROR', 'SUPD_VER', 'bitm_'], 'condition': 'or'}],
+    },
+    {
+        "id": 'cacti-log-exposure', "name": 'Cacti Log - Exposure',
+        "severity": 'medium', "path": '/cacti/log/cacti.log',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Cacti Log - Exposure (ported from nuclei template http/exposures/logs/cacti-log-exposure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['SYSTEM STATS'], 'condition': 'or'}],
+    },
+    {
+        "id": 'oracle-cgi-printenv', "name": 'Oracle CGI printenv - Information Disclosure',
+        "severity": 'medium', "path": '/cgi-bin/printenv',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Oracle CGI printenv - Information Disclosure (ported from nuclei template http/exposures/configs/oracle-cgi-printenv.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['DOCUMENT_ROOT="'], 'condition': 'or'}],
+    },
+    {
+        "id": 'cgi-printenv', "name": 'Test CGI Script - Detect',
+        "severity": 'medium', "path": '/cgi-bin/printenv.pl',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Test CGI Script - Detect (ported from nuclei template http/exposures/configs/cgi-printenv.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['MYSQL_HOME', 'OPENSSL_CONF', 'REMOTE_ADDR', 'SERVER_ADMIN', 'Environment Variables:'], 'condition': 'or'}],
+    },
+    {
+        "id": 'cloud-config', "name": 'Cloud Config File Exposure',
+        "severity": 'medium', "path": '/cloud-config.yml',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Cloud Config File Exposure (ported from nuclei template http/exposures/files/cloud-config.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['ssh_authorized_keys', '#cloud-config'], 'condition': 'or'}],
+    },
+    {
+        "id": 'cobbler-exposed-directory', "name": 'Exposed Cobbler Directories',
+        "severity": 'medium', "path": '/cobbler/',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Exposed Cobbler Directories (ported from nuclei template http/misconfiguration/cobbler-exposed-directory.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Index of /cobbler', 'Index of /cblr'], 'condition': 'or'}],
+    },
+    {
+        "id": 'apache-hive-config', "name": 'Apache Hive Configuration - Exposure',
+        "severity": 'medium', "path": '/conf',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Apache Hive Configuration - Exposure (ported from nuclei template http/exposures/configs/apache-hive-config.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['hive.conf.', '<configuration>'], 'condition': 'or'}],
+    },
+    {
+        "id": 'configuration-listing', "name": 'Sensitive Configuration Files Listing - Detect',
+        "severity": 'medium', "path": '/config/',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Sensitive Configuration Files Listing - Detect (ported from nuclei template http/exposures/configs/configuration-listing.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Index of /config', 'Parent Directory'], 'condition': 'or'}],
+    },
+    {
+        "id": 'rails-secret-token-disclosure', "name": 'Ruby on Rails Secret Token Disclosure',
+        "severity": 'medium', "path": '/config/initializers/secret_token.rb',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Ruby on Rails Secret Token Disclosure (ported from nuclei template http/exposures/files/rails-secret-token-disclosure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['secret_key_base =', 'config.secret_token ='], 'condition': 'or'}],
+    },
+    {
+        "id": 'pghero-dashboard-exposure', "name": 'PgHero Dashboard Exposure Panel - Detect',
+        "severity": 'medium', "path": '/connections',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'PgHero Dashboard Exposure Panel - Detect (ported from nuclei template http/misconfiguration/pghero-dashboard-exposure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['<title>PgHero / Connections</title>'], 'condition': 'or'}],
+    },
+    {
+        "id": 'aem-dump-contentnode', "name": 'AEM Dump Content Node Properties',
+        "severity": 'medium', "path": '/content.infinity.json',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'AEM Dump Content Node Properties (ported from nuclei template http/misconfiguration/aem/aem-dump-contentnode.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['"rep:privileges":['], 'condition': 'or'}],
+    },
+    {
+        "id": 'gcloud-credentials', "name": 'Google Cloud Credentials',
+        "severity": 'medium', "path": '/credentials.db',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Google Cloud Credentials (ported from nuclei template http/exposures/files/gcloud-credentials.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['SQLite', 'client_id'], 'condition': 'or'}],
+    },
+    {
+        "id": 'credentials-json', "name": 'Credentials File Disclosure',
+        "severity": 'medium', "path": '/credentials.json',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Credentials File Disclosure (ported from nuclei template http/exposures/files/credentials-json.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['"client_secret":', '"client_id":'], 'condition': 'or'}],
+    },
+    {
+        "id": 'unauth-fastvue-dashboard', "name": 'Fastvue Dashboard Panel - Unauthenticated Detect',
+        "severity": 'medium', "path": '/dashboard.aspx',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Fastvue Dashboard Panel - Unauthenticated Detect (ported from nuclei template http/misconfiguration/unauth-fastvue-dashboard.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['<title>Fastvue Sophos Reporter</title>', '<title>Fastvue Reporter for SonicWall</title>'], 'condition': 'or'}],
+    },
+    {
+        "id": 'lightstreamer-dashboard-exposure', "name": 'Lightstreamer Dashboard Exposure',
+        "severity": 'medium', "path": '/dashboard/',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Lightstreamer Dashboard Exposure (ported from nuclei template http/misconfiguration/lightstreamer-dashboard-exposure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Lightstreamer Monitoring Dashboard', 'performance'], 'condition': 'or'}],
+    },
+    {
+        "id": 'db-xml-file', "name": 'db.xml File - Detect',
+        "severity": 'medium', "path": '/db.xml',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'db.xml File - Detect (ported from nuclei template http/exposures/files/db-xml-file.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['<ServerName>', '<DBPASS>', '<DBtype>'], 'condition': 'or'}],
+    },
+    {
+        "id": 'jboss-seam-debug-page', "name": 'Jboss Seam Debug Page Enabled',
+        "severity": 'medium', "path": '/debug.seam',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Jboss Seam Debug Page Enabled (ported from nuclei template http/exposures/logs/jboss-seam-debug-page.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['SeamDebugPage', 'org.jboss.seam'], 'condition': 'or'}],
+    },
+    {
+        "id": 'netalertx-dashboard', "name": 'NetAlert X Admin Dashboard - Exposed',
+        "severity": 'medium', "path": '/devices.php',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'NetAlert X Admin Dashboard - Exposed (ported from nuclei template http/misconfiguration/netalertx-dashboard.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['<title>NetAlertX', 'Sign out</a>', 'My Devices'], 'condition': 'or'}],
+    },
+    {
+        "id": 'mfp-unauth-exposure', "name": 'Multi-function Printer - Unauthorized Access',
+        "severity": 'medium', "path": '/eSCL/ScannerCapabilities',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Multi-function Printer - Unauthorized Access (ported from nuclei template http/misconfiguration/mfp-unauth-exposure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['xmlns:pwg=', '<scan:ScannerCapabilities'], 'condition': 'or'}],
+    },
+    {
+        "id": 'apache-kyuubi-config', "name": 'Apache Kyuubi - Configuration Exposure',
+        "severity": 'medium', "path": '/engine-ui/0.0.0.0:4040/environment/',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Apache Kyuubi - Configuration Exposure (ported from nuclei template http/exposures/configs/apache-kyuubi-config.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Environment</title>', 'kyuubi'], 'condition': 'or'}],
+    },
+    {
+        "id": 'environment-rb', "name": 'Environment Ruby File Disclosure',
+        "severity": 'medium', "path": '/environment.rb',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Environment Ruby File Disclosure (ported from nuclei template http/exposures/files/environment-rb.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['# Load the Rails application.'], 'condition': 'or'}],
+    },
+    {
+        "id": 'aem-acs-common', "name": 'Adobe AEM ACS Common Exposure',
+        "severity": 'medium', "path": '/etc/acs-commons/jcr-compare.html',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Adobe AEM ACS Common Exposure (ported from nuclei template http/misconfiguration/aem/aem-acs-common.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['<title>Version Compare | ACS AEM Commons</title>', '<title>Oak Index Manager | ACS AEM Commons</title>', '<title>JCR Compare | ACS AEM Commons</title>', '<title>Workflow Remover | ACS AEM Commons</title>'], 'condition': 'or'}],
+    },
+    {
+        "id": 'forgejo-repo-exposure', "name": 'Forgejo Repositories - Exposure',
+        "severity": 'medium', "path": '/explore/repos',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Forgejo Repositories - Exposure (ported from nuclei template http/misconfiguration/forgejo-repo-exposure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Powered by Forgejo', 'Explore</a>', 'Repositories'], 'condition': 'or'}],
+    },
+    {
+        "id": 'teampass-ldap', "name": 'Teampass LDAP Debug Config - Detect',
+        "severity": 'medium', "path": '/files/ldap.debug.txt',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Teampass LDAP Debug Config - Detect (ported from nuclei template http/exposures/logs/teampass-ldap.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['base_dn', 'search_base', 'bind_dn', 'bind_passwd'], 'condition': 'or'}],
+    },
+    {
+        "id": 'springboot-gateway', "name": 'Detect Spring Gateway Actuator',
+        "severity": 'medium', "path": '/gateway/routes',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Detect Spring Gateway Actuator (ported from nuclei template http/misconfiguration/springboot/springboot-gateway.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['predicate', 'route_id'], 'condition': 'or'}],
+    },
+    {
+        "id": 'google-api-private-key', "name": 'Google Api Private Key',
+        "severity": 'medium', "path": '/google-api-private-key.json',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Google Api Private Key (ported from nuclei template http/exposures/files/google-api-private-key.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['private_key_id', 'private_key'], 'condition': 'or'}],
+    },
+    {
+        "id": 'cacti-guest-access-enabled', "name": 'Cacti - Guest User Access Enabled',
+        "severity": 'medium', "path": '/graph_view.php',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Cacti - Guest User Access Enabled (ported from nuclei template http/misconfiguration/cacti-guest-access-enabled.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Tree Mode', 'List Mode', 'Preview Mode', 'Login to Cacti', 'Please enter your Cacti'], 'condition': 'or'}],
+    },
+    {
+        "id": 'haproxy-status', "name": 'HAProxy Statistics Page - Detect',
+        "severity": 'medium', "path": '/haproxy-status',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'HAProxy Statistics Page - Detect (ported from nuclei template http/misconfiguration/haproxy-status.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Statistics Report for HAProxy'], 'condition': 'or'}],
+    },
+    {
+        "id": 'hazelcast-management-exposure', "name": 'Hazelcast Management Center - Configuration Exposure',
+        "severity": 'medium', "path": '/hazelcast/rest/cluster',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Hazelcast Management Center - Configuration Exposure (ported from nuclei template http/misconfiguration/hazelcast-management-exposure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['memberVersion', 'members'], 'condition': 'or'}],
+    },
+    {
+        "id": 'azure-functions-hostjson-exposure', "name": 'Azure Functions host.json Configuration Exposure',
+        "severity": 'medium', "path": '/host.json',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Azure Functions host.json Configuration Exposure (ported from nuclei template http/exposures/configs/azure-functions-hostjson-exposure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['"version"', '"extensionBundle"', '"functionTimeout"', '"logging"', '"extensions"', '"healthMonitor"', '"singleton"', '"concurrency"'], 'condition': 'or'}],
+    },
+    {
+        "id": 'kyan-credential-exposure', "name": 'Kyan Credential - Exposure',
+        "severity": 'medium', "path": '/hosts',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Kyan Credential - Exposure (ported from nuclei template http/exposures/configs/kyan-credential-exposure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['UserName=', 'Password='], 'condition': 'or'}],
+    },
+    {
+        "id": 'hp-laserjet-config', "name": 'HP LaserJet Configuration Exposure',
+        "severity": 'medium', "path": '/hp/device/this.LCDispatcher?nav=hp.Config',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'HP LaserJet Configuration Exposure (ported from nuclei template http/exposures/configs/hp-laserjet-config.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Configuration Page', 'Device Configuration', 'set_config_deviceinfo'], 'condition': 'or'}],
+    },
+    {
+        "id": 'oracle-ebs-sqllog-exposure', "name": 'Oracle EBS SQL Log - Exposure',
+        "severity": 'medium', "path": '/html/bin/sqlnet.log',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Oracle EBS SQL Log - Exposure (ported from nuclei template http/exposures/logs/oracle-ebs-sqllog-exposure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['DESCRIPTION=', 'USER='], 'condition': 'or'}],
+    },
+    {
+        "id": 'aws-s3-explorer', "name": 'Amazon Web Services S3 Explorer - Detect',
+        "severity": 'medium', "path": '/index.html',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Amazon Web Services S3 Explorer - Detect (ported from nuclei template http/misconfiguration/aws/aws-s3-explorer.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['<title>AWS S3 Explorer</title>'], 'condition': 'or'}],
+    },
+    {
+        "id": 'info-cgi-env-leak', "name": 'info.cgi  Environment Variable - Disclosure',
+        "severity": 'medium', "path": '/info.cgi',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'info.cgi  Environment Variable - Disclosure (ported from nuclei template http/misconfiguration/info-cgi-env-leak.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['SERVER_SOFTWARE', 'SERVER_NAME', 'GATEWAY_INTERFACE', 'SERVER_PROTOCOL', 'REQUEST_METHOD', 'QUERY_STRING', 'REMOTE_ADDR', 'HTTP_USER_AGENT'], 'condition': 'or'}],
+    },
+    {
+        "id": 'redmine-issues-exposure', "name": 'Redmine Issues - Exposure',
+        "severity": 'medium', "path": '/issues.json',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Redmine Issues - Exposure (ported from nuclei template http/exposures/files/redmine-issues-exposure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['"issues":', '"total_count":', '"project":'], 'condition': 'or'}],
+    },
+    {
+        "id": 'kubernetes-kustomization-disclosure', "name": 'Kubernetes Kustomize Configuration - Detect',
+        "severity": 'medium', "path": '/kustomization.yml',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Kubernetes Kustomize Configuration - Detect (ported from nuclei template http/exposures/configs/kubernetes-kustomization-disclosure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['apiVersion:', 'resources:', 'namespace:', 'commonLabels:', 'Kustomization'], 'condition': 'or'}],
+    },
+    {
+        "id": 'joomla-file-listing', "name": 'Joomla! Database File List',
+        "severity": 'medium', "path": '/libraries/joomla/database/',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Joomla! Database File List (ported from nuclei template http/exposures/files/joomla-file-listing.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Index of /libraries/joomla/database', 'Parent Directory'], 'condition': 'or'}],
+    },
+    {
+        "id": 'aem-offloading-browser', "name": 'Adobe AEM Offloading Browser',
+        "severity": 'medium', "path": '/libs/granite/offloading/content/view.html',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Adobe AEM Offloading Browser (ported from nuclei template http/misconfiguration/aem/aem-offloading-browser.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Offloading Browser', '>CLUSTER</th>'], 'condition': 'or'}],
+    },
+    {
+        "id": 'aem-security-users', "name": 'Adobe AEM Security Users Exposure',
+        "severity": 'medium', "path": '/libs/granite/security/content/useradmin.html',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Adobe AEM Security Users Exposure (ported from nuclei template http/misconfiguration/aem/aem-security-users.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['AEM Security | Users', 'trackingelement="create user"'], 'condition': 'or'}],
+    },
+    {
+        "id": 'sound4-directory-listing', "name": 'SOUND4 Impact/Pulse/First/Eco <=2.x - Information Disclosure',
+        "severity": 'medium', "path": '/log/',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'SOUND4 Impact/Pulse/First/Eco <=2.x - Information Disclosure (ported from nuclei template http/misconfiguration/sound4-directory-listing.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['<title>Index of /log</title>', 'Parent Directory'], 'condition': 'or'}],
+    },
+    {
+        "id": 'zen-cart-log-exposure', "name": 'Zen Cart Log File Exposure',
+        "severity": 'medium', "path": '/logs/',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Zen Cart Log File Exposure (ported from nuclei template http/exposures/logs/zen-cart-log-exposure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Index of', 'myDEBUG'], 'condition': 'or'}],
+    },
+    {
+        "id": 'grafana-loki-api-exposure', "name": 'Grafana Loki - Unauthenticated API Access',
+        "severity": 'medium', "path": '/loki/api/v1/labels',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Grafana Loki - Unauthenticated API Access (ported from nuclei template http/exposures/apis/grafana-loki-api-exposure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['"status":"success"'], 'condition': 'or'}],
+    },
+    {
+        "id": 'prometheus-metrics', "name": 'Prometheus Metrics - Detect',
+        "severity": 'medium', "path": '/metrics',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Prometheus Metrics - Detect (ported from nuclei template http/exposures/configs/prometheus-metrics.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['cpu_seconds_total', 'http_request_duration_seconds', 'process_virtual_memory_bytes', 'process_start_time_seconds', 'lvm_', 'kube', 'namedprocess', 'mysqld'], 'condition': 'or'}],
+    },
+    {
+        "id": 'putty-private-key-disclosure', "name": 'Putty Private Key Disclosure',
+        "severity": 'medium', "path": '/my.ppk',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Putty Private Key Disclosure (ported from nuclei template http/exposures/files/putty-private-key-disclosure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['PuTTY-User-Key-File', 'Encryption:'], 'condition': 'or'}],
+    },
+    {
+        "id": 'opcache-status-exposure', "name": 'OPcache Status Page - Detect',
+        "severity": 'medium', "path": '/opcache-status/',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'OPcache Status Page - Detect (ported from nuclei template http/exposures/configs/opcache-status-exposure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['<th>opcache_enabled</th>', '<th>opcache_hit_rate</th>'], 'condition': 'or'}],
+    },
+    {
+        "id": 'opennms-dashboard-exposure', "name": 'OpenNMS Dashboard - Exposure Detection',
+        "severity": 'medium', "path": '/opennms/index.jsp',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'OpenNMS Dashboard - Exposure Detection (ported from nuclei template http/misconfiguration/opennms-dashboard-exposure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['OpenNMS Web Console', 'OpenNMS', 'Maps'], 'condition': 'or'}],
+    },
+    {
+        "id": 'redpanda-console', "name": 'Redpanda Console - Exposure',
+        "severity": 'medium', "path": '/overview',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Redpanda Console - Exposure (ported from nuclei template http/misconfiguration/redpanda-console.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Redpanda Console'], 'condition': 'or'}],
+    },
+    {
+        "id": 'phinx-config', "name": 'Phinx Configuration Exposure',
+        "severity": 'medium', "path": '/phinx.yml',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Phinx Configuration Exposure (ported from nuclei template http/exposures/configs/phinx-config.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['paths:', 'environments:', 'development:'], 'condition': 'or'}],
+    },
+    {
+        "id": 'plesk-stat', "name": 'Webalizer Log Analyzer Configuration - Detect',
+        "severity": 'medium', "path": '/plesk-stat/',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Webalizer Log Analyzer Configuration - Detect (ported from nuclei template http/exposures/configs/plesk-stat.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Index of /plesk-stat', 'Parent Directory', 'anon_ftpstat', 'ftpstat', 'webstat-ssl', 'webstat'], 'condition': 'or'}],
+    },
+    {
+        "id": 'exposed-alps-spring', "name": 'Exposed Spring Data REST Application-Level Profile Semantics (ALPS)',
+        "severity": 'medium', "path": '/profile',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Exposed Spring Data REST Application-Level Profile Semantics (ALPS) (ported from nuclei template http/exposures/files/exposed-alps-spring.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['_links', '/alps/', 'profile', 'application/hal+json'], 'condition': 'or'}],
+    },
+    {
+        "id": 'firebase-config-exposure', "name": 'Firebase Configuration File - Detect',
+        "severity": 'medium', "path": '/public/config.js',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Firebase Configuration File - Detect (ported from nuclei template http/exposures/configs/firebase-config-exposure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['apiKey:', 'authDomain:', 'databaseURL:', 'storageBucket:'], 'condition': 'or'}],
+    },
+    {
+        "id": 'laravel-pulse-unauth', "name": 'Laravel Pulse - Unauthenticated Dashboard Access',
+        "severity": 'medium', "path": '/pulse',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Laravel Pulse - Unauthenticated Dashboard Access (ported from nuclei template http/misconfiguration/laravel-pulse-unauth.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Laravel Pulse', 'livewire'], 'condition': 'or'}],
+    },
+    {
+        "id": 'apache-polaris-metrics-exposure', "name": 'Apache Polaris - Information Disclosure',
+        "severity": 'medium', "path": '/q/metrics',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Apache Polaris - Information Disclosure (ported from nuclei template http/exposures/configs/apache-polaris-metrics-exposure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['application="Polaris"', 'org.apache.polaris'], 'condition': 'or'}],
+    },
+    {
+        "id": 'redis-config', "name": 'Redis Configuration File - Detect',
+        "severity": 'medium', "path": '/redis.conf',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Redis Configuration File - Detect (ported from nuclei template http/exposures/configs/redis-config.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['bind', 'protected-mode', 'port'], 'condition': 'or'}],
+    },
+    {
+        "id": 'coolify-register-account', "name": 'Coolify Register User Account - Enabled',
+        "severity": 'medium', "path": '/register',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Coolify Register User Account - Enabled (ported from nuclei template http/misconfiguration/coolify-register-account.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Password again', 'Coolify'], 'condition': 'or'}],
+    },
+    {
+        "id": 'prisma-schema-exposure', "name": 'Exposed Prisma Database Schema - Exposure',
+        "severity": 'medium', "path": '/schema.prisma',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Exposed Prisma Database Schema - Exposure (ported from nuclei template http/exposures/configs/prisma-schema-exposure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['generator', 'datasource', 'provider =', 'model'], 'condition': 'or'}],
+    },
+    {
+        "id": 'secret-token-rb', "name": 'Secret Token Ruby - File Disclosure',
+        "severity": 'medium', "path": '/secret_token.rb',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Secret Token Ruby - File Disclosure (ported from nuclei template http/exposures/files/secret-token-rb.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['::Application.config.secret'], 'condition': 'or'}],
+    },
+    {
+        "id": 'prometheus-promtail', "name": 'Prometheus Promtail - Exposure',
+        "severity": 'medium', "path": '/service-discovery',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Prometheus Promtail - Exposure (ported from nuclei template http/misconfiguration/prometheus-promtail.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['>Promtail</a>', 'https://github.com/grafana/loki'], 'condition': 'or'}],
+    },
+    {
+        "id": 'teslamate-unauth-access', "name": 'TeslaMate - Unauthenticated Access',
+        "severity": 'medium', "path": '/settings',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'TeslaMate - Unauthenticated Access (ported from nuclei template http/misconfiguration/teslamate-unauth-access.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Settings · TeslaMate', 'URLs</h2>'], 'condition': 'or'}],
+    },
+    {
+        "id": 'generic-php-files', "name": 'Generic PHP Backup Information Disclosure',
+        "severity": 'medium', "path": '/settings.php.bak',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Generic PHP Backup Information Disclosure (ported from nuclei template http/exposures/backups/generic-php-files.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['DB_NAME'], 'condition': 'or'}],
+    },
+    {
+        "id": 'untangle-admin-setup', "name": 'Untangle Exposed Admin Signup',
+        "severity": 'medium', "path": '/setup/setup.do',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Untangle Exposed Admin Signup (ported from nuclei template http/misconfiguration/untangle-admin-setup.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['<title>Setup Wizard</title>', 'java.untangle.com'], 'condition': 'or'}],
+    },
+    {
+        "id": 'jenkins-openuser-register', "name": 'Jenkins Open User registration',
+        "severity": 'medium', "path": '/signup',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Jenkins Open User registration (ported from nuclei template http/misconfiguration/jenkins/jenkins-openuser-register.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Create an account! [Jenkins]', 'Register [Jenkins]', 'Register - Jenkins'], 'condition': 'or'}],
+    },
+    {
+        "id": 'slurm-hpc-dashboard', "name": 'Slurm HPC Dashboard - Detect',
+        "severity": 'medium', "path": '/slurm/',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Slurm HPC Dashboard - Detect (ported from nuclei template http/misconfiguration/slurm-hpc-dashboard.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['<title>Slurm HPC Dashboard</title>', 'content="Slurm HPC dashboard'], 'condition': 'or'}],
+    },
+    {
+        "id": 'sensitive-storage-data-expose', "name": 'Sensitive Storage Data - Detect',
+        "severity": 'medium', "path": '/storage/',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Sensitive Storage Data - Detect (ported from nuclei template http/exposures/files/sensitive-storage-exposure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Index of', 'oauth-private.key'], 'condition': 'or'}],
+    },
+    {
+        "id": 'craftcms-log-disclosure', "name": 'Craft CMS - Log File Disclosure',
+        "severity": 'medium', "path": '/storage/logs/web.log',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Craft CMS - Log File Disclosure (ported from nuclei template http/exposures/logs/craftcms-log-disclosure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['craft_cms', 'UrlManager', 'schemaVersion'], 'condition': 'or'}],
+    },
+    {
+        "id": 'opencart-error-log', "name": 'OpenCart Error Log Disclosure',
+        "severity": 'medium', "path": '/system/storage/logs/error.log',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'OpenCart Error Log Disclosure (ported from nuclei template http/exposures/logs/opencart-error-log.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['PHP Notice', 'PHP Warning', 'PHP Error', 'PHP Fatal error', 'opencart', 'catalog/controller', 'catalog/model', 'system/library'], 'condition': 'or'}],
+    },
+    {
+        "id": 'tcpconfig', "name": 'Rockwell Automation TCP/IP Configuration Information - Detect',
+        "severity": 'medium', "path": '/tcpconfig.html',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Rockwell Automation TCP/IP Configuration Information - Detect (ported from nuclei template http/misconfiguration/tcpconfig.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['TCP/IP Configuration'], 'condition': 'or'}],
+    },
+    {
+        "id": 'laravel-telescope', "name": 'Laravel Telescope Disclosure',
+        "severity": 'medium', "path": '/telescope/requests',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Laravel Telescope Disclosure (ported from nuclei template http/exposures/logs/laravel-telescope.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['<title>Telescope</title>', 'Requests', 'Commands', 'Schedule'], 'condition': 'or'}],
+    },
+    {
+        "id": 'perfsonar-toolkit', "name": 'perfSONAR Toolkit - Exposure',
+        "severity": 'medium', "path": '/toolkit/',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'perfSONAR Toolkit - Exposure (ported from nuclei template http/misconfiguration/perfsonar-toolkit.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['<title>perfSONAR Toolkit</title>'], 'condition': 'or'}],
+    },
+    {
+        "id": 'transmission-dashboard', "name": 'Transmission Dashboard - Detect',
+        "severity": 'medium', "path": '/transmission/web/',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Transmission Dashboard - Detect (ported from nuclei template http/misconfiguration/transmission-dashboard.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['The Transmission Project', 'Transmission Web Interface', 'Transmission'], 'condition': 'or'}],
+    },
+    {
+        "id": 'exposed-nomad', "name": 'Nomad - Exposed Jobs',
+        "severity": 'medium', "path": '/ui/jobs',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Nomad - Exposed Jobs (ported from nuclei template http/misconfiguration/nomad-jobs.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Nomad', 'nomad-ui'], 'condition': 'or'}],
+    },
+    {
+        "id": 'php-user-ini-disclosure', "name": 'Php User.ini Disclosure',
+        "severity": 'medium', "path": '/user.ini',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Php User.ini Disclosure (ported from nuclei template http/exposures/files/php-user-ini-disclosure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['assert', 'highlight', 'opcache', 'mssql', 'oci8', 'agent'], 'condition': 'or'}],
+    },
+    {
+        "id": 'docker-registry', "name": 'Docker Registry Listing',
+        "severity": 'medium', "path": '/v2/_catalog',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Docker Registry Listing (ported from nuclei template http/misconfiguration/docker-registry.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['"repositories":'], 'condition': 'or'}],
+    },
+    {
+        "id": 'imprivata-installer', "name": 'Imprivata Appliance Installation Exposure',
+        "severity": 'medium', "path": '/wizard/base.php',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Imprivata Appliance Installation Exposure (ported from nuclei template http/misconfiguration/installer/imprivata-installer.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['<title>Appliance Setup Wizard', 'Imprivata'], 'condition': 'or'}],
+    },
+    {
+        "id": 'nextgen-gallery-pro-error-log', "name": 'WordPress NextGEN Gallery Pro - Error Log Disclosure',
+        "severity": 'medium', "path": '/wp-content/debug.log',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'WordPress NextGEN Gallery Pro - Error Log Disclosure (ported from nuclei template http/misconfiguration/wordpress/nextgen-gallery-pro-error-log.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['nextgen'], 'condition': 'or'}],
+    },
+    {
+        "id": 'wordfence-config-disclosure', "name": 'WordPress Wordfence - Configuration File Disclosure',
+        "severity": 'medium', "path": '/wp-content/wflogs/config.php',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'WordPress Wordfence - Configuration File Disclosure (ported from nuclei template http/misconfiguration/wordpress/wordfence-config-disclosure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['plugins/wordfence', 'authKey"'], 'condition': 'or'}],
+    },
+    {
+        "id": 'wordfence-rules-disclosure', "name": 'WordPress Wordfence - Rules File Disclosure',
+        "severity": 'medium', "path": '/wp-content/wflogs/rules.php',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'WordPress Wordfence - Rules File Disclosure (ported from nuclei template http/misconfiguration/wordpress/wordfence-rules-disclosure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['wfWAFrule'], 'condition': 'or'}],
+    },
+    {
+        "id": 'hp-ilo-serial-key-disclosure', "name": 'HP iLO Serial Key - Detect',
+        "severity": 'medium', "path": '/xmldata?item=CpqKey',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'HP iLO Serial Key - Detect (ported from nuclei template http/exposures/configs/hp-ilo-serial-key-disclosure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['LTYPE', 'LNAME'], 'condition': 'or'}],
+    },
+    {
+        "id": 'xprober-service', "name": 'X Prober Server - Information Disclosure',
+        "severity": 'medium', "path": '/xprober.php',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'X Prober Server - Information Disclosure (ported from nuclei template http/exposures/configs/xprober-service.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['"appName":"X Prober"', '<title>X Prober'], 'condition': 'or'}],
+    },
+    {
+        "id": 'zabbix-dashboards-access', "name": 'zabbix-dashboards-access',
+        "severity": 'medium', "path": '/zabbix/zabbix.php?action=dashboard.list',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'zabbix-dashboards-access (ported from nuclei template http/misconfiguration/zabbix-dashboards-access.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Create dashboard', 'Zabbix SIA'], 'condition': 'or'}],
+    },
+    {
+        "id": 'editor-exposure', "name": 'Editor Configuration File - Detect',
+        "severity": 'low', "path": '/.editorconfig',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Editor Configuration File - Detect (ported from nuclei template http/exposures/configs/editor-exposure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['= true', 'indent_style'], 'condition': 'or'}],
+    },
+    {
+        "id": 'firebase-detect', "name": 'firebase detect',
+        "severity": 'low', "path": '/.settings/rules.json?auth=FIREBASE_SECRET',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'firebase detect (ported from nuclei template http/technologies/google/firebase-detect.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Could not parse auth token'], 'condition': 'or'}],
+    },
+    {
+        "id": 'wordpress-wp-env-exposure', "name": 'WordPress Configuration wp-env - Exposure',
+        "severity": 'low', "path": '/.wp-env.json',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'WordPress Configuration wp-env - Exposure (ported from nuclei template http/exposures/configs/wordpress-wp-env-exposure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['"phpVersion"', '"plugins"', '"themes"'], 'condition': 'or'}],
+    },
+    {
+        "id": 'exposed-bitkeeper', "name": 'BitKeeper Configuration - Detect',
+        "severity": 'low', "path": '/BitKeeper/etc/config',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'BitKeeper Configuration - Detect (ported from nuclei template http/exposures/configs/exposed-bitkeeper.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['BitKeeper configuration', 'logging', 'description'], 'condition': 'or'}],
+    },
+    {
+        "id": '3cx-config', "name": '3CX Config - File Disclosure',
+        "severity": 'low', "path": '/SetupConfig.xml',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": '3CX Config - File Disclosure (ported from nuclei template http/exposures/configs/3cx-config.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['<SetupConfig'], 'condition': 'or'}],
+    },
+    {
+        "id": 'elasticsearch', "name": 'ElasticSearch Information Disclosure',
+        "severity": 'low', "path": '/_cluster/health?pretty',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'ElasticSearch Information Disclosure (ported from nuclei template http/misconfiguration/elasticsearch.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['"took":', '"number" :', '"number_of_nodes"', 'application/vnd.api+json'], 'condition': 'or'}],
+    },
+    {
+        "id": 'ms-front-page-misconfig', "name": 'Microsoft FrontPage Configuration - Exposure',
+        "severity": 'low', "path": '/_vti_inf.html',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Microsoft FrontPage Configuration - Exposure (ported from nuclei template http/misconfiguration/microsoft/ms-front-page-misconfig.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['vti_extenderversion:', 'FPVersion=', 'PasswordDir:', 'Catalog for database:'], 'condition': 'or'}],
+    },
+    {
+        "id": 'airflow-debug', "name": 'Airflow Debug Trace',
+        "severity": 'low', "path": '/admin/airflow/login',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Airflow Debug Trace (ported from nuclei template http/misconfiguration/airflow/airflow-debug.yaml)',
+        "matchers": [{'type': 'status', 'status': [200, 500]}, {'type': 'word', 'part': 'all', 'words': ['<h1> Ooops. </h1>', 'Traceback (most recent call last)'], 'condition': 'or'}],
+    },
+    {
+        "id": 'keycloak-admin-console-config', "name": 'Keycloak Admin Console Configuration Disclosure',
+        "severity": 'low', "path": '/admin/master/console/config',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Keycloak Admin Console Configuration Disclosure (ported from nuclei template http/exposures/configs/keycloak-admin-console-config.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['"realm":', '"resource":', '"auth-server-url":'], 'condition': 'or'}],
+    },
+    {
+        "id": 'joomla-fpd', "name": 'Joomla! - Full Path Disclosure',
+        "severity": 'low', "path": '/administrator/manifests/files/joomla.xml',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Joomla! - Full Path Disclosure (ported from nuclei template http/misconfiguration/joomla-fpd.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['<version>', '<creationDate>', '</metafile>'], 'condition': 'or'}],
+    },
+    {
+        "id": 'sonarqube-public-projects', "name": 'Sonarqube with public projects',
+        "severity": 'low', "path": '/api/components/suggestions?recentlyBrowsed=',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Sonarqube with public projects (ported from nuclei template http/misconfiguration/sonarqube-public-projects.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['"results":', '"items":', '"more":'], 'condition': 'or'}],
+    },
+    {
+        "id": 'librechat-config-exposure', "name": 'librechat - Config Exposure',
+        "severity": 'low', "path": '/api/config',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'librechat - Config Exposure (ported from nuclei template http/exposures/configs/librechat-config-exposure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['LibreChat', 'serverDomain', 'registrationEnabled', 'passwordResetEnabled'], 'condition': 'or'}],
+    },
+    {
+        "id": 'jfrog-artifactory-exposure', "name": 'JFrog Artifactory Artifacts Exposure',
+        "severity": 'low', "path": '/artifactory/api/repositories',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'JFrog Artifactory Artifacts Exposure (ported from nuclei template http/misconfiguration/jfrog-artifactory-exposure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['"key" :', '"type" :', '"url" :', '"packageType" :', 'application/vnd.org.jfrog.artifactory'], 'condition': 'or'}],
+    },
+    {
+        "id": 'springboot-autoconfig', "name": 'Detect Springboot autoconfig Actuator',
+        "severity": 'low', "path": '/autoconfig',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Detect Springboot autoconfig Actuator (ported from nuclei template http/misconfiguration/springboot/springboot-autoconfig.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['positiveMatches', 'AuditAutoConfiguration#auditListener', 'EndpointAutoConfiguration#beansEndpoint'], 'condition': 'or'}],
+    },
+    {
+        "id": 'springboot-beans', "name": 'Detect Springboot Beans Actuator',
+        "severity": 'low', "path": '/beans',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Detect Springboot Beans Actuator (ported from nuclei template http/misconfiguration/springboot/springboot-beans.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['"type"', '"beans"', '"dependencies"', '"scope"', 'application/vnd.spring-boot.actuator', 'application/vnd.spring-boot.actuator.v1+json'], 'condition': 'or'}],
+    },
+    {
+        "id": 'springboot-caches', "name": 'Springboot Actuator Caches',
+        "severity": 'low', "path": '/caches',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Springboot Actuator Caches (ported from nuclei template http/misconfiguration/springboot/springboot-caches.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['cacheManagers', 'application/vnd.spring-boot.actuator', 'application/vnd.spring-boot.actuator.v1+json', 'application/vnd.spring-boot.actuator.v2+json'], 'condition': 'or'}],
+    },
+    {
+        "id": 'codeception-config', "name": 'Codeception YAML Configuration File - Detect',
+        "severity": 'low', "path": '/codeception.yml',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Codeception YAML Configuration File - Detect (ported from nuclei template http/exposures/configs/codeception-config.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['paths:', 'settings:'], 'condition': 'or'}],
+    },
+    {
+        "id": 'springboot-conditions', "name": 'Detect Springboot Conditions Actuator',
+        "severity": 'low', "path": '/conditions',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Detect Springboot Conditions Actuator (ported from nuclei template http/misconfiguration/springboot/springboot-conditions.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['"positiveMatches":{', '"unconditionalClasses":[', 'application/vnd.spring-boot.actuator', 'application/vnd.spring-boot.actuator.v1+json'], 'condition': 'or'}],
+    },
+    {
+        "id": 'springboot-configprops', "name": 'Detect Springboot Configprops Actuator',
+        "severity": 'low', "path": '/configprops',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Detect Springboot Configprops Actuator (ported from nuclei template http/misconfiguration/springboot/springboot-configprops.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['org.springframework.boot.actuate', 'beans', 'context', 'application/vnd.spring-boot.actuator', 'application/vnd.spring-boot.actuator.v1+json'], 'condition': 'or'}],
+    },
+    {
+        "id": 'joomla-config-dist-file', "name": 'Joomla! Configuration File - Detect',
+        "severity": 'low', "path": '/configuration.php-dist',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Joomla! Configuration File - Detect (ported from nuclei template http/exposures/configs/joomla-config-dist-file.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Joomla', 'JConfig', '@package'], 'condition': 'or'}],
+    },
+    {
+        "id": 'yii-debugger', "name": 'View Yii Debugger Information',
+        "severity": 'low', "path": '/debug/default/view.html',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'View Yii Debugger Information (ported from nuclei template http/exposures/configs/yii-debugger.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['<title>Yii Debugger</title>', 'Route', 'Time', 'Memory'], 'condition': 'or'}],
+    },
+    {
+        "id": 'go-pprof-debug', "name": 'Go pprof Debug Page',
+        "severity": 'low', "path": '/debug/pprof/heap?debug=1',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Go pprof Debug Page (ported from nuclei template http/exposures/logs/go-pprof-debug.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['heap profile:', 'Alloc'], 'condition': 'or'}],
+    },
+    {
+        "id": 'debug-vars', "name": 'Golang Expvar - Detect',
+        "severity": 'low', "path": '/debug/vars',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Golang Expvar - Detect (ported from nuclei template http/exposures/configs/debug-vars.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['"memstats":', '"cmdline":'], 'condition': 'or'}],
+    },
+    {
+        "id": 'domcfg-page', "name": 'Lotus Domino Configuration Page',
+        "severity": 'low', "path": '/domcfg.nsf',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Lotus Domino Configuration Page (ported from nuclei template http/exposures/files/domcfg-page.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Web Server Configuration', 'Mapping', 'Mappings'], 'condition': 'or'}],
+    },
+    {
+        "id": 'springboot-dump', "name": 'Detect Springboot Dump Actuator',
+        "severity": 'low', "path": '/dump',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Detect Springboot Dump Actuator (ported from nuclei template http/misconfiguration/springboot/springboot-dump.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['threadName', 'threadId', 'waitedTime', 'lockName', 'stackTrace', 'methodName'], 'condition': 'or'}],
+    },
+    {
+        "id": 'springboot-env', "name": 'Springboot Env Actuator - Detect',
+        "severity": 'low', "path": '/env',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Springboot Env Actuator - Detect (ported from nuclei template http/misconfiguration/springboot/springboot-env.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['applicationConfig', 'activeProfiles', 'server.port', 'local.server.port', 'application/vnd.spring-boot.actuator', 'application/vnd.spring-boot.actuator.v1+json', 'application/vnd.spring-boot.actuator.v2+json', 'application/vnd.spring-boot.actuator.v3+json'], 'condition': 'or'}],
+    },
+    {
+        "id": 'javascript-env', "name": 'JavaScript Environment Configuration - Detect',
+        "severity": 'low', "path": '/env.js',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'JavaScript Environment Configuration - Detect (ported from nuclei template http/exposures/files/javascript-env.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['module.exports', 'const audience', 'const domain', 'NODE_ENV', 'LOG_LEVEL', 'TOKEN', 'window.__ENV =', 'Bootstrap'], 'condition': 'or'}],
+    },
+    {
+        "id": 'tomcat-cookie-exposed', "name": 'Tomcat Cookie Exposed',
+        "severity": 'low', "path": '/examples/servlets/servlet/CookieExample',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Tomcat Cookie Exposed (ported from nuclei template http/misconfiguration/tomcat-cookie-exposed.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Cookies Example', 'Your browser is sending the following cookies:'], 'condition': 'or'}],
+    },
+    {
+        "id": 'springboot-features', "name": 'Detects Springboot Features Actuator',
+        "severity": 'low', "path": '/features',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Detects Springboot Features Actuator (ported from nuclei template http/misconfiguration/springboot/springboot-features.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['"enabled":[', '"disabled":[', 'application/vnd.spring-boot.actuator', 'application/vnd.spring-boot.actuator.v1+json'], 'condition': 'or'}],
+    },
+    {
+        "id": 'firebase-debug-log', "name": 'Firebase Debug Log File Exposure',
+        "severity": 'low', "path": '/firebase-debug.log',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Firebase Debug Log File Exposure (ported from nuclei template http/exposures/logs/firebase-debug-log.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['[debug]', 'firebase', 'googleapis.com'], 'condition': 'or'}],
+    },
+    {
+        "id": 'springboot-flyway', "name": 'Springboot Flyway API',
+        "severity": 'low', "path": '/flyway',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Springboot Flyway API (ported from nuclei template http/misconfiguration/springboot/springboot-flyway.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['flywayBeans', 'application/vnd.spring-boot.actuator', 'application/vnd.spring-boot.actuator.v1+json', 'application/vnd.spring-boot.actuator.v2+json'], 'condition': 'or'}],
+    },
+    {
+        "id": 'springboot-httpexchanges', "name": 'Detects Springboot HTTP Exchanges Actuator',
+        "severity": 'low', "path": '/httpexchanges',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Detects Springboot HTTP Exchanges Actuator (ported from nuclei template http/misconfiguration/springboot/springboot-httpexchanges.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['"exchanges"', '"request"', '"response"', 'application/vnd.spring-boot.actuator', 'application/vnd.spring-boot.actuator.v3+json'], 'condition': 'or'}],
+    },
+    {
+        "id": 'springboot-httptrace', "name": 'Detect Springboot httptrace',
+        "severity": 'low', "path": '/httptrace',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Detect Springboot httptrace (ported from nuclei template http/misconfiguration/springboot/springboot-httptrace.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['"traces"', '"timestamp"', '"principal"', '"session"', 'application/vnd.spring-boot.actuator', 'application/vnd.spring-boot.actuator.v1+json'], 'condition': 'or'}],
+    },
+    {
+        "id": 'openstack-config', "name": 'Openstack - Infomation Disclosure',
+        "severity": 'low', "path": '/info',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Openstack - Infomation Disclosure (ported from nuclei template http/misconfiguration/openstack-config.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['{"formpost"', '"bulk_'], 'condition': 'or'}],
+    },
+    {
+        "id": 'springboot-integrationgraph', "name": 'Springboot Actuator integrationgraph',
+        "severity": 'low', "path": '/integrationgraph',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Springboot Actuator integrationgraph (ported from nuclei template http/misconfiguration/springboot/springboot-integrationgraph.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['provider', 'integrationPatternType', 'application/vnd.spring-boot.actuator', 'application/vnd.spring-boot.actuator.v1+json', 'application/vnd.spring-boot.actuator.v2+json', 'application/vnd.spring-boot.actuator.v3+json'], 'condition': 'or'}],
+    },
+    {
+        "id": 'springboot-jolokia', "name": 'Detects Springboot Jolokia Actuator',
+        "severity": 'low', "path": '/jolokia',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Detects Springboot Jolokia Actuator (ported from nuclei template http/misconfiguration/springboot/springboot-jolokia.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['"config":{', '"agentId":"', 'application/vnd.spring-boot.actuator', 'application/vnd.spring-boot.actuator.v1+json', 'application/vnd.spring-boot.actuator.v2+json', 'application/vnd.spring-boot.actuator.v3+json'], 'condition': 'or'}],
+    },
+    {
+        "id": 'springboot-liquidbase', "name": 'Springboot Liquidbase API',
+        "severity": 'low', "path": '/liquibase',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Springboot Liquidbase API (ported from nuclei template http/misconfiguration/springboot/springboot-liquidbase.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['liquibase', '"FILENAME":"', 'application/vnd.spring-boot.actuator', 'application/vnd.spring-boot.actuator.v1+json', 'application/vnd.spring-boot.actuator.v2+json'], 'condition': 'or'}],
+    },
+    {
+        "id": 'springboot-logfile', "name": 'Detects Springboot Logfile Actuator',
+        "severity": 'low', "path": '/logfile',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Detects Springboot Logfile Actuator (ported from nuclei template http/misconfiguration/springboot/springboot-logfile.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['springframework.web.HttpRequestMethodNotSupportedException', 'INFO'], 'condition': 'or'}],
+    },
+    {
+        "id": 'springboot-loggers', "name": 'Springboot Loggers - Exposure',
+        "severity": 'low', "path": '/loggers',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Springboot Loggers - Exposure (ported from nuclei template http/misconfiguration/springboot/springboot-loggers.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['"levels"', '"configuredLevel"', '"effectiveLevel"'], 'condition': 'or'}],
+    },
+    {
+        "id": 'vscode-mcp-json', "name": 'Visual Studio Code MCP Configuration ("mcp.json") Exposure',
+        "severity": 'low', "path": '/mcp.json',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Visual Studio Code MCP Configuration ("mcp.json") Exposure (ported from nuclei template http/exposures/files/vscode-mcp-json.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['"mcpServers": {', '"args":'], 'condition': 'or'}],
+    },
+    {
+        "id": 'umbraco-miniprofiler-exposure', "name": 'Umbraco Mini Profiler - Exposure',
+        "severity": 'low', "path": '/mini-profiler-resources/results',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Umbraco Mini Profiler - Exposure (ported from nuclei template http/misconfiguration/umbraco-miniprofiler-exposure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['StartupProfiler', 'var profiler =', '"DurationMilliseconds"'], 'condition': 'or'}],
+    },
+    {
+        "id": 'npm-debug-log', "name": 'NPM Debug Log Disclosure',
+        "severity": 'low', "path": '/npm-debug.log',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'NPM Debug Log Disclosure (ported from nuclei template http/exposures/logs/npm-debug-log.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['verbose cli', 'verbose stack'], 'condition': 'or'}],
+    },
+    {
+        "id": 'oauth-credentials-json', "name": 'Oauth Credentials Json',
+        "severity": 'low', "path": '/oauth-credentials.json',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Oauth Credentials Json (ported from nuclei template http/exposures/files/oauth-credentials-json.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['"client_id":', '"client_secret":'], 'condition': 'or'}],
+    },
+    {
+        "id": 'platformio-ini', "name": 'Platformio Config File Disclosure',
+        "severity": 'low', "path": '/platformio.ini',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Platformio Config File Disclosure (ported from nuclei template http/exposures/configs/platformio-ini.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['[platformio]', 'platform =', 'board ='], 'condition': 'or'}],
+    },
+    {
+        "id": 'prometheus-log', "name": 'Exposed Prometheus',
+        "severity": 'low', "path": '/prometheus',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Exposed Prometheus (ported from nuclei template http/misconfiguration/prometheus/prometheus-log.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['gateway_request_total', 'logback_events_total'], 'condition': 'or'}],
+    },
+    {
+        "id": 'protractor-config', "name": 'Protractor Configuration Exposure',
+        "severity": 'low', "path": '/protractor.conf.js',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Protractor Configuration Exposure (ported from nuclei template http/exposures/configs/protractor-config.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['exports.config', 'capabilities:', 'application/javascript'], 'condition': 'or'}],
+    },
+    {
+        "id": 'psalm-config', "name": 'Psalm Configuration Exposure - Detect',
+        "severity": 'low', "path": '/psalm.xml',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Psalm Configuration Exposure - Detect (ported from nuclei template http/exposures/configs/psalm-config.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['<psalm', '<projectFiles', 'xmlns:xsi'], 'condition': 'or'}],
+    },
+    {
+        "id": 'imageresizer-debug-exposure', "name": 'ImageResizer Debug - Information Exposure',
+        "severity": 'low', "path": '/resizer.debug.ashx',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'ImageResizer Debug - Information Exposure (ported from nuclei template http/misconfiguration/imageresizer-debug-exposure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['ImageResizer.', 'Diagnostics', 'Configuration:', 'Registered plugins:'], 'condition': 'or'}],
+    },
+    {
+        "id": 'springboot-sbom', "name": 'Spring Boot Actuator SBOM - Exposure',
+        "severity": 'low', "path": '/sbom',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Spring Boot Actuator SBOM - Exposure (ported from nuclei template http/misconfiguration/springboot/springboot-sbom.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['application/vnd.spring-boot.actuator', 'application/vnd.spring-boot.actuator.v1+json', 'application/vnd.spring-boot.actuator.v2+json', 'application/vnd.spring-boot.actuator.v3+json', 'application/vnd.cyclonedx+json', 'application/spdx+json', 'application/vnd.syft+json'], 'condition': 'or'}],
+    },
+    {
+        "id": 'python-setup-config', "name": 'Python Setup Configuration - Exposure',
+        "severity": 'low', "path": '/setup.py',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Python Setup Configuration - Exposure (ported from nuclei template http/exposures/configs/python-setup-config.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['import os', 'find_packages', 'setup(', 'text/x-python'], 'condition': 'or'}],
+    },
+    {
+        "id": 'sitecore-debug-page', "name": 'SiteCore Debug Page',
+        "severity": 'low', "path": "/sitecore/'",
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'SiteCore Debug Page (ported from nuclei template http/misconfiguration/sitecore-debug-page.yaml)',
+        "matchers": [{'type': 'status', 'status': [200, 404]}, {'type': 'word', 'part': 'all', 'words': ['extranet\\Anonymous'], 'condition': 'or'}],
+    },
+    {
+        "id": 'drupal-directory-listing', "name": 'Drupal Directory Listing',
+        "severity": 'low', "path": '/sites/',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Drupal Directory Listing (ported from nuclei template http/misconfiguration/drupal-directory-listing.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Index of /', 'Last modified', 'Parent Directory'], 'condition': 'or'}],
+    },
+    {
+        "id": 'springboot-startup', "name": 'Springboot Actuator startup',
+        "severity": 'low', "path": '/startup',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Springboot Actuator startup (ported from nuclei template http/misconfiguration/springboot/springboot-startup.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['springBootVersion', 'startTime', 'application/vnd.spring-boot.actuator', 'application/vnd.spring-boot.actuator.v1+json', 'application/vnd.spring-boot.actuator.v2+json', 'application/vnd.spring-boot.actuator.v3+json'], 'condition': 'or'}],
+    },
+    {
+        "id": 'springboot-threaddump', "name": 'Detect Springboot Thread Dump page',
+        "severity": 'low', "path": '/threaddump',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Detect Springboot Thread Dump page (ported from nuclei template http/misconfiguration/springboot/springboot-threaddump.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['"threads":', '"threadName":', 'application/vnd.spring-boot.actuator', 'application/vnd.spring-boot.actuator.v2+json', 'application/vnd.spring-boot.actuator.v1+json'], 'condition': 'or'}],
+    },
+    {
+        "id": 'token-json', "name": 'Token Json File Disclosure',
+        "severity": 'low', "path": '/token.json',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Token Json File Disclosure (ported from nuclei template http/exposures/files/token-json.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['"access_token":', '"token_type":'], 'condition': 'or'}],
+    },
+    {
+        "id": 'ruijie-phpinfo', "name": 'Ruijie Phpinfo Configuration - Detect',
+        "severity": 'low', "path": '/tool/view/phpinfo.view.php',
+        "matchers_condition": "and", "origin": "nuclei",
+        "description": 'Ruijie Phpinfo Configuration - Detect (ported from nuclei template http/exposures/configs/ruijie-phpinfo.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['PHP Version', 'PHP Extension'], 'condition': 'or'}],
+    },
+]
+
+
+def _run_vuln_rules(domain, base_sigs=None, timeout=7, brand=None):
+    """
+    Execute the rule playbook against a target, nuclei-style.
+    Every rule requires product + vulnerability evidence, so a generic
+    catch-all/soft-404 page cannot satisfy it.
+    """
+    if not HAS_REQUESTS:
+        return []
+    H = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+         "Accept": "*/*"}
+    findings = []
+    _lk = __import__("threading").Lock()
+
+    def run(rule):
+        for scheme in ("https", "http"):
+            url = f"{scheme}://{domain}{rule['path']}"
+            try:
+                r = requests.get(url, headers=H, timeout=timeout,
+                                 verify=False, allow_redirects=False)
+            except Exception:
+                continue
+            if base_sigs and _is_catchall(r, base_sigs):
+                return
+            if _looks_soft_404(r):
+                return
+            # The site's own routing/search page answering for this path is not
+            # product evidence (e.g. GitHub serves "phpMyAdmin · GitHub" for
+            # /phpmyadmin/). We test for the *site brand* rather than a bare path
+            # echo, because for real products the path and the product name are
+            # legitimately the same (phpinfo.php → "phpinfo()").
+            if _is_site_own_page(r, brand):
+                return
+            # Scrub the requested path so product matchers can't match the URL
+            # echoed back. Only whole-path forms and long segments are removed —
+            # scrubbing short tokens (e.g. "php" from /phpinfo.php) would also
+            # destroy legitimate body text such as "PHP Version".
+            from urllib.parse import quote as _q
+            p = rule["path"]
+            scrub = {p, p.strip("/"), _q(p), p.lower(), domain}
+            for seg in p.strip("/").split("/"):
+                if len(seg) >= 8:
+                    scrub.add(seg)
+            scrub = {s for s in scrub if s and len(s) >= 5}
+            if _eval_rule(r, rule, scrub):
+                with _lk:
+                    findings.append({
+                        "name": rule["name"],
+                        "severity": rule["severity"],
+                        "path": rule["path"],
+                        "url": url,
+                        "status": r.status_code,
+                        "size": len(r.content),
+                        "description": rule.get("description", ""),
+                        "rule_id": rule["id"],
+                        "source": "rule_playbook",
+                    })
+            return
+
+    all_rules = VULN_RULES + [r for r in VULN_RULES_EXTENDED
+                              if r["path"] not in {x["path"] for x in VULN_RULES}]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=25) as ex:
+        list(ex.map(run, all_rules))
+    return findings
+
+
+def _page_title(r, n=200_000):
+    """
+    Return the <title> (and first <h1>) text of a response.
+
+    The window is large because real pages often carry a huge <head> full of
+    preload/meta tags before the title — GitHub's sits ~17 KB in, so a small
+    window silently returned nothing and defeated the echo checks.
+    """
+    import re as _re
+    try:
+        head = (r.text or "")[:n]
+    except Exception:
+        return ""
+    out = []
+    for pat in (r'<title[^>]*>(.{0,200}?)</title>', r'<h1[^>]*>(.{0,200}?)</h1>'):
+        m = _re.search(pat, head, _re.I | _re.S)
+        if m:
+            out.append(_re.sub(r'<[^>]+>', ' ', m.group(1)))
+    return " ".join(out).strip()
+
+
+def _echoes_path(r, path):
+    """
+    True if the page merely reflects the requested path back at us.
+
+    Sites with catch-all routing (search pages, SPAs, CMS 'did you mean'
+    handlers) answer /phpmyadmin/ with a 200 page titled "phpMyAdmin · Site".
+    Matching a product name in that page is a false positive — the product is
+    not installed, the path is just being echoed.
+    """
+    title = _page_title(r).lower()
+    if not title:
+        return False
+    for seg in (path or "").strip("/").replace(".", "/").split("/"):
+        seg = seg.strip().lower()
+        if len(seg) >= 4 and seg in title:
+            return True
+    return False
+
+
+def _site_brand(domain, homepage_resp=None):
+    """Brand token from the homepage <title>, used to spot the site's own pages."""
+    if homepage_resp is not None:
+        t = _page_title(homepage_resp)
+        if t:
+            import re as _re
+            parts = [p.strip() for p in _re.split(r'[·|\-–—:]', t) if p.strip()]
+            if parts:
+                cand = min(parts, key=len)
+                if 3 <= len(cand) <= 30:
+                    return cand.lower()
+    return (domain.split(".")[0] or "").lower()
+
+
+def _is_site_own_page(r, brand):
+    """
+    True if the response is one of the site's own templated pages.
+
+    If a probe for /phpmyadmin/ returns a page whose title carries the site's
+    brand ("phpMyAdmin · GitHub"), it is the target's own routing/search page,
+    not an exposed third-party product.
+    """
+    if not brand or len(brand) < 3:
+        return False
+    return brand in _page_title(r).lower()
+
+
+def _looks_soft_404(r):
+    """
+    True if a 200-OK response is really a 'not found' page.
+
+    Many sites (SPAs, e-commerce platforms, custom error handlers) answer every
+    unknown path with HTTP 200 and a friendly 404 page. Without this check a
+    scanner treats those as real hits — the classic cause of phantom findings.
+    """
+    try:
+        if r.status_code != 200:
+            return False
+        head = (r.text or "")[:4000]
+    except Exception:
+        return False
+    import re as _re
+    NOTFOUND = (r'404|not[\s\-]?found|page (?:not found|introuvable|non trouv)|'
+                r'no s?e encontr|nicht gefunden|doesn.?t exist|does not exist|'
+                r'page unavailable|oops|sorry')
+    # Only trust prominent locations — <title> and headings — so a stray "404"
+    # somewhere in a legitimate page body never trips this.
+    for pat in (r'<title[^>]*>(.{0,120}?)</title>',
+                r'<h1[^>]*>(.{0,120}?)</h1>',
+                r'<h2[^>]*>(.{0,120}?)</h2>'):
+        for m in _re.finditer(pat, head, _re.I | _re.S):
+            if _re.search(NOTFOUND, m.group(1), _re.I):
+                return True
+    return False
+
+
+def _path_variants(path):
+    """All textual forms of a request path, so they can be scrubbed from a
+    response before matching product names (a path echo is not evidence)."""
+    out = set()
+    if not path:
+        return out
+    from urllib.parse import quote as _q
+    p = path.strip()
+    out.update({p, p.strip("/"), _q(p), _q(p).lower(), p.lower(), p.replace("/", "")})
+    for seg in p.strip("/").replace(".", "/").split("/"):
+        if len(seg) >= 3:
+            out.add(seg)
+            out.add(seg.lower())
+    return {v for v in out if len(v) >= 3}
 
 
 def _extract_version(banner, service):
@@ -774,14 +3739,34 @@ def scan_geo(domain):
 # MODULE: ROBOTS
 # ═══════════════════════════════════════════════════════════════
 
+def _get_any_scheme(domain, path, timeout=10, allow_redirects=True):
+    """
+    Fetch a path over HTTPS, falling back to HTTP, tolerating invalid certs.
+
+    Modules that hard-coded `https://` with certificate verification silently
+    returned nothing for HTTP-only hosts and for hosts with self-signed or
+    expired certificates — exactly the targets a scanner most needs to inspect.
+    """
+    if not HAS_REQUESTS:
+        return None
+    H = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"}
+    for scheme in ("https", "http"):
+        try:
+            return requests.get(f"{scheme}://{domain}{path}", timeout=timeout,
+                                headers=H, verify=False, allow_redirects=allow_redirects)
+        except Exception:
+            continue
+    return None
+
+
 def scan_robots(domain):
     results = {"robots": None, "security_txt": None, "sitemaps": []}
     if not HAS_REQUESTS:
         return results
 
     try:
-        r = requests.get(f"https://{domain}/robots.txt", timeout=10, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"})
-        if r.status_code == 200 and r.text.strip():
+        r = _get_any_scheme(domain, "/robots.txt", timeout=10)
+        if r is not None and r.status_code == 200 and r.text.strip():
             disallowed = []
             sitemaps = []
             sensitive_kw = ["admin", "login", "api", "config", "backup", "db", "private", "secret",
@@ -810,7 +3795,7 @@ def scan_robots(domain):
 
     for path in ["/.well-known/security.txt", "/security.txt"]:
         try:
-            r = requests.get(f"https://{domain}{path}", timeout=8, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"})
+            r = _get_any_scheme(domain, path, timeout=8)
             if r.status_code == 200 and "contact" in r.text.lower():
                 results["security_txt"] = {"path": path, "content": r.text[:500]}
                 break
@@ -829,42 +3814,155 @@ def scan_robots(domain):
 # probe a few random non-existent paths and record their (status, size) so real
 # scanners can suppress responses that merely echo the catch-all.
 
-def _catchall_baseline(domain, prefix="/", n=2, timeout=6):
-    """Probe random non-existent paths; return a set of (status, size_bucket) sigs."""
+def _catchall_baseline(domain, prefix="/", n=3, timeout=6):
+    """
+    Probe random non-existent paths and record how the host answers them.
+
+    Returns a dict with the observed statuses and raw body sizes. Sizes are kept
+    raw (not bucketed) because error pages usually echo the requested path back,
+    so two catch-all responses differ by a few bytes — matching therefore uses a
+    tolerance rather than an exact bucket, which previously let dozens of
+    identical 403 pages through as separate "findings".
+    """
     import random as _rnd
     import string as _s
-    sigs = set()
+    base = {"statuses": set(), "sizes": [], "redirect": False, "samples": []}
     if not HAS_REQUESTS:
-        return sigs
+        return base
+    UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"}
     for scheme in ("https", "http"):
         got = False
         for _ in range(n):
             rnd = prefix.rstrip("/") + "/" + "".join(_rnd.choices(_s.ascii_lowercase + _s.digits, k=16))
             try:
                 r = requests.get(f"{scheme}://{domain}{rnd}", timeout=timeout, verify=False,
-                                 allow_redirects=False, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"})
-                sigs.add((r.status_code, len(r.content) // 64))
-                # also record the redirect target host so www/https redirects are caught
+                                 allow_redirects=False, headers=UA)
+                base["statuses"].add(r.status_code)
+                base["sizes"].append(len(r.content))
                 if r.status_code in (301, 302, 307, 308):
-                    sigs.add((r.status_code, -1))
+                    base["redirect"] = True
+                try:
+                    base["samples"].append((r.text or "")[:600])
+                except Exception:
+                    pass
                 got = True
             except Exception:
                 pass
         if got:
             break   # one working scheme is enough
-    return sigs
+    return base
 
 
-def _is_catchall(r, sigs):
-    """True if response r matches the catch-all baseline (should be suppressed)."""
+def _is_catchall(r, base):
+    """
+    True if response r is just the host's generic answer for any path.
+
+    Matches on status + body size within a tolerance (path echoes change the
+    length slightly), or on near-identical body text.
+    """
     try:
-        if (r.status_code, len(r.content) // 64) in sigs:
+        if not base or not base.get("sizes"):
+            return False
+        if r.status_code in (301, 302, 307, 308) and base.get("redirect"):
             return True
-        if r.status_code in (301, 302, 307, 308) and (r.status_code, -1) in sigs:
-            return True
+        if r.status_code not in base["statuses"]:
+            return False
+        size = len(r.content)
+        for bs in base["sizes"]:
+            # allow the larger of 256 bytes or 15% — covers echoed paths,
+            # timestamps, request-ids and CSRF tokens in error pages
+            if abs(size - bs) <= max(256, bs * 0.15):
+                return True
+        # fall back to comparing the body text itself
+        try:
+            txt = (r.text or "")[:600]
+            for sample in base.get("samples", []):
+                if txt and sample and _similar(txt, sample) > 0.85:
+                    return True
+        except Exception:
+            pass
     except Exception:
         pass
     return False
+
+
+def _similar(a, b):
+    """Cheap similarity ratio between two short strings (0..1)."""
+    try:
+        import difflib
+        return difflib.SequenceMatcher(None, a, b).quick_ratio()
+    except Exception:
+        return 0.0
+
+
+def _body_fp(r, path=""):
+    """
+    Content fingerprint of a response, used to spot pages that are byte-for-byte
+    the same generic template. The requested path and digits are removed first so
+    a catch-all page that echoes the URL still fingerprints identically.
+    """
+    import hashlib
+    import re as _re
+    try:
+        txt = (r.text or "")[:1200]
+    except Exception:
+        return ""
+    if path:
+        for v in {path, path.strip("/")}:
+            if v and len(v) >= 3:
+                txt = txt.replace(v, " ")
+    txt = _re.sub(r'\d+', '#', txt)
+    txt = _re.sub(r'\s+', ' ', txt).strip().lower()
+    return hashlib.md5(txt.encode("utf-8", "replace")).hexdigest()
+
+
+def _drop_uniform_findings(findings, key_status="status", key_size="size", min_group=4):
+    """
+    Safety net for catch-all hosts: drop findings that are all the *same page*.
+
+    Grouping is by content fingerprint when available — grouping purely on
+    response size wrongly discarded genuine small files (a 103-byte .git/config
+    and an 85-byte .htpasswd look "uniform" by size but are entirely different
+    documents). Size grouping is only used as a fallback, and then only for a
+    large group whose sizes are nearly identical.
+    """
+    if not findings or len(findings) < min_group:
+        return findings
+
+    drop = set()
+
+    # Preferred: identical content fingerprints = one generic template page
+    fps = {}
+    for f in findings:
+        fp = f.get("body_fp")
+        if fp:
+            fps.setdefault(fp, []).append(f)
+    for fp, items in fps.items():
+        if len(items) >= min_group:
+            for f in items:
+                drop.add(id(f))
+
+    # Fallback for findings without a fingerprint: require a big group with
+    # near-identical sizes (±2%), which real, distinct files never produce.
+    unfingerprinted = [f for f in findings if not f.get("body_fp")]
+    if len(unfingerprinted) >= max(8, min_group):
+        groups = {}
+        for f in unfingerprinted:
+            st, sz = f.get(key_status), f.get(key_size)
+            if st in (None, "") or not isinstance(sz, int):
+                continue
+            groups.setdefault(st, []).append((sz, f))
+        for st, items in groups.items():
+            if len(items) < 8:
+                continue
+            sizes = sorted(s for s, _ in items)
+            median = sizes[len(sizes) // 2]
+            uniform = [f for s, f in items if abs(s - median) <= max(16, median * 0.02)]
+            if len(uniform) >= 8:
+                for f in uniform:
+                    drop.add(id(f))
+
+    return [f for f in findings if id(f) not in drop]
 
 
 def _looks_like_html(content):
@@ -1018,6 +4116,68 @@ def scan_endpoints(domain):
         ("/Dockerfile",                "Dockerfile",           "medium"),
         ("/.htpasswd",                 ".htpasswd",            "critical"),
         ("/.htaccess",                 ".htaccess",            "medium"),
+
+        # ── Additional exposures mined from the nuclei-templates repo ──
+        ("/.gem/credentials", "Ruby Gem::ConfigFile Credential - Exposure", "high"),
+        ("/.msmtprc", "Msmtp - Config Exposure", "high"),
+        ("/.remote-sync.json", "Atom Synchronization Exposure", "high"),
+        ("/collibra.properties", "Collibra Properties Exposure", "high"),
+        ("/config/databases.yml", "Symfony Database Configuration File - Detect", "high"),
+        ("/configuration.yml", "Redmine Configuration File - Detect", "high"),
+        ("/db/robomongo.json", "RoboMongo Credential - Exposure", "high"),
+        ("/kcfinder/browse.php", "KCFinder - Exposure", "high"),
+        ("/requestlogs", "ServiceStack Request Logs - Unauthenticated Access", "high"),
+        ("/sftp.json", "VSCode SFTP File Exposure", "high"),
+        ("/webapi/v1/system/accountmanage/account", "Lvmeng - UTS Disclosure", "high"),
+        ("/.claude/settings.json", "Claude Code Project Settings Exposure", "medium"),
+        ("/.coveralls.yml", "Coveralls Configuration File Exposure", "medium"),
+        ("/.git-credentials", "Git Credentials - Detect", "medium"),
+        ("/.git/", "Git Metadata Directory Exposure", "medium"),
+        ("/.htdeployment", ".htdeployment - Files Tree Cache File", "medium"),
+        ("/.php_cs.cache", "PHP-CS-Fixer Cache - File Disclosure", "medium"),
+        ("/.vscode/", "Visual Studio Code Directories - Detect", "medium"),
+        ("/Properties/launchSettings.json", "ASP.NET Launch Settings - Exposure", "medium"),
+        ("/_ignition/logs", "Laravel Ignition - Log Viewer Information Disclosure", "medium"),
+        ("/appconfigs", "Apache Pinot - Exposure", "medium"),
+        ("/appspec.yml", "Appspec YML/YAML - Detect", "medium"),
+        ("/artifactory/api/build", "JFrog Artifactory Build - Exposure", "medium"),
+        ("/azuredeploy.json", "Azure Resource Manager Template - File Exposure", "medium"),
+        ("/filezilla.xml", "Filezilla", "medium"),
+        ("/ioncube/loader-wizard.php", "ioncube Loader Wizard Disclosure", "medium"),
+        ("/issues.json", "Redmine Issues - Exposure", "medium"),
+        ("/lfm.php", "Lazy File Manager", "medium"),
+        ("/prober.php", "PHP Prober - Exposure", "medium"),
+        ("/static/shards.html", "NGINX Shards Disclosure", "medium"),
+        ("/.apdisk", "Apdisk - File Disclosure", "low"),
+        ("/.badarg.log", "Badarg Log File Exposure", "low"),
+        ("/.composer-auth.json", "Composer-auth Json File Disclosure", "low"),
+        ("/.editorconfig", "Editor Configuration File - Detect", "low"),
+        ("/.gcloudignore", "Google Cloud Ignore File Exposure", "low"),
+        ("/.mailmap", "Git Mailmap File Disclosure", "low"),
+        ("/.phpunit.result.cache", "PHPUnit Result Cache File Exposure", "low"),
+        ("/.viminfo", "Viminfo - File Disclosure", "low"),
+        ("/.vscode/launch.json", "Visual Studio Code launch.json Exposure", "low"),
+        ("/?view=log", "ZoneMinder System Log - Detect", "low"),
+        ("/Trace.axd", "ASP.NET Trace.AXD - Exposure", "low"),
+        ("/Vagrantfile", "Vagrantfile Exposure", "low"),
+        ("/Wiki.jsp?page=SystemInfo", "Apache JSPWiki - User IP Enumeration", "low"),
+        ("/access.log", "Publicly accessible access-log file", "low"),
+        ("/admin/master/console/config", "Keycloak Admin Console Configuration Disclosure", "low"),
+        ("/anonymous-cli-metrics.json", "NPM Anonymous CLI Metrics Json", "low"),
+        ("/buildspec.yml", "AWS CodeBuild Build Spec - Exposure", "low"),
+        ("/cfcache.map", "Discover Cold Fusion cfcache.map Files", "low"),
+        ("/database_credentials.inc", "Database Credentials File Exposure", "low"),
+        ("/go.mod", "Go.mod Disclosure", "low"),
+        ("/google-services.json", "Google Service Json", "low"),
+        ("/hopfully404", "Google API Key", "low"),
+        ("/jsapi_ticket.json", "JsAPI Ticket Json", "low"),
+        ("/log/system.log", "ICEFlow VPN Disclosure", "low"),
+        ("/pantheon.upstream.yml", "Pantheon upstream.yml Disclosure", "low"),
+        ("/php.ini", "Php.ini File Disclosure", "low"),
+        ("/phpsysinfo/index.php?disp=bootstrap", "phpSysInfo Exposure", "low"),
+        ("/stats?json", "OpenTSDB - Detect", "low"),
+        ("/storage.yml", "Ruby on Rails storage.yml File Disclosure", "low"),
+        ("/usage/", "Webalizer Xtended Statistics Exposed", "low"),
     ]
 
     sev_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
@@ -1037,7 +4197,7 @@ def scan_endpoints(domain):
                     verify=False,
                 )
                 # Suppress catch-all responses (same as a random non-existent path)
-                if _is_catchall(r, base_sigs):
+                if _is_catchall(r, base_sigs) or _looks_soft_404(r):
                     return None
                 if r.status_code not in (404, 410, 400, 501):
                     content_len = len(r.content)
@@ -1055,6 +4215,7 @@ def scan_endpoints(domain):
                             "severity":     sev,
                             "status":       r.status_code,
                             "size":         content_len,
+                            "body_fp":      _body_fp(r, path),
                             "url":          f"{scheme}://{domain}{path}",
                             "content_type": r.headers.get("Content-Type", "")[:40],
                         }
@@ -1076,6 +4237,11 @@ def scan_endpoints(domain):
         [r for r in raw if r is not None],
         key=lambda x: (sev_order.get(x["severity"], 99), x["path"])
     )
+    # Catch-all safety net: many rows sharing one status AND the same response
+    # size are the host's single generic page, not distinct discoveries.
+    _before = len(found)
+    found = _drop_uniform_findings(found)
+    _suppressed = _before - len(found)
 
     counts = {}
     for f in found:
@@ -1084,6 +4250,7 @@ def scan_endpoints(domain):
     return {
         "total_probed":    len(ENDPOINTS),
         "total_found":     len(found),
+        "suppressed_generic": _suppressed,
         "severity_counts": counts,
         "findings":        found,
     }
@@ -2000,6 +5167,18 @@ def _nuclei_manual_checks(domain):
     # that many hosts return for every path.
     base_sigs = _catchall_baseline(domain)
 
+    # Learn the site's own brand from the homepage title. Sites with catch-all
+    # routing answer /phpmyadmin/ with their OWN page titled "phpMyAdmin · Site"
+    # — that is the site echoing the path, not an exposed product.
+    _brand = None
+    try:
+        _hp = requests.get(f"https://{domain}", timeout=8, verify=False,
+                           allow_redirects=True,
+                           headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"})
+        _brand = _site_brand(domain, _hp)
+    except Exception:
+        _brand = _site_brand(domain)
+
     def check_path(item):
         path, name, severity = item
         for scheme in ["https", "http"]:
@@ -2012,11 +5191,16 @@ def _nuclei_manual_checks(domain):
                     verify=False,
                 )
                 # Suppress catch-all / WAF responses (same as a random path)
-                if _is_catchall(r, base_sigs):
+                if _is_catchall(r, base_sigs) or _looks_soft_404(r):
                     return None
 
                 if r.status_code == 200:
                     if len(r.content) < 50:
+                        return None
+                    # An HTML page from the target's own site that merely echoes
+                    # the requested path is not an exposed asset.
+                    if _looks_like_html(r.content) and (
+                            _echoes_path(r, path) or _is_site_own_page(r, _brand)):
                         return None
                     content = r.text[:500].lower()
                     # Admin panels: require a real login page, not a homepage
@@ -2029,6 +5213,7 @@ def _nuclei_manual_checks(domain):
                     return {
                         "path": path, "name": name, "severity": severity,
                         "status": r.status_code, "size": len(r.content),
+                        "body_fp": _body_fp(r, path),
                         "url": f"{scheme}://{domain}{path}",
                         "description": f"HTTP 200 — {len(r.content)} bytes",
                     }
@@ -2039,6 +5224,7 @@ def _nuclei_manual_checks(domain):
                     return {
                         "path": path, "name": name + " (access forbidden — path may exist)",
                         "severity": demoted, "status": r.status_code, "size": len(r.content),
+                        "body_fp": _body_fp(r, path),
                         "url": f"{scheme}://{domain}{path}",
                         "description": f"HTTP {r.status_code} — access blocked (not confirmed exposed)",
                     }
@@ -2070,6 +5256,7 @@ def _nuclei_manual_checks(domain):
         [r for r in results if r is not None],
         key=lambda x: severity_order.get(x["severity"], 99)
     )
+    findings = _drop_uniform_findings(findings)
 
     counts = {}
     for f in findings:
@@ -2092,12 +5279,34 @@ def _nuclei_manual_checks(domain):
         s = rf.get("severity", "info")
         counts[s] = counts.get(s, 0) + 1
 
+    # ── Rule playbook (nuclei-style matchers) ──
+    # Each rule requires product identification AND vulnerability evidence, so
+    # these are the highest-confidence findings in the report.
+    try:
+        rule_sigs = _catchall_baseline(domain)
+        rule_findings = _run_vuln_rules(domain, rule_sigs, brand=_brand)
+    except Exception:
+        rule_findings = []
+    # Prefer a validated rule hit over a generic path-list hit for the same path
+    rule_paths = {f.get("path") for f in rule_findings}
+    if rule_paths:
+        removed = [f for f in findings if f.get("path") in rule_paths]
+        for f in removed:
+            s = f.get("severity", "info")
+            counts[s] = max(0, counts.get(s, 0) - 1)
+        findings = [f for f in findings if f.get("path") not in rule_paths]
+    for rf in rule_findings:
+        findings.append(rf)
+        s = rf.get("severity", "info")
+        counts[s] = counts.get(s, 0) + 1
+
     findings.sort(key=lambda x: {"critical":0,"high":1,"medium":2,"low":3,"info":4}.get(x.get("severity","info"),5))
 
     return {
         "total": len(findings),
         "severity_counts": counts,
         "findings": findings,
+        "rules_run": len(VULN_RULES) + len(VULN_RULES_EXTENDED),
         "source": "manual_checks",
     }
 
@@ -2130,6 +5339,18 @@ def _nuclei_recent_cve_checks(domain):
     # product-name matches fire on every check. Suppress those.
     base_sigs = _catchall_baseline(domain)
 
+    # Homepage baseline — SPAs and catch-all vhosts serve the SAME index page for
+    # every unknown path. If a probe returns (almost) the homepage, the path does
+    # not really exist, so nothing found in it counts as evidence.
+    _home = {"size": -1, "text": ""}
+    try:
+        _hr = requests.get(f"https://{domain}", headers=H, timeout=6,
+                           verify=False, allow_redirects=True)
+        _home["size"] = len(_hr.content)
+        _home["text"] = (_hr.text or "")[:4000]
+    except Exception:
+        pass
+
     def fetch(path, port=None, timeout=6, method="GET"):
         for sch in ("https", "http"):
             host = f"{sch}://{domain}" + (f":{port}" if port else "")
@@ -2139,8 +5360,12 @@ def _nuclei_recent_cve_checks(domain):
                        verify=False, allow_redirects=False)
                 try:
                     _tls.size = len(r.content)
-                    _tls.generic = _is_catchall(r, base_sigs)
                     _tls.path = path
+                    _tls.generic = (
+                        _is_catchall(r, base_sigs)
+                        or _looks_soft_404(r)
+                        or _same_as_homepage(r)
+                    )
                 except Exception:
                     _tls.size = ""; _tls.generic = False; _tls.path = ""
                 return r, host
@@ -2148,8 +5373,20 @@ def _nuclei_recent_cve_checks(domain):
                 continue
         return None, None
 
+    def _same_as_homepage(r):
+        """True if this response is just the homepage served for an unknown path."""
+        try:
+            if _home["size"] < 0 or r.status_code != 200:
+                return False
+            if abs(len(r.content) - _home["size"]) <= max(64, _home["size"] * 0.02):
+                return True
+            a, b = (r.text or "")[:1500], _home["text"][:1500]
+            return bool(a) and a == b
+        except Exception:
+            return False
+
     def rec(name, severity, cve, url, description, size=None):
-        # Skip anything derived from a catch-all / error page.
+        # Skip anything derived from a catch-all / soft-404 / homepage response.
         if getattr(_tls, "generic", False):
             return
         findings.append({
@@ -2159,16 +5396,49 @@ def _nuclei_recent_cve_checks(domain):
             "source": "recent_cve",
         })
 
+    def usable(r):
+        """A response is usable as evidence only if it exists, isn't a
+        catch-all/soft-404/homepage echo, and carries real content."""
+        if r is None:
+            return False
+        if getattr(_tls, "generic", False):
+            return False
+        try:
+            if r.status_code >= 500 or len(r.content) < 40:
+                return False
+        except Exception:
+            return False
+        return True
+
+    def evidence(r, n=4000):
+        """Headers + body with every form of the requested path scrubbed out, so
+        a server echoing the URL can never be mistaken for the product itself.
+        (This is what previously caused phantom 'Wazuh'/'Fortinet' findings:
+        a redirect Location or 404 page repeating /app/wazuh or /remote/login.)"""
+        try:
+            txt = (r.text or "")[:n]
+        except Exception:
+            txt = ""
+        hdr = hdrs(r)
+        blob = hdr + " " + txt
+        for variant in _path_variants(getattr(_tls, "path", "")):
+            blob = blob.replace(variant, " ")
+            blob = blob.replace(variant.upper(), " ")
+        # also scrub the domain itself (e.g. wazuh-shop.com must not match "wazuh")
+        blob = blob.replace(domain, " ")
+        base = domain.split(".")[0]
+        if len(base) >= 3:
+            blob = blob.replace(base, " ")
+        return blob.lower()
+
     def body(r, n=4000):
-        # Strip the requested path so error pages that echo it don't trigger
-        # product-name matches (e.g. "/goanywhere/" printed in a 404 page).
+        # Kept for callers that only need the (path-scrubbed) body text.
         try:
             txt = (r.text or "")[:n]
         except Exception:
             return ""
-        p = getattr(_tls, "path", "") or ""
-        if p and len(p) > 3:
-            txt = txt.replace(p, " ").replace(p.strip("/"), " ")
+        for variant in _path_variants(getattr(_tls, "path", "")):
+            txt = txt.replace(variant, " ")
         return txt
 
     def hdrs(r):
@@ -2217,18 +5487,21 @@ def _nuclei_recent_cve_checks(domain):
 
     # ── CVE-2025-64446 · Fortinet FortiWeb / FortiOS management exposure ──
     def c_fortinet():
-        for path in ("/remote/login", "/login", "/"):
+        for path in ("/remote/login", "/login"):
             r, host = fetch(path, timeout=5)
-            if r is None:
+            if not usable(r):
                 continue
-            blob = (hdrs(r) + body(r, 3000)).lower()
+            blob = evidence(r, 3000)
             if "fortiweb" in blob:
                 rec("FortiWeb Management Exposed", "high", "CVE-2025-64446",
                     host + path,
                     "FortiWeb interface exposed. Verify patch for the actively-exploited "
                     "authentication bypass / path traversal (CISA KEV)")
                 return
-            if "fortigate" in blob or "fortinet" in blob or "/remote/login" in blob:
+            # Require an explicit Fortinet product string. A path echo such as
+            # "/remote/login" appearing in a redirect Location or error page is
+            # NOT evidence — that produced false positives on ordinary sites.
+            if "fortigate" in blob or "fortios" in blob or "fortinet" in blob:
                 rec("Fortinet Portal Exposed", "medium", "FORTI-KEV",
                     host + path,
                     "Fortinet SSL-VPN / management portal exposed. Review against recent FortiOS "
@@ -2240,7 +5513,14 @@ def _nuclei_recent_cve_checks(domain):
         for path, prod in (("/mifs/login.jsp", "Ivanti EPMM (MobileIron)"),
                            ("/dana-na/auth/url_default/welcome.cgi", "Ivanti Connect Secure")):
             r, host = fetch(path, timeout=5)
-            if r is not None and r.status_code in (200, 302, 401, 403):
+            if not usable(r):
+                continue
+            blob = evidence(r, 3000)
+            # A bare status code proves nothing — require an Ivanti product string.
+            if not any(k in blob for k in ("ivanti", "mobileiron", "mifs", "pulse secure",
+                                           "dana-na", "connect secure", "welcome.cgi")):
+                continue
+            if True:
                 cve = "CVE-2025-4427/4428" if "EPMM" in prod else "CVE-2025-22457"
                 rec(f"{prod} Exposed", "high", cve, host + path,
                     f"{prod} endpoint reachable. Verify patch level — recent Ivanti RCE/auth "
@@ -2251,9 +5531,8 @@ def _nuclei_recent_cve_checks(domain):
     def c_paloalto():
         for path in ("/global-protect/login.esp", "/php/login.php"):
             r, host = fetch(path, timeout=5)
-            if r is not None and ("globalprotect" in body(r, 3000).lower()
-                                  or "pan-os" in (hdrs(r)+body(r,2000)).lower()
-                                  or r.status_code in (200, 302)):
+            if usable(r) and any(k in evidence(r, 3000) for k in
+                                 ("globalprotect", "global-protect", "pan-os", "palo alto")):
                 rec("Palo Alto PAN-OS / GlobalProtect Exposed", "high", "CVE-2025-0108",
                     host + path,
                     "PAN-OS management / GlobalProtect portal exposed. Verify patch for the "
@@ -2263,7 +5542,7 @@ def _nuclei_recent_cve_checks(domain):
     # ── CVE-2025-31161 · CrushFTP authentication bypass (KEV) ──
     def c_crushftp():
         r, host = fetch("/WebInterface/login.html", timeout=5)
-        if r is not None and "crushftp" in (hdrs(r) + body(r, 3000)).lower():
+        if usable(r) and "crushftp" in evidence(r, 3000):
             rec("CrushFTP Web Interface Exposed", "high", "CVE-2025-31161",
                 host + "/WebInterface/login.html",
                 "CrushFTP admin interface exposed. Verify patch for the unauthenticated "
@@ -2284,7 +5563,9 @@ def _nuclei_recent_cve_checks(domain):
     def c_sap():
         path = "/developmentserver/metadatauploader"
         r, host = fetch(path, timeout=6)
-        if r is not None and r.status_code in (200, 405, 500):
+        if usable(r) and r.status_code in (200, 405) and any(
+                k in evidence(r, 3000) for k in ("sap", "netweaver", "visual composer",
+                                                 "j2ee", "metadatauploader", "com.sap")):
             rec("SAP NetWeaver Visual Composer Endpoint Exposed", "critical",
                 "CVE-2025-31324", host + path,
                 "The Visual Composer metadata-uploader endpoint is reachable. This is the "
@@ -2325,8 +5606,10 @@ def _nuclei_recent_cve_checks(domain):
             r, host = fetch(path, timeout=5)
             if r is None:
                 continue
+            if not usable(r):
+                continue
             blob = body(r, 4000)
-            if "roundcube" in (hdrs(r) + blob).lower():
+            if "roundcube" in evidence(r, 4000):
                 m = _re.search(r'([\d]+\.[\d]+\.[\d]+)', blob)
                 ver = m.group(1) if m else "unknown"
                 rec(f"Roundcube Webmail Detected ({ver})", "high", "CVE-2025-49113",
@@ -2352,8 +5635,12 @@ def _nuclei_recent_cve_checks(domain):
     def c_aem():
         for path in ("/etc.clientlibs/", "/system/console", "/libs/granite/core/content/login.html"):
             r, host = fetch(path, timeout=5)
-            if r is not None and ("adobe experience manager" in body(r, 3000).lower()
-                                  or "cq-" in hdrs(r).lower() or "granite" in body(r, 3000).lower()):
+            # "aem" alone is far too short a token — it matches ordinary words
+            # on unrelated sites. Require an unambiguous AEM fingerprint.
+            if usable(r) and any(k in evidence(r, 3000) for k in
+                                 ("adobe experience manager", "/etc/clientlibs",
+                                  "granite.csrf", "cq-editor", "day-servlet",
+                                  "/libs/granite", "adobedtm")):
                 rec("Adobe Experience Manager Exposed", "high", "CVE-2025-54253/54251",
                     host + path,
                     "AEM fingerprinted. Verify patch for the AEM Forms misconfiguration / "
@@ -2364,7 +5651,8 @@ def _nuclei_recent_cve_checks(domain):
     def c_oracle_ebs():
         for path in ("/OA_HTML/AppsLogin", "/OA_HTML/AppsLocalLogin.jsp"):
             r, host = fetch(path, timeout=5)
-            if r is not None and r.status_code in (200, 302) and "oracle" in (hdrs(r)+body(r,2000)).lower():
+            if usable(r) and r.status_code in (200, 302) and any(
+                    k in evidence(r, 2500) for k in ("oracle", "e-business", "ebs", "apps login")):
                 rec("Oracle E-Business Suite Exposed", "critical", "CVE-2025-61882",
                     host + path,
                     "Oracle EBS login exposed. Verify the October 2025 emergency patch for the "
@@ -2399,7 +5687,8 @@ def _nuclei_recent_cve_checks(domain):
     # ── CVE-2025-30208 · Vite dev server exposed in production ──
     def c_vite():
         r, host = fetch("/@vite/client", timeout=5)
-        if r is not None and r.status_code == 200 and "vite" in body(r, 2000).lower():
+        if usable(r) and r.status_code == 200 and "vite" in evidence(r, 2500) \
+           and any(k in evidence(r, 2500) for k in ("hmr", "import", "createhotcontext", "__vite")):
             rec("Vite Dev Server Exposed", "high", "CVE-2025-30208",
                 host + "/@vite/client",
                 "A Vite development server is exposed publicly. Dev servers before the fix are "
@@ -2410,7 +5699,7 @@ def _nuclei_recent_cve_checks(domain):
     def c_langflow():
         for path in ("/api/v1/version", "/health"):
             r, host = fetch(path, timeout=5)
-            if r is not None and "langflow" in (hdrs(r) + body(r, 2000)).lower():
+            if usable(r) and "langflow" in evidence(r, 2500):
                 rec("Langflow Exposed", "critical", "CVE-2025-3248", host + path,
                     "Langflow instance exposed. Versions before 1.3.0 have an unauthenticated "
                     "code-execution flaw in the /validate/code endpoint (CISA KEV)")
@@ -2419,10 +5708,16 @@ def _nuclei_recent_cve_checks(domain):
     # ── CVE-2025-24016 · Wazuh dashboard/server RCE ──
     def c_wazuh():
         r, host = fetch("/app/wazuh", timeout=5)
-        if r is None:
-            r, host = fetch("/", timeout=5)
-        if r is not None and "wazuh" in (hdrs(r) + body(r, 3000)).lower():
-            rec("Wazuh Dashboard Exposed", "high", "CVE-2025-24016", host + "/",
+        if not usable(r):
+            return
+        blob = evidence(r, 3000)
+        # "wazuh" must appear in the response itself — not merely echoed back
+        # from the requested path (evidence() scrubs the path), and the page
+        # must look like the actual dashboard.
+        if "wazuh" in blob and any(k in blob for k in
+                                   ("kibana", "opensearch", "elastic", "dashboard",
+                                    "wazuh-app", "app/wazuh", "wzd", "security information")):
+            rec("Wazuh Dashboard Exposed", "high", "CVE-2025-24016", host + "/app/wazuh",
                 "Wazuh fingerprinted. Versions 4.4.0–4.9.0 are affected by an unsafe "
                 "deserialization RCE in the server API — verify patch level")
 
@@ -2470,8 +5765,14 @@ def _nuclei_exploit_templates(domain):
     UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
     HEADERS = {"User-Agent": UA, "Accept": "*/*"}
 
+    # Fingerprint hosts that answer every path with the same page, so a probe
+    # against a non-existent path can't be mistaken for a real exposure.
+    _ex_sigs = _catchall_baseline(domain)
+
     def probe(path, method="GET", data=None, extra_headers=None, timeout=6, schemes=None):
-        """Single HTTP probe, returns (response, base_url) or (None, None)."""
+        """Single HTTP probe, returns (response, base_url) or (None, None).
+        Responses that are catch-all pages or soft-404s (HTTP 200 whose body
+        says 'not found') are rejected — they are not evidence of anything."""
         for base in (schemes or [base_https, base_http]):
             try:
                 h = dict(HEADERS)
@@ -2487,6 +5788,8 @@ def _nuclei_exploit_templates(domain):
                     _tls.size = len(r.content)
                 except Exception:
                     _tls.size = ""
+                if path not in ("", "/") and (_is_catchall(r, _ex_sigs) or _looks_soft_404(r)):
+                    return None, None
                 return r, base
             except Exception:
                 pass
@@ -4798,6 +8101,78 @@ def scan_cloud_buckets(domain):
 # ═══════════════════════════════════════════════════════════════════
 # MODULE: JS FILE SECRET SCANNER
 # ═══════════════════════════════════════════════════════════════════
+def _plausible_secret(value, secret_type=""):
+    """
+    Reject obvious non-secrets so a wider scan doesn't drown the real hits.
+
+    Filters out documentation placeholders ("YOUR_API_KEY", "xxxxx"), template
+    variables ({{key}}, ${env.KEY}, process.env.X) and low-entropy strings —
+    minified bundles are full of 32-char hashes that otherwise match generic
+    patterns like the Twilio SID or Mailgun key formats.
+    """
+    if not value:
+        return False
+    v = value.strip().strip('"\'')
+    if len(v) < 8:
+        return False
+    low = v.lower()
+
+    import math
+
+    def entropy_of(s):
+        counts = {}
+        for ch in s:
+            counts[ch] = counts.get(ch, 0) + 1
+        return -sum((c / len(s)) * math.log2(c / len(s)) for c in counts.values())
+
+    # Prefixed, self-identifying tokens (AKIA…, ghp_…, sk_live_…, glpat-…) are
+    # unambiguous by construction, so they are checked first and only against
+    # blatant placeholders — a strict substring filter would otherwise discard
+    # perfectly valid keys that happen to contain a common letter run.
+    STRONG_PREFIX = ("AKIA", "ghp_", "gho_", "ghs_", "ghu_", "ghr_", "glpat-",
+                     "sk_live_", "sk_test_", "rk_live_", "xox", "SG.", "shppa_",
+                     "shpss_", "AIza", "ya29.", "eyJ", "sk-", "sq0atp-", "sq0csp-",
+                     "-----BEGIN", "npm_", "dop_v1_", "hvs.", "ATATT", "hf_")
+    OBVIOUS = ("your", "example", "placeholder", "changeme", "redacted",
+               "xxxx", "yyyy", "dummy", "insert", "<your", "notreal")
+    if any(v.startswith(p) for p in STRONG_PREFIX):
+        if any(p in low for p in OBVIOUS):
+            return False
+        return entropy_of(v) >= 2.0
+
+    PLACEHOLDERS = (
+        "your", "example", "sample", "placeholder", "changeme", "change_me",
+        "insert", "dummy", "test_key", "testkey", "fake", "xxxx", "yyyy", "zzzz",
+        "aaaa", "1234567", "abcdef", "none", "null", "undefined", "todo",
+        "redacted", "hidden", "removed", "notreal", "my_", "lorem",
+    )
+    if any(p in low for p in PLACEHOLDERS):
+        return False
+    # template / env-var references, not literal values
+    if any(t in v for t in ("{{", "}}", "${", "<%", "%>", "process.env", "os.environ",
+                            "getenv", "import.meta.env", "REACT_APP_", "VITE_")):
+        return False
+    if v.startswith(("$", "%", "#{", "@")):
+        return False
+    # a single repeated character, or too few distinct characters
+    if len(set(v)) <= 3:
+        return False
+
+    # Connection strings / URLs are meaningful as-is
+    if "://" in v:
+        return True
+
+    entropy = entropy_of(v)
+    # Generic catches (API Key, Secret Key, Auth Token, Twilio SID…) must look
+    # genuinely random to survive.
+    if entropy < 3.2:
+        return False
+    # pure lowercase hex of exactly 32 chars is usually an asset/build hash
+    if len(v) == 32 and all(c in "0123456789abcdef" for c in low):
+        return False
+    return True
+
+
 def scan_js_secrets(domain):
     """
     Scans JS files linked from the homepage for hardcoded secrets.
@@ -4867,6 +8242,42 @@ def scan_js_secrets(domain):
         # ── Shopify ───────────────────────────────────────────────────
         (_re.compile(r'shppa_[a-fA-F0-9]{32}'),                                                                 "Shopify Private App Key", "critical"),
         (_re.compile(r'shpss_[a-fA-F0-9]{32}'),                                                                 "Shopify Shared Secret",   "critical"),
+        # ── AI / LLM providers ────────────────────────────────────────
+        (_re.compile(r'sk-[A-Za-z0-9]{20}T3BlbkFJ[A-Za-z0-9]{20}'),                                             "OpenAI API Key",          "critical"),
+        (_re.compile(r'sk-proj-[A-Za-z0-9_\-]{20,}'),                                                           "OpenAI Project Key",      "critical"),
+        (_re.compile(r'sk-ant-api\d{2}-[A-Za-z0-9_\-]{20,}'),                                                   "Anthropic API Key",       "critical"),
+        (_re.compile(r'(?i)hf_[A-Za-z0-9]{34}'),                                                                "HuggingFace Token",       "high"),
+        # ── GitLab / Atlassian / npm / packages ───────────────────────
+        (_re.compile(r'glpat-[A-Za-z0-9_\-]{20}'),                                                              "GitLab Personal Token",   "critical"),
+        (_re.compile(r'npm_[A-Za-z0-9]{36}'),                                                                   "npm Access Token",        "critical"),
+        (_re.compile(r'ATATT[A-Za-z0-9_\-=]{20,}'),                                                             "Atlassian API Token",     "critical"),
+        (_re.compile(r'dop_v1_[a-f0-9]{64}'),                                                                   "DigitalOcean Token",      "critical"),
+        (_re.compile(r'hvs\.[A-Za-z0-9_\-]{20,}'),                                                              "HashiCorp Vault Token",   "critical"),
+        # ── Supabase / Algolia / Mapbox / Cloudinary / Airtable ───────
+        (_re.compile(r'(?i)supabase[._\-]?(?:anon|service[._\-]?role)?[._\-]?key\s*[:=]\s*["\']([A-Za-z0-9._\-]{30,})["\']'), "Supabase Key", "high"),
+        (_re.compile(r'(?i)algolia[._\-]?(?:admin|api)?[._\-]?key\s*[:=]\s*["\']([A-Za-z0-9]{32})["\']'),      "Algolia API Key",         "high"),
+        (_re.compile(r'sk\.eyJ[A-Za-z0-9_\-]{20,}\.[A-Za-z0-9_\-]{20,}'),                                       "Mapbox Secret Token",     "critical"),
+        (_re.compile(r'cloudinary://[0-9]{10,}:[A-Za-z0-9_\-]{20,}@[A-Za-z0-9_\-]+'),                           "Cloudinary URL",          "critical"),
+        (_re.compile(r'(?i)airtable[._\-]?api[._\-]?key\s*[:=]\s*["\'](key[A-Za-z0-9]{14})["\']'),             "Airtable API Key",        "high"),
+        (_re.compile(r'pat[A-Za-z0-9]{14}\.[a-f0-9]{64}'),                                                      "Airtable PAT",            "critical"),
+        # ── Payments ──────────────────────────────────────────────────
+        (_re.compile(r'sq0atp-[A-Za-z0-9_\-]{22}'),                                                             "Square Access Token",     "critical"),
+        (_re.compile(r'sq0csp-[A-Za-z0-9_\-]{43}'),                                                             "Square OAuth Secret",     "critical"),
+        (_re.compile(r'access_token\$production\$[a-z0-9]{16}\$[a-f0-9]{32}'),                                  "Braintree Token",         "critical"),
+        # ── Messaging / bots ──────────────────────────────────────────
+        (_re.compile(r'\d{9,10}:AA[A-Za-z0-9_\-]{33}'),                                                         "Telegram Bot Token",      "high"),
+        (_re.compile(r'https://discord(?:app)?\.com/api/webhooks/\d+/[A-Za-z0-9_\-]+'),                         "Discord Webhook",         "high"),
+        (_re.compile(r'(?i)twilio[._\-]?auth[._\-]?token\s*[:=]\s*["\']([a-f0-9]{32})["\']'),                  "Twilio Auth Token",       "critical"),
+        # ── Monitoring / infra ────────────────────────────────────────
+        (_re.compile(r'https://[a-f0-9]{32}@[a-z0-9.\-]*sentry\.io/\d+'),                                       "Sentry DSN (with key)",   "medium"),
+        (_re.compile(r'(?i)datadog[._\-]?api[._\-]?key\s*[:=]\s*["\']([a-f0-9]{32})["\']'),                    "Datadog API Key",         "high"),
+        (_re.compile(r'(?i)new[._\-]?relic[._\-]?(?:license|api)[._\-]?key\s*[:=]\s*["\']([A-Za-z0-9]{40})["\']'), "New Relic Key",       "high"),
+        # ── Azure / cloud storage ─────────────────────────────────────
+        (_re.compile(r'DefaultEndpointsProtocol=https;AccountName=[A-Za-z0-9]+;AccountKey=[A-Za-z0-9+/=]{80,}'), "Azure Storage Key",      "critical"),
+        (_re.compile(r'(?i)"type"\s*:\s*"service_account"'),                                                    "GCP Service Account JSON","critical"),
+        (_re.compile(r'(?i)sas[._\-]?token\s*[:=]\s*["\'](sv=[^"\']{20,})["\']'),                              "Azure SAS Token",         "high"),
+        # ── Basic auth in URLs ────────────────────────────────────────
+        (_re.compile(r'https?://[A-Za-z0-9._%\-]{2,40}:[^\s"\'@/]{4,40}@[A-Za-z0-9.\-]{3,}'),                   "Credentials in URL",      "critical"),
     ]
 
     SKIP_CDNS = [
@@ -4877,81 +8288,182 @@ def scan_js_secrets(domain):
         "newrelic", "datadog", "sentry-cdn", "bugsnag",
     ]
 
-    result = {"domain": domain, "js_files": [], "secrets": [], "total": 0}
+    result = {"domain": domain, "js_files": [], "secrets": [], "total": 0,
+              "sources": {"inline_scripts": 0, "js_files": 0, "html": 0, "chunks": 0}}
 
-    # Step 1: Fetch homepage, extract <script src> pointing to this domain
+    UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"}
+    MAX_FILES = 60
+
+    # The site's own brand token, e.g. "github" for github.com — asset hosts such
+    # as github.githubassets.com or static.shop-cdn.net belong to the target even
+    # though the netloc is not the domain itself. Only skipping the *known*
+    # third-party CDNs (rather than requiring an exact domain match) is what lets
+    # us actually reach a modern site's real application bundles.
+    brand = domain.split(".")[0].lower()
+
+    def is_first_party(netloc):
+        if not netloc:
+            return True
+        nl = netloc.lower()
+        if any(c in nl for c in SKIP_CDNS):
+            return False
+        if domain in nl or nl.endswith("." + domain):
+            return True
+        if len(brand) >= 4 and brand in nl:
+            return True          # github.githubassets.com, corp-cdn.net, …
+        if any(nl.startswith(p) for p in ("assets.", "static.", "cdn.", "js.", "media.")):
+            return True
+        return False
+
+    def absolutise(url, scheme, base_netloc=None):
+        url = url.strip()
+        if url.startswith("//"):
+            return "https:" + url
+        if url.startswith(("http://", "https://")):
+            return url
+        if url.startswith("/"):
+            return f"{scheme}://{base_netloc or domain}{url}"
+        return f"{scheme}://{base_netloc or domain}/" + url.lstrip("./")
+
+    sources = []          # (label, text) pairs that get scanned
     js_urls = set()
+
+    # ── Step 1: homepage — scan the HTML itself, every inline script, and
+    #    collect JS from <script src>, <link rel=preload/modulepreload>, and
+    #    plain "....js" strings in the markup. ─────────────────────────────
+    html, used_scheme = None, "https"
     for scheme in ["https", "http"]:
         try:
-            resp = requests.get(
-                f"{scheme}://{domain}", timeout=7, verify=False,
-                allow_redirects=True,
-                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"}
-            )
-            if resp.status_code == 200:
-                for m in _re.finditer(
-                    r'<script[^>]+src=["\']([^"\'> ]+)["\']', resp.text, _re.I
-                ):
-                    url = m.group(1).strip()
-                    if any(c in url.lower() for c in SKIP_CDNS):
-                        continue
-                    if url.startswith("//"):
-                        url = f"https:{url}"
-                    elif url.startswith("/"):
-                        url = f"{scheme}://{domain}{url}"
-                    elif not url.startswith("http"):
-                        url = f"{scheme}://{domain}/{url}"
-                    parsed = _up.urlparse(url)
-                    if domain in parsed.netloc or not parsed.netloc:
-                        js_urls.add(url)
+            resp = requests.get(f"{scheme}://{domain}", timeout=9, verify=False,
+                                allow_redirects=True, headers=UA)
+            if resp.status_code == 200 and resp.text:
+                html, used_scheme = resp.text, scheme
                 break
         except Exception:
             continue
 
-    if not js_urls:
-        result["error"] = "No first-party JS files found on homepage"
+    if html:
+        sources.append(("(homepage HTML)", html[:800_000]))
+        result["sources"]["html"] = 1
+
+        # inline <script> blocks — a very common home for config objects
+        for m in _re.finditer(r'(?is)<script(?![^>]*\bsrc=)[^>]*>(.*?)</script>', html):
+            blk = m.group(1)
+            if blk and blk.strip():
+                result["sources"]["inline_scripts"] += 1
+                sources.append((f"(inline script #{result['sources']['inline_scripts']})",
+                                blk[:400_000]))
+
+        # <script src>, preloaded modules, and any bare .js reference
+        patterns = [
+            r'<script[^>]+src=["\']([^"\'> ]+)["\']',
+            r'<link[^>]+(?:rel=["\'](?:modulepreload|preload)["\'][^>]*)href=["\']([^"\']+\.m?js[^"\']*)["\']',
+            r'<link[^>]+href=["\']([^"\']+\.m?js[^"\']*)["\'][^>]*rel=["\'](?:modulepreload|preload)["\']',
+            r'["\'](/[^"\'<>\s]+\.m?js(?:\?[^"\'<>\s]{0,60})?)["\']',
+        ]
+        for pat in patterns:
+            for m in _re.finditer(pat, html, _re.I):
+                raw = m.group(1).strip()
+                if not raw or any(c in raw.lower() for c in SKIP_CDNS):
+                    continue
+                u = absolutise(raw, used_scheme)
+                if is_first_party(_up.urlparse(u).netloc):
+                    js_urls.add(u)
+
+    if not js_urls and not sources:
+        result["error"] = "Homepage unreachable — nothing to scan"
         return result
 
-    result["js_files"] = list(js_urls)
+    # ── Step 2: fetch the JS files, then follow one level of webpack/Vite
+    #    chunk references found inside them (that is where SPA secrets live). ──
     _lock = _thr.Lock()
+    fetched = set()
 
-    # Step 2: Fetch each JS file IN MEMORY — scan for secrets — clear text output
-    def scan_file(js_url):
+    def fetch_js(u, collect_chunks=False):
+        if u in fetched or len(fetched) >= MAX_FILES:
+            return []
+        fetched.add(u)
         try:
-            resp = requests.get(
-                js_url, timeout=8, verify=False,
-                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"}
-            )
-            if resp.status_code != 200:
-                return
-            content = resp.text[:800_000]  # 800KB limit per file
+            r = requests.get(u, timeout=9, verify=False, headers=UA)
+            if r.status_code != 200 or not r.text:
+                return []
+            body = r.text[:800_000]
+        except Exception:
+            return []
+        with _lock:
+            sources.append((u.split("?")[0][-70:], body))
+            result["js_files"].append(u)
+        if not collect_chunks:
+            return []
+        # chunk manifests: "static/js/453.9f2a.chunk.js", "/assets/index-ab12.js"
+        found = []
+        base_netloc = _up.urlparse(u).netloc
+        for m in _re.finditer(r'["\']([\w./\-]{3,120}?\.m?js)(?:\?[\w=&.\-]{0,40})?["\']', body):
+            cand = m.group(1)
+            if any(c in cand.lower() for c in SKIP_CDNS):
+                continue
+            if not any(k in cand for k in ("chunk", "static/js", "assets/", "/js/", "bundle", "main", "vendor", "app")):
+                continue
+            cu = absolutise(cand, used_scheme, base_netloc)
+            if is_first_party(_up.urlparse(cu).netloc) and cu not in fetched:
+                found.append(cu)
+        return found[:40]
 
-            for pattern, secret_type, severity in SECRET_PATTERNS:
-                for match in pattern.finditer(content):
-                    # Extract the actual secret value — group(1) if present, else full match
-                    try:
-                        value = match.group(1) if match.lastindex and match.lastindex >= 1 else match.group(0)
-                    except Exception:
-                        value = match.group(0)
+    primary = list(js_urls)[:MAX_FILES]
+    chunk_lists = []
+    if primary:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
+            chunk_lists = list(ex.map(lambda u: fetch_js(u, True), primary))
 
-                    # Get context snippet (line where it was found)
-                    start  = content.rfind('\n', 0, match.start()) + 1
-                    end    = content.find('\n', match.end())
-                    line   = content[start:end if end > 0 else start+120].strip()[:120]
+    chunks = []
+    for lst in chunk_lists:
+        for c in lst:
+            if c not in fetched and c not in chunks:
+                chunks.append(c)
+    chunks = chunks[:max(0, MAX_FILES - len(fetched))]
+    if chunks:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
+            list(ex.map(lambda u: fetch_js(u, False), chunks))
+        result["sources"]["chunks"] = len(chunks)
 
-                    with _lock:
-                        result["secrets"].append({
-                            "type":     secret_type,
-                            "severity": severity,
-                            "value":    value.strip()[:200],   # clear text, no masking
-                            "file":     js_url.split("?")[0][-70:],
-                            "line":     line,
-                        })
+    result["sources"]["js_files"] = len(result["js_files"])
+
+    # ── Step 3: scan every collected source ─────────────────────────────────
+    def scan_text(label, content):
+        for pattern, secret_type, severity in SECRET_PATTERNS:
+            for match in pattern.finditer(content):
+                # Pick the most meaningful capture: the longest group, falling
+                # back to the whole match. (Some patterns have small optional
+                # groups such as "(\\+srv)" that must not be taken as the value.)
+                value = match.group(0)
+                try:
+                    groups = [g for g in (match.groups() or ()) if g]
+                    if groups:
+                        longest = max(groups, key=len)
+                        if len(longest) >= max(8, len(match.group(0)) // 3):
+                            value = longest
+                except Exception:
+                    pass
+                value = (value or "").strip()
+                if not _plausible_secret(value, secret_type):
+                    continue
+                start = content.rfind('\n', 0, match.start()) + 1
+                end = content.find('\n', match.end())
+                line = content[start:end if end > 0 else start + 160].strip()[:160]
+                with _lock:
+                    result["secrets"].append({
+                        "type": secret_type,
+                        "severity": severity,
+                        "value": value[:200],       # clear text, no masking
+                        "file": label,
+                        "line": line,
+                    })
+
+    for label, text in sources:
+        try:
+            scan_text(label, text)
         except Exception:
             pass
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
-        list(ex.map(scan_file, list(js_urls)[:30]))
 
     # Deduplicate: one finding per (type + value) pair
     seen, unique = set(), []
@@ -4972,6 +8484,262 @@ def scan_js_secrets(domain):
 # ═══════════════════════════════════════════════════════════════════
 # MODULE: CONTENT INTELLIGENCE (JS/HTML URL & info extractor)
 # ═══════════════════════════════════════════════════════════════════
+def scan_http_inspect(domain):
+    """
+    HTTP Inspector — the DevTools "Network" tab, headless.
+
+    Shows exactly what went out and what came back:
+      • Full request headers Kumo sent
+      • Full response headers, verbatim and in order
+      • The complete redirect chain (each hop, status, Location, timing)
+      • Cookies with their security flags (Secure / HttpOnly / SameSite)
+      • Response timing, size, protocol, final URL, TLS details
+      • Allowed HTTP methods (OPTIONS) and CORS behaviour
+      • Notable/non-standard headers a defender should look at
+
+    Detection/inspection only — plain GET/OPTIONS requests, no payloads.
+    """
+    if not HAS_REQUESTS:
+        return {"error": "requests required"}
+
+    import time as _t
+    UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+          "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")
+
+    # Only advertise content encodings we can actually decode. Claiming "br"
+    # without the brotli module means the server sends brotli-compressed bytes
+    # that requests cannot inflate — the body then reads as binary garbage.
+    _encodings = ["gzip", "deflate"]
+    try:
+        import brotli  # noqa: F401
+        _encodings.append("br")
+    except Exception:
+        try:
+            import brotlicffi  # noqa: F401
+            _encodings.append("br")
+        except Exception:
+            pass
+    try:
+        import zstandard  # noqa: F401
+        _encodings.append("zstd")
+    except Exception:
+        pass
+
+    REQ_HEADERS = {
+        "User-Agent": UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": ", ".join(_encodings),
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+    }
+    try:
+        import urllib3
+        urllib3.disable_warnings()
+    except Exception:
+        pass
+
+    result = {
+        "domain": domain, "request": {}, "response": {}, "redirect_chain": [],
+        "cookies": [], "timing": {}, "methods": {}, "cors": {},
+        "notable_headers": [], "security_headers": {}, "error": None,
+    }
+
+    resp = None
+    scheme_used = None
+    for scheme in ("https", "http"):
+        try:
+            t0 = _t.time()
+            resp = requests.get(f"{scheme}://{domain}", headers=REQ_HEADERS,
+                                timeout=12, verify=False, allow_redirects=True)
+            result["timing"]["total_ms"] = round((_t.time() - t0) * 1000)
+            scheme_used = scheme
+            break
+        except Exception as e:
+            result["error"] = str(e)[:120]
+            continue
+    if resp is None:
+        return {"error": result["error"] or "Host unreachable"}
+
+    result["error"] = None
+
+    # ── REQUEST (exactly what we sent, after requests' own additions) ──
+    try:
+        sent = resp.request
+        result["request"] = {
+            "method":     sent.method,
+            "url":        sent.url,
+            "http_line":  f"{sent.method} {sent.path_url} HTTP/1.1",
+            "headers":    [{"name": k, "value": str(v)} for k, v in sent.headers.items()],
+            "body":       (sent.body or "") if isinstance(sent.body, str) else "",
+        }
+    except Exception:
+        result["request"] = {"headers": [{"name": k, "value": v} for k, v in REQ_HEADERS.items()]}
+
+    # ── REDIRECT CHAIN (every hop, like DevTools) ──
+    for hop in list(resp.history) + [resp]:
+        try:
+            result["redirect_chain"].append({
+                "url":         hop.url,
+                "status":      hop.status_code,
+                "reason":      getattr(hop, "reason", ""),
+                "location":    hop.headers.get("Location", ""),
+                "size":        len(hop.content) if hop is resp else int(hop.headers.get("Content-Length") or 0),
+                "elapsed_ms":  round(hop.elapsed.total_seconds() * 1000) if hop.elapsed else 0,
+                "server":      hop.headers.get("Server", ""),
+            })
+        except Exception:
+            pass
+
+    # ── RESPONSE ──
+    body_preview = ""
+    try:
+        ct = resp.headers.get("Content-Type", "").lower()
+        enc_hdr = (resp.headers.get("Content-Encoding", "") or "").lower()
+        # If the body arrived in an encoding we can't inflate, skip the preview
+        # instead of printing undecodable bytes as mojibake.
+        undecodable = any(e in enc_hdr for e in ("br", "zstd", "compress")) and \
+            not any(e in enc_hdr for e in _encodings)
+        if undecodable:
+            body_preview = f"[body is {enc_hdr}-compressed — preview unavailable " \
+                           f"(install the matching decoder to view it)]"
+        elif any(t in ct for t in ("text", "json", "xml", "javascript", "html")):
+            txt = (resp.text or "")[:1500]
+            # Mojibake guard: real markup is mostly printable ASCII.
+            printable = sum(1 for c in txt[:400] if 32 <= ord(c) < 127 or c in "\r\n\t")
+            if txt and printable / max(1, len(txt[:400])) > 0.75:
+                body_preview = txt
+            else:
+                body_preview = "[binary or undecodable content — preview suppressed]"
+    except Exception:
+        pass
+
+    result["response"] = {
+        "status":        resp.status_code,
+        "reason":        getattr(resp, "reason", ""),
+        "final_url":     resp.url,
+        "scheme":        scheme_used,
+        "size":          len(resp.content),
+        "content_type":  resp.headers.get("Content-Type", ""),
+        "server":        resp.headers.get("Server", ""),
+        "headers":       [{"name": k, "value": str(v)} for k, v in resp.headers.items()],
+        "header_count":  len(resp.headers),
+        "body_preview":  body_preview,
+        "elapsed_ms":    round(resp.elapsed.total_seconds() * 1000) if resp.elapsed else 0,
+        "encoding":      resp.encoding or "",
+    }
+
+    # ── COOKIES + security flags ──
+    for c in resp.cookies:
+        issues = []
+        if not c.secure:
+            issues.append("no Secure flag")
+        rest = getattr(c, "_rest", {}) or {}
+        http_only = any(str(k).lower() == "httponly" for k in rest)
+        if not http_only:
+            issues.append("no HttpOnly (readable by JS)")
+        samesite = next((str(v) for k, v in rest.items() if str(k).lower() == "samesite"), "")
+        if not samesite:
+            issues.append("no SameSite")
+        result["cookies"].append({
+            "name": c.name,
+            "value": (c.value or "")[:60] + ("…" if c.value and len(c.value) > 60 else ""),
+            "domain": c.domain, "path": c.path,
+            "secure": bool(c.secure), "httponly": http_only,
+            "samesite": samesite, "expires": c.expires or "session",
+            "issues": issues,
+            "severity": "medium" if len(issues) >= 2 else ("low" if issues else "info"),
+        })
+
+    # ── ALLOWED METHODS (OPTIONS) + CORS ──
+    try:
+        o = requests.options(f"{scheme_used}://{domain}", headers=REQ_HEADERS,
+                             timeout=8, verify=False, allow_redirects=False)
+        allow = o.headers.get("Allow") or o.headers.get("Access-Control-Allow-Methods") or ""
+        methods = [m.strip().upper() for m in allow.split(",") if m.strip()]
+        risky = [m for m in methods if m in ("PUT", "DELETE", "TRACE", "TRACK", "PATCH", "CONNECT")]
+        result["methods"] = {"status": o.status_code, "allowed": methods, "risky": risky,
+                             "raw": allow[:200]}
+    except Exception:
+        result["methods"] = {"status": None, "allowed": [], "risky": [], "raw": ""}
+
+    try:
+        probe_origin = "https://kumo-recon.example"
+        c = requests.get(f"{scheme_used}://{domain}",
+                         headers=dict(REQ_HEADERS, Origin=probe_origin),
+                         timeout=8, verify=False, allow_redirects=False)
+        acao = c.headers.get("Access-Control-Allow-Origin", "")
+        acac = c.headers.get("Access-Control-Allow-Credentials", "")
+        note, sev = "", "info"
+        if acao == "*":
+            note, sev = "Wildcard origin allowed", "low"
+        elif acao and probe_origin in acao:
+            note = "Reflects arbitrary Origin"
+            sev = "high" if acac.lower() == "true" else "medium"
+        result["cors"] = {"allow_origin": acao, "allow_credentials": acac,
+                          "reflected": bool(acao and probe_origin in acao),
+                          "note": note, "severity": sev}
+    except Exception:
+        result["cors"] = {}
+
+    # ── SECURITY HEADERS present/absent (quick at-a-glance) ──
+    SEC = ["Strict-Transport-Security", "Content-Security-Policy", "X-Frame-Options",
+           "X-Content-Type-Options", "Referrer-Policy", "Permissions-Policy"]
+    result["security_headers"] = {
+        h: resp.headers.get(h, "") for h in SEC
+    }
+
+    # ── NOTABLE / NON-STANDARD HEADERS worth a look ──
+    STANDARD = {
+        "date", "content-type", "content-length", "connection", "server", "vary",
+        "cache-control", "expires", "last-modified", "etag", "accept-ranges",
+        "content-encoding", "transfer-encoding", "location", "set-cookie", "age",
+        "strict-transport-security", "content-security-policy", "x-frame-options",
+        "x-content-type-options", "referrer-policy", "permissions-policy", "pragma",
+        "content-language", "alt-svc", "link", "report-to", "nel",
+    }
+    LEAKY = {
+        "x-powered-by": ("Backend stack disclosed", "low"),
+        "x-aspnet-version": ("ASP.NET version disclosed", "low"),
+        "x-aspnetmvc-version": ("ASP.NET MVC version disclosed", "low"),
+        "x-generator": ("CMS/generator disclosed", "low"),
+        "x-drupal-cache": ("Drupal fingerprint", "info"),
+        "x-backend-server": ("Internal backend hostname leaked", "medium"),
+        "x-served-by": ("Internal node/CDN name", "info"),
+        "x-amz-cf-id": ("AWS CloudFront", "info"),
+        "x-debug-token": ("Debug token exposed (Symfony profiler)", "medium"),
+        "x-debug-token-link": ("Symfony profiler link exposed", "high"),
+        "x-runtime": ("Response timing leak (Rails)", "info"),
+        "x-request-id": ("Request correlation id", "info"),
+        "via": ("Proxy chain disclosed", "info"),
+        "x-cache": ("Cache layer", "info"),
+        "x-real-ip": ("Client IP echoed back", "low"),
+        "x-forwarded-for": ("Forwarding chain echoed back", "low"),
+        "x-kubernetes-pod": ("Kubernetes pod name leaked", "medium"),
+        "x-envoy-upstream-service-time": ("Envoy/Istio mesh", "info"),
+    }
+    for k, v in resp.headers.items():
+        lk = k.lower()
+        if lk in LEAKY:
+            desc, sev = LEAKY[lk]
+            result["notable_headers"].append(
+                {"name": k, "value": str(v)[:120], "note": desc, "severity": sev})
+        elif lk not in STANDARD and lk.startswith("x-"):
+            result["notable_headers"].append(
+                {"name": k, "value": str(v)[:120], "note": "Non-standard header", "severity": "info"})
+
+    result["summary"] = {
+        "status": resp.status_code,
+        "redirects": max(0, len(result["redirect_chain"]) - 1),
+        "req_headers": len(result["request"].get("headers", [])),
+        "resp_headers": result["response"]["header_count"],
+        "cookies": len(result["cookies"]),
+        "notable": len(result["notable_headers"]),
+        "risky_methods": len(result["methods"].get("risky", [])),
+    }
+    return result
+
+
 def scan_content_intel(domain):
     """
     Content Intelligence — scrapes the homepage HTML + all first-party JS
@@ -5112,6 +8880,30 @@ def scan_content_intel(domain):
         with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
             list(ex.map(fetch_js, js_urls))
 
+        # Follow one level of webpack/Vite chunk references. SPAs load a small
+        # entry bundle that names dozens of chunks, and the interesting material
+        # (DB URIs, internal hosts, API routes) lives in those chunks.
+        chunk_urls, seen_chunks = [], set(js_urls)
+        for label, text in list(sources):
+            if not label.endswith((".js", ".mjs")) and "(inline" not in label:
+                continue
+            for m in _re.finditer(r'["\']([\w./\-]{3,120}?\.m?js)(?:\?[\w=&.\-]{0,40})?["\']', text or ""):
+                cand = m.group(1)
+                if any(c in cand.lower() for c in SKIP_CDNS):
+                    continue
+                if not any(k in cand for k in ("chunk", "static/js", "assets/", "/js/",
+                                               "bundle", "main", "vendor", "app")):
+                    continue
+                cu = norm(cand, used_scheme)
+                if is_internal(host_of(cu)) and cu not in seen_chunks:
+                    seen_chunks.add(cu)
+                    chunk_urls.append(cu)
+        chunk_urls = chunk_urls[:MAX_JS]
+        if chunk_urls:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
+                list(ex.map(fetch_js, chunk_urls))
+            js_urls = list(js_urls) + chunk_urls
+
     # ── extract ──
     cats = {k: {} for k in ("endpoints", "urls_internal", "urls_external", "api_endpoints",
                             "databases", "cloud_storage", "emails", "ip_addresses",
@@ -5225,12 +9017,91 @@ def scan_api_fuzzer(domain):
     result = {
         "domain":     domain,
         "base_found": None,
+        "bases_found": [],
         "endpoints":  [],
         "graphql":    None,
+        "specs":      [],
+        "discovered": [],
         "total":      0,
     }
 
-    API_BASES = ["/api", "/api/v1", "/api/v2", "/v1", "/v2", "/rest", "/service"]
+    API_BASES = ["/api", "/api/v1", "/api/v2", "/api/v3", "/v1", "/v2", "/v3",
+                 "/rest", "/service", "/services", "/wp-json", "/wp-json/wp/v2",
+                 "/graphql", "/_api", "/api/public", "/api/internal", "/backend",
+                 "/gateway", "/oauth", "/.netlify/functions", "/api/rest"]
+
+    # Root-level specification / documentation endpoints. These are probed
+    # ALWAYS — independent of whether a base path is found — because a site can
+    # expose its whole API surface here even when /api itself returns HTML.
+    ROOT_SPECS = [
+        ("/swagger.json",                     "Swagger spec",              "high"),
+        ("/swagger/v1/swagger.json",          "Swagger spec (ASP.NET)",    "high"),
+        ("/openapi.json",                     "OpenAPI spec",              "high"),
+        ("/openapi.yaml",                     "OpenAPI spec (YAML)",       "high"),
+        ("/v2/api-docs",                      "Springfox API docs",        "high"),
+        ("/v3/api-docs",                      "SpringDoc OpenAPI",         "high"),
+        ("/api-docs",                         "API docs",                  "medium"),
+        ("/swagger-ui.html",                  "Swagger UI",                "medium"),
+        ("/swagger-ui/index.html",            "Swagger UI",                "medium"),
+        ("/redoc",                            "ReDoc UI",                  "medium"),
+        ("/graphiql",                         "GraphiQL IDE",              "high"),
+        ("/playground",                       "GraphQL Playground",        "high"),
+        ("/.well-known/openid-configuration", "OIDC discovery",            "medium"),
+        ("/.well-known/oauth-authorization-server", "OAuth metadata",      "medium"),
+        ("/.well-known/security.txt",         "security.txt",              "info"),
+        ("/wp-json/wp/v2/users",              "WordPress user enumeration","high"),
+        ("/wp-json",                          "WordPress REST root",       "medium"),
+        ("/actuator",                         "Spring Actuator root",      "high"),
+        ("/actuator/health",                  "Spring Actuator health",    "medium"),
+        ("/actuator/env",                     "Spring Actuator env",       "critical"),
+        ("/actuator/mappings",                "Spring Actuator mappings",  "high"),
+        ("/manifest.json",                    "App manifest",              "info"),
+        ("/api/config",                       "API config",                "high"),
+        ("/config.json",                      "Config JSON",               "high"),
+        ("/env.js",                           "Runtime env JS",            "high"),
+        ("/_next/data",                       "Next.js data routes",       "medium"),
+    ]
+
+    ENDPOINT_PATHS = [
+        ("/users",          "Users list",           "high"),
+        ("/users/me",       "Current user info",    "high"),
+        ("/user",           "User endpoint",        "high"),
+        ("/accounts",       "Accounts",             "high"),
+        ("/customers",      "Customers",            "high"),
+        ("/orders",         "Orders",               "high"),
+        ("/products",       "Products",             "medium"),
+        ("/admin",          "Admin endpoint",       "critical"),
+        ("/admin/users",    "Admin user list",      "critical"),
+        ("/auth/login",     "Auth login",           "medium"),
+        ("/login",          "Login endpoint",       "medium"),
+        ("/register",       "Registration",         "medium"),
+        ("/token",          "Token endpoint",       "high"),
+        ("/refresh",        "Token refresh",        "high"),
+        ("/config",         "Config endpoint",      "high"),
+        ("/settings",       "Settings",             "medium"),
+        ("/debug",          "Debug endpoint",       "critical"),
+        ("/metrics",        "Metrics",              "medium"),
+        ("/health",         "Health check",         "low"),
+        ("/status",         "Status endpoint",      "low"),
+        ("/version",        "Version disclosure",   "low"),
+        ("/info",           "Info endpoint",        "low"),
+        ("/docs",           "API docs",             "medium"),
+        ("/swagger",        "Swagger UI",           "medium"),
+        ("/swagger.json",   "Swagger JSON",         "medium"),
+        ("/openapi.json",   "OpenAPI spec",         "medium"),
+        ("/redoc",          "ReDoc",                "medium"),
+        ("/keys",           "Keys endpoint",        "critical"),
+        ("/secrets",        "Secrets",              "critical"),
+        ("/tokens",         "Tokens list",          "high"),
+        ("/export",         "Data export",          "high"),
+        ("/logs",           "Logs endpoint",        "high"),
+        ("/files",          "Files endpoint",       "high"),
+        ("/upload",         "Upload endpoint",      "high"),
+        ("/backup",         "Backup endpoint",      "high"),
+        ("/events",         "Events",               "medium"),
+        ("/search",         "Search endpoint",      "low"),
+        ("/graphql",        "GraphQL under base",   "high"),
+    ]
 
     # Baseline: probe a random path to detect catch-all servers
     _rnd = "/" + "".join(random.choices(_str.ascii_lowercase, k=12))
@@ -5239,42 +9110,161 @@ def scan_api_fuzzer(domain):
     _catch_all_size   = -1
 
     UA_H = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36", "Accept": "application/json"}
+    _lock0 = _thr.Lock()
 
+    def _generic(r):
+        """Catch-all / soft-404 response — carries no information."""
+        if r is None:
+            return True
+        if _catch_all_status is not None and r.status_code == _catch_all_status \
+           and abs(len(r.content) - _catch_all_size) <= max(256, _catch_all_size * 0.15):
+            return True
+        return _looks_soft_404(r)
+
+    scheme_used = "https"
     for scheme in ["https", "http"]:
         try:
-            _br = requests.get(f"{scheme}://{domain}{_rnd}", timeout=4,
-                verify=False, allow_redirects=False,
-                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"})
+            _br = requests.get(f"{scheme}://{domain}{_rnd}", timeout=5,
+                verify=False, allow_redirects=False, headers=UA_H)
             _catch_all_status = _br.status_code
             _catch_all_size   = len(_br.content)
+            scheme_used = scheme
+            break
         except Exception:
-            pass
+            continue
 
-        def _probe_base(base):
+    def _looks_api(r):
+        ct = r.headers.get("Content-Type", "").lower()
+        try:
+            body = r.text[:300].strip()
+        except Exception:
+            body = ""
+        return ("json" in ct or "api" in ct or body.startswith("{") or body.startswith("[")
+                or r.status_code in (401, 405, 422))
+
+    # ── Collect EVERY responding base, not just the first one ──
+    def _probe_base(base):
+        for scheme in ([scheme_used] if scheme_used else ["https", "http"]):
             try:
-                r = requests.get(f"{scheme}://{domain}{base}", timeout=4,
+                r = requests.get(f"{scheme}://{domain}{base}", timeout=5,
                                  verify=False, allow_redirects=False, headers=UA_H)
             except Exception:
-                return None
-            if r.status_code not in (200, 401, 403, 405, 422):
-                return None
-            if r.status_code == _catch_all_status and abs(len(r.content) - _catch_all_size) < 10:
-                return None
-            ct = r.headers.get("Content-Type", "").lower()
-            body = r.text[:200].strip()
-            if ("json" in ct or "api" in ct or body.startswith("{")
-                    or body.startswith("[") or r.status_code in (401, 405)):
-                return base
-            return None
+                continue
+            if r.status_code not in (200, 401, 403, 405, 422) or _generic(r):
+                continue
+            if _looks_api(r):
+                return (base, f"{scheme}://{domain}{base}", r.status_code, len(r.content))
+        return None
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(API_BASES)) as ex:
-            for found in ex.map(_probe_base, API_BASES):
-                if found:
-                    base_url = f"{scheme}://{domain}{found}"
-                    result["base_found"] = found
-                    break
-        if base_url:
-            break
+    with concurrent.futures.ThreadPoolExecutor(max_workers=12) as ex:
+        for found in ex.map(_probe_base, API_BASES):
+            if found:
+                result["bases_found"].append(
+                    {"path": found[0], "status": found[2], "size": found[3]})
+                if base_url is None:
+                    base_url = found[1]
+                    result["base_found"] = found[0]
+
+    # ── ALWAYS probe root-level specs/docs, even with no API base ──
+    def _probe_spec(item):
+        path, name, sev = item
+        try:
+            r = requests.get(f"{scheme_used}://{domain}{path}", timeout=5,
+                             verify=False, allow_redirects=False, headers=UA_H)
+        except Exception:
+            return None
+        if r.status_code not in (200, 401, 403) or _generic(r):
+            return None
+        ct = r.headers.get("Content-Type", "").lower()
+        try:
+            body = r.text[:400]
+        except Exception:
+            body = ""
+        low = body.lower()
+        # Require it to actually look like a spec/doc, not the site's HTML shell
+        looks_real = (
+            "json" in ct or "yaml" in ct
+            or body.strip().startswith(("{", "[", "openapi", "swagger"))
+            or any(k in low for k in ("swagger", "openapi", "graphiql", "redoc",
+                                      "\"paths\"", "actuator", "wp-json", "_links",
+                                      "issuer", "authorization_endpoint"))
+        )
+        if not looks_real:
+            return None
+        return {"path": path, "name": name, "severity": sev,
+                "status": r.status_code, "size": len(r.content),
+                "content_type": ct[:40]}
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=12) as ex:
+        for s in ex.map(_probe_spec, ROOT_SPECS):
+            if s:
+                result["specs"].append(s)
+
+    # ── Harvest REAL API paths out of the site's own JavaScript ──
+    # Guessing is a fallback; the app's bundles usually name the exact routes.
+    discovered_paths = set()
+    try:
+        import re as _re2
+        html = requests.get(f"{scheme_used}://{domain}", timeout=8, verify=False,
+                            headers=UA_H, allow_redirects=True).text[:600_000]
+        js_srcs = []
+        for m in _re2.finditer(r'<script[^>]+src=["\']([^"\'> ]+)["\']', html, _re2.I):
+            u = m.group(1).strip()
+            if u.startswith("//"):
+                u = "https:" + u
+            elif u.startswith("/"):
+                u = f"{scheme_used}://{domain}{u}"
+            elif not u.startswith("http"):
+                u = f"{scheme_used}://{domain}/{u.lstrip('./')}"
+            js_srcs.append(u)
+        blobs = [html]
+
+        def _grab(u):
+            try:
+                rr = requests.get(u, timeout=7, verify=False, headers=UA_H)
+                if rr.status_code == 200:
+                    return rr.text[:400_000]
+            except Exception:
+                pass
+            return ""
+        if js_srcs:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+                blobs.extend([b for b in ex.map(_grab, js_srcs[:12]) if b])
+
+        API_PATH_RE = _re2.compile(
+            r'["\'](/(?:api|rest|v\d|graphql|oauth|auth|wp-json|_api|services?)'
+            r'[A-Za-z0-9_\-/.]{0,60})["\']')
+        for b in blobs:
+            for m in API_PATH_RE.finditer(b):
+                p = m.group(1)
+                if 3 < len(p) <= 70 and not p.endswith((".js", ".css", ".png", ".svg", ".map")):
+                    discovered_paths.add(p)
+    except Exception:
+        pass
+    discovered_paths = sorted(discovered_paths)[:40]
+
+    def _probe_discovered(path):
+        try:
+            r = requests.get(f"{scheme_used}://{domain}{path}", timeout=5,
+                             verify=False, allow_redirects=False, headers=UA_H)
+        except Exception:
+            return None
+        if r.status_code in (404, 410) or _generic(r):
+            return None
+        if not _looks_api(r):
+            return None
+        sev = "high" if any(k in path.lower() for k in
+                            ("admin", "user", "token", "key", "secret", "config",
+                             "debug", "internal", "export", "backup")) else "medium"
+        return {"path": path, "name": "Discovered in JS", "severity": sev,
+                "status": r.status_code, "size": len(r.content),
+                "source": "js_discovery"}
+
+    if discovered_paths:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=12) as ex:
+            for d in ex.map(_probe_discovered, discovered_paths):
+                if d:
+                    result["discovered"].append(d)
 
     # GraphQL check — probe candidates in parallel, bounded
     def _probe_gql(gql):
@@ -5287,8 +9277,16 @@ def scan_api_fuzzer(domain):
             except Exception:
                 continue
             body = r.text[:500].lower()
-            if r.status_code in (200, 400) and any(k in body for k in ("typename", "data", "errors", "graphql")):
-                introspection = "typename" in body or '"data"' in r.text
+            ct = r.headers.get("Content-Type", "").lower()
+            raw = (r.text or "").lstrip()
+            # A real GraphQL endpoint answers with JSON. Matching loose keywords
+            # inside an HTML page produced false positives (a 300 KB login page
+            # containing the word "data" is not a GraphQL API).
+            is_json = "json" in ct or raw.startswith(("{", "["))
+            if not is_json or _looks_soft_404(r):
+                continue
+            if r.status_code in (200, 400) and any(k in body for k in ("__typename", "\"data\"", "\"errors\"", "graphql")):
+                introspection = "__typename" in body or '"data"' in r.text
                 return {
                     "path": gql, "status": r.status_code,
                     "severity": "high" if introspection else "medium",
@@ -5304,40 +9302,23 @@ def scan_api_fuzzer(domain):
                 result["graphql"] = g
                 break
 
-    if not base_url and not result["graphql"]:
-        result["error"] = "No API base detected — skipping endpoint fuzzing"
-        return result
-
+    # NOTE: no early bail-out. Root specs and JS-discovered paths are valuable
+    # findings on their own, even when no /api base responds.
     if base_url:
-        ENDPOINTS = [
-            ("/users",          "Users list",           "high"),
-            ("/users/me",       "Current user info",    "high"),
-            ("/admin",          "Admin endpoint",       "critical"),
-            ("/admin/users",    "Admin user list",      "critical"),
-            ("/auth/login",     "Auth login",           "medium"),
-            ("/token",          "Token endpoint",       "high"),
-            ("/config",         "Config endpoint",      "high"),
-            ("/settings",       "Settings",             "medium"),
-            ("/debug",          "Debug endpoint",       "critical"),
-            ("/metrics",        "Metrics",              "medium"),
-            ("/health",         "Health check",         "low"),
-            ("/version",        "Version disclosure",   "low"),
-            ("/docs",           "API docs",             "medium"),
-            ("/swagger",        "Swagger UI",           "medium"),
-            ("/swagger.json",   "Swagger JSON",         "medium"),
-            ("/openapi.json",   "OpenAPI spec",         "medium"),
-            ("/redoc",          "ReDoc",                "medium"),
-            ("/keys",           "Keys endpoint",        "critical"),
-            ("/secrets",        "Secrets",              "critical"),
-            ("/tokens",         "Tokens list",          "high"),
-            ("/export",         "Data export",          "high"),
-            ("/logs",           "Logs endpoint",        "high"),
-            ("/files",          "Files endpoint",       "high"),
-            ("/backup",         "Backup endpoint",      "high"),
-            ("/events",         "Events",               "medium"),
-        ]
+        ENDPOINTS = ENDPOINT_PATHS
 
         _lock = _thr.Lock()
+
+        # Some APIs answer 200-JSON for ANY sub-path. Fingerprint that first,
+        # otherwise every guessed endpoint looks like a real discovery.
+        _api_ca_status, _api_ca_size = None, -1
+        try:
+            _rp = "/" + "".join(random.choices(_str.ascii_lowercase, k=14))
+            _rr = requests.get(f"{base_url}{_rp}", timeout=5, verify=False,
+                               allow_redirects=False, headers=UA_H)
+            _api_ca_status, _api_ca_size = _rr.status_code, len(_rr.content)
+        except Exception:
+            pass
 
         def check_ep(ep):
             path, name, sev = ep
@@ -5348,6 +9329,12 @@ def scan_api_fuzzer(domain):
                     headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
                              "Accept": "application/json"}
                 )
+                # Identical to the response for a random path → not a discovery
+                if _api_ca_status is not None and r.status_code == _api_ca_status \
+                   and abs(len(r.content) - _api_ca_size) <= max(32, _api_ca_size * 0.10):
+                    return
+                if _looks_soft_404(r):
+                    return
                 if r.status_code in (200, 401, 403, 405, 422):
                     actual = sev
                     if r.status_code in (401, 403):
@@ -5368,12 +9355,19 @@ def scan_api_fuzzer(domain):
         with concurrent.futures.ThreadPoolExecutor(max_workers=15) as ex:
             list(ex.map(check_ep, ENDPOINTS))
 
+        # Final safety net: many endpoints sharing one status AND size are the
+        # same generic response, not distinct endpoints.
+        result["endpoints"] = _drop_uniform_findings(result["endpoints"], min_group=6)
+
         result["endpoints"].sort(
             key=lambda x: {"critical": 0, "high": 1, "medium": 2,
                            "low": 3, "info": 4}.get(x["severity"], 5)
         )
 
-    result["total"] = len(result["endpoints"]) + (1 if result["graphql"] else 0)
+    result["total"] = (len(result["endpoints"]) + len(result["specs"])
+                       + len(result["discovered"]) + (1 if result["graphql"] else 0))
+    if result["total"] == 0:
+        result["error"] = "No API surface detected (no base, specs, GraphQL or JS-referenced routes)"
     return result
 
 
@@ -5403,6 +9397,7 @@ ALL_MODULES = {
     "cloud_buckets":   ("Cloud Bucket Finder (S3/Azure/GCP)",  scan_cloud_buckets),
     "js_secrets":      ("JS Secret Scanner",                   scan_js_secrets),
     "content_intel":   ("Content Intel (JS/HTML URL & info extractor)", scan_content_intel),
+    "http_inspect":    ("HTTP Inspector (request/response headers)", scan_http_inspect),
     "api_fuzzer":      ("API Endpoint Fuzzer",                  scan_api_fuzzer),
 }
 
