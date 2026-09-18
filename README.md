@@ -9,6 +9,7 @@
 [![Vuln Checks](https://img.shields.io/badge/Vuln_Checks-490+-ef4444?style=flat-square)](.)
 [![No API Key](https://img.shields.io/badge/API_Key-Not_Required-22c55e?style=flat-square)](.)
 [![License](https://img.shields.io/badge/License-MIT-6b7280?style=flat-square)](LICENSE)
+[![ko-fi](https://img.shields.io/badge/Support-Ko--fi-FF5E5B?logo=kofi&logoColor=white)](https://ko-fi.com/k0r1m)
 
 **One domain. One command. Everything.**
 
@@ -651,7 +652,6 @@ python3 kumo.py target.com --no-color         pipe-friendly output
 
 fast mode skips: wayback · brute · subdomains · email_harvest
 ```
-
 ---
 
 > ⚠️ **For authorized security testing only.**  
