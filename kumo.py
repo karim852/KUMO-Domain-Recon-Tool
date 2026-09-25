@@ -16,6 +16,9 @@ import json
 import argparse
 import textwrap
 import time
+import shutil
+import threading
+import itertools
 from datetime import datetime, timezone
 
 from engine import clean_domain, ALL_MODULES, FAST_SKIP, run_scan
@@ -24,13 +27,101 @@ from engine import clean_domain, ALL_MODULES, FAST_SKIP, run_scan
 # COLORS
 # ═══════════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════════
+# THEME — the same four palettes as the web UI, in 24-bit ANSI.
+# Terminals that only do 256 colours degrade gracefully; --no-color
+# strips everything.
+# ═══════════════════════════════════════════════════════════════
+
+def _fg(rgb):
+    return f"\033[38;2;{rgb[0]};{rgb[1]};{rgb[2]}m"
+
+
+THEMES = {
+    # accent is the identity colour; text/dim carry the body copy
+    "void": {
+        "label":  "Void",
+        "accent": (92, 176, 255),   # cyan bloom
+        "accent2":(61, 220, 132),   # green
+        "warn":   (227, 179, 65),
+        "danger": (255, 95, 87),
+        "violet": (188, 140, 255),
+        "orange": (255, 166, 87),
+        "text":   (212, 220, 232),
+        "dim":    (119, 136, 163),
+        "dim2":   (70, 80, 100),
+    },
+    "glass": {
+        "label":  "Void Glass",
+        "accent": (64, 168, 255),
+        "accent2":(61, 220, 132),
+        "warn":   (227, 179, 65),
+        "danger": (255, 95, 87),
+        "violet": (188, 140, 255),
+        "orange": (255, 166, 87),
+        "text":   (219, 230, 240),
+        "dim":    (131, 152, 173),
+        "dim2":   (77, 95, 114),
+    },
+    "web": {
+        "label":  "Web 蜘蛛",
+        "accent": (199, 146, 255),
+        "accent2":(77, 255, 166),
+        "warn":   (255, 207, 92),
+        "danger": (255, 107, 129),
+        "violet": (217, 179, 255),
+        "orange": (255, 166, 87),
+        "text":   (224, 216, 240),
+        "dim":    (147, 132, 181),
+        "dim2":   (87, 73, 111),
+    },
+    "carbon": {
+        "label":  "Carbon",
+        "accent": (88, 166, 255),
+        "accent2":(61, 220, 132),
+        "warn":   (227, 179, 65),
+        "danger": (248, 81, 73),
+        "violet": (188, 140, 255),
+        "orange": (255, 166, 87),
+        "text":   (214, 218, 222),
+        "dim":    (130, 140, 150),
+        "dim2":   (77, 86, 95),
+    },
+}
+
+DEFAULT_THEME = "void"
+
+
 class C:
+    """ANSI palette. Attribute names are kept from the original 16-colour
+    set so every renderer in this file stays theme-aware for free."""
     R="\033[91m"; G="\033[92m"; Y="\033[93m"; B="\033[94m"; M="\033[95m"
     CY="\033[96m"; W="\033[97m"; GR="\033[90m"; BD="\033[1m"; DM="\033[2m"
     UL="\033[4m"; RS="\033[0m"; BG_R="\033[41m"
+    ACC="\033[96m"          # theme accent
+    theme = DEFAULT_THEME
+    _enabled = True
+
+    @classmethod
+    def apply_theme(cls, name):
+        p = THEMES.get(name)
+        if not p or not cls._enabled:
+            return
+        cls.theme = name
+        cls.ACC = _fg(p["accent"])
+        cls.CY  = _fg(p["accent"])     # primary accent
+        cls.B   = _fg(p["accent"])     # banner / headings
+        cls.G   = _fg(p["accent2"])
+        cls.Y   = _fg(p["warn"])
+        cls.R   = _fg(p["danger"])
+        cls.M   = _fg(p["violet"])
+        cls.W   = _fg(p["text"])
+        cls.GR  = _fg(p["dim"])
+        cls.DM  = _fg(p["dim2"])
 
     @classmethod
     def off(cls):
+        cls._enabled = False
         for a in list(vars(cls)):
             if a.isupper() and not a.startswith("_"):
                 setattr(cls, a, "")
@@ -40,21 +131,384 @@ class C:
 # CLI DISPLAY
 # ═══════════════════════════════════════════════════════════════
 
-def banner():
+LOGO = [
+    "██╗  ██╗██╗   ██╗███╗   ███╗ ██████╗ ",
+    "██║ ██╔╝██║   ██║████╗ ████║██╔═══██╗",
+    "█████╔╝ ██║   ██║██╔████╔██║██║   ██║",
+    "██╔═██╗ ██║   ██║██║╚██╔╝██║██║   ██║",
+    "██║  ██╗╚██████╔╝██║ ╚═╝ ██║╚██████╔╝",
+    "╚═╝  ╚═╝ ╚═════╝ ╚═╝     ╚═╝ ╚═════╝ ",
+]
+
+TAGLINE = "Domain OSINT & Reconnaissance Framework"
+
+# Short labels for the menu; the long text in ALL_MODULES stays for --help.
+SHORT_NAMES = {
+    "screenshot":    "Website Screenshot",
+    "dns":           "DNS & Email Security",
+    "geo":           "IP Geolocation & ASN",
+    "whois":         "WHOIS / RDAP",
+    "ssl":           "SSL/TLS Certificate",
+    "headers":       "HTTP Security Headers",
+    "wafw00f":       "WAF Detection",
+    "ports":         "Port Scan & Banners",
+    "whatweb":       "Tech Stack Detection",
+    "robots":        "Robots & Sitemap",
+    "endpoints":     "Sensitive Endpoints",
+    "nuclei":        "Vulnerability Scanner",
+    "shodan":        "Shodan InternetDB",
+    "censys":        "Censys Hosts & Certs",
+    "subdomains":    "Subdomain Discovery",
+    "brute":         "Subdomain Brute Force",
+    "wayback":       "Wayback Archives",
+    "email_harvest": "Email Harvester",
+    "breachintel":   "Breach Intelligence",
+    "dorks":         "Google Dorks",
+    "osint":         "OSINT Platform URLs",
+    "favicon":       "Favicon Fingerprint",
+    "cloud_buckets": "Cloud Bucket Finder",
+    "js_secrets":    "JS Secret Scanner",
+    "content_intel": "Content Intel",
+    "http_inspect":  "HTTP Inspector",
+    "api_fuzzer":    "API Endpoint Fuzzer",
+}
+
+CATEGORY_LAYOUT = [
+    ("Network & Infrastructure",
+     ["dns", "geo", "whois", "ssl", "ports", "subdomains", "brute", "favicon"]),
+    ("Web Application Analysis",
+     ["screenshot", "whatweb", "robots", "wayback", "content_intel",
+      "http_inspect", "api_fuzzer", "js_secrets", "endpoints"]),
+    ("Security & Threat Intelligence",
+     ["headers", "wafw00f", "nuclei", "shodan", "censys", "breachintel",
+      "email_harvest", "cloud_buckets", "dorks", "osint"]),
+]
+
+
+def build_categories():
+    """Group modules for display. Anything registered in ALL_MODULES but not
+    placed in CATEGORY_LAYOUT still shows up, so a newly added module can
+    never silently vanish from the menu."""
+    cats, placed = [], set()
+    for title, keys in CATEGORY_LAYOUT:
+        live = [k for k in keys if k in ALL_MODULES]
+        placed.update(live)
+        if live:
+            cats.append((title, live))
+    leftover = [k for k in ALL_MODULES if k not in placed]
+    if leftover:
+        cats.append(("Other Modules", leftover))
+    return cats
+
+
+def module_index():
+    """Ordered [(number, key, label)] matching what the menu prints."""
+    out, n = [], 0
+    for _, keys in build_categories():
+        for k in keys:
+            n += 1
+            out.append((n, k, SHORT_NAMES.get(k) or ALL_MODULES[k][0]))
+    return out
+
+
+def _pad(s, width):
+    """Pad to a visible width, ignoring ANSI and counting CJK as 2 cells."""
+    return s + " " * max(0, width - _dwidth(_strip_ansi(s)))
+
+
+def _term_width(default=100):
+    try:
+        return shutil.get_terminal_size((default, 24)).columns
+    except Exception:
+        return default
+
+
+def banner(compact=False):
     import platform
-    os_name = platform.system() or "Unknown"
-    print(f"""{C.B}{C.BD}
-██╗  ██╗██╗   ██╗███╗   ███╗ ██████╗
-██║ ██╔╝██║   ██║████╗ ████║██╔═══██╗
-█████╔╝ ██║   ██║██╔████╔██║██║   ██║
-██╔═██╗ ██║   ██║██║╚██╔╝██║██║   ██║
-██║  ██╗╚██████╔╝██║ ╚═╝ ██║╚██████╔╝
-╚═╝  ╚═╝ ╚═════╝ ╚═╝     ╚═╝ ╚═════╝{C.RS}
-  {C.CY}{C.BD}Powered by Kumo Recon Engine{C.RS}        {C.GR}v2.0{C.RS}
-  {C.M}{C.BD}蜘蛛{C.RS}  {C.GR}web recon · osint · breach intel{C.RS}
-  {C.Y}OS:{C.RS} {C.W}{os_name}{C.RS}    {C.Y}Modules:{C.RS} {C.W}{len(ALL_MODULES)}{C.RS}    {C.Y}API Key:{C.RS} {C.G}not required{C.RS}
-  {C.CY}🌐 github.com/karim852/KUMO{C.RS}   {C.GR}·  authorized security testing only{C.RS}
-""")
+    w = min(_term_width(), 96)
+    inner = w - 4
+    top = f"{C.DM}╭{'─' * (w - 2)}╮{C.RS}"
+    bot = f"{C.DM}╰{'─' * (w - 2)}╯{C.RS}"
+    edge = f"{C.DM}│{C.RS}"
+
+    def row(content=""):
+        return f"  {edge} {_pad(content, inner)} {edge}"
+
+    logo_pad = max(0, (inner - len(LOGO[0])) // 2)
+    print(f"\n  {top}")
+    print(row())
+    for line in LOGO:
+        print(row(f"{' ' * logo_pad}{C.ACC}{C.BD}{line}{C.RS}"))
+    print(row())
+    tag_pad = max(0, (inner - len(TAGLINE)) // 2)
+    print(row(f"{' ' * tag_pad}{C.M}{TAGLINE}{C.RS}"))
+    print(row())
+
+    theme_label = THEMES.get(C.theme, {}).get("label", C.theme)
+    meta = (f"{C.GR}Version:{C.RS} {C.W}2.0{C.RS}   "
+            f"{C.GR}Modules:{C.RS} {C.ACC}{C.BD}{len(ALL_MODULES)}{C.RS}   "
+            f"{C.GR}Theme:{C.RS} {C.ACC}{theme_label}{C.RS}   "
+            f"{C.GR}API key:{C.RS} {C.G}not required{C.RS}   "
+            f"{C.M}蜘蛛{C.RS}")
+    meta_w = _dwidth(_strip_ansi(meta))
+    print(row(f"{' ' * max(0, (inner - meta_w) // 2)}{meta}"))
+    print(row())
+    print(f"  {bot}")
+    if not compact:
+        print(f"  {C.DM}{platform.system() or 'Unknown'} · "
+              f"authorized security testing only · github.com/karim852/KUMO{C.RS}")
+    print()
+
+
+def web_panel():
+    """The web interface, sold hard — it is the most capable surface."""
+    w = min(_term_width(), 96)
+    inner = w - 4
+    print(f"  {C.ACC}┏{'━' * (w - 2)}┓{C.RS}")
+
+    def row(content):
+        return (f"  {C.ACC}┃{C.RS} {_pad(content, inner)} {C.ACC}┃{C.RS}")
+
+    print(row(f"{C.ACC}{C.BD}[W]{C.RS}  {C.W}{C.BD}WEB INTERFACE{C.RS}"
+              f"   {C.DM}—{C.RS}  {C.GR}live dashboard · streaming cards · "
+              f"4 themes · reports{C.RS}"))
+    print(row(f"     {C.DM}kumo --web{C.RS}   {C.DM}→{C.RS}  "
+              f"{C.ACC}http://127.0.0.1:8888{C.RS}"
+              f"   {C.DM}·  runs every module with full rendering{C.RS}"))
+    print(f"  {C.ACC}┗{'━' * (w - 2)}┛{C.RS}")
+    print()
+
+
+def module_menu():
+    """ARGUS-style numbered module list, grouped and columnised."""
+    cats = build_categories()
+    width = _term_width()
+    ncols = 3 if width >= 108 else (2 if width >= 74 else 1)
+
+    # Build each category as a block of rendered lines.
+    blocks, n = [], 0
+    for title, keys in cats:
+        lines = [f"{C.ACC}{C.BD}{title}{C.RS}",
+                 f"{C.DM}{'─' * min(len(title) + 2, 34)}{C.RS}"]
+        for k in keys:
+            n += 1
+            label = SHORT_NAMES.get(k) or ALL_MODULES[k][0]
+            lines.append(f"{C.ACC}{n:>2}.{C.RS} {C.W}{label}{C.RS}")
+        blocks.append(lines)
+
+    colw = max(4, (width - 6) // ncols)
+    for i in range(0, len(blocks), ncols):
+        group = blocks[i:i + ncols]
+        height = max(len(b) for b in group)
+        for r in range(height):
+            cells = []
+            for b in group:
+                cells.append(_pad(b[r] if r < len(b) else "", colw))
+            print("  " + "".join(cells).rstrip())
+        print()
+
+
+def home_screen():
+    banner()
+    web_panel()
+    module_menu()
+    print(f"  {C.DM}Pick modules by number (e.g. {C.RS}{C.GR}1 4 12{C.DM}), "
+          f"{C.RS}{C.GR}a{C.DM} for all, {C.RS}{C.GR}f{C.DM} for fast, "
+          f"{C.RS}{C.GR}w{C.DM} for the web interface, "
+          f"{C.RS}{C.GR}q{C.DM} to quit.{C.RS}\n")
+
+
+# ═══════════════════════════════════════════════════════════════
+# SPIDER CRAWL — live progress while modules run in parallel
+# ═══════════════════════════════════════════════════════════════
+
+# Eight columns wide each, pure ASCII so it never breaks alignment.
+SPIDER_FRAMES = ["/\\(oo)/\\", "\\/(oo)\\/", "/\\(oo)\\/", "\\/(oo)/\\"]
+SPIDER_W = 8
+BRAILLE = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+
+class SpiderCrawl:
+    """A spider that spins silk across the strand as modules finish.
+
+    Runs on its own daemon thread. Wrap any printing in `block()` so the
+    animated line is cleared first and redrawn after — otherwise module
+    output and the spinner fight over the same row.
+    """
+
+    def __init__(self, total, stream=None, strand=30, enabled=None):
+        self.total = max(1, total)
+        self.done = 0
+        self.pending = []
+        self.stream = stream or sys.stdout
+        self.strand = strand
+        self.start_ts = time.time()
+        self._lock = threading.RLock()
+        self._stop = threading.Event()
+        self._thread = None
+        self._drawn = False
+        if enabled is None:
+            enabled = bool(getattr(self.stream, "isatty", lambda: False)()) \
+                      and C._enabled
+        self.enabled = enabled
+        self._frames = itertools.cycle(range(len(SPIDER_FRAMES)))
+        self._frame = 0
+
+    # ── lifecycle ──
+    def start(self):
+        if not self.enabled:
+            return self
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+        return self
+
+    def update(self, done=None, pending=None):
+        with self._lock:
+            if done is not None:
+                self.done = done
+            if pending is not None:
+                self.pending = pending
+
+    def stop(self, final=None):
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=0.5)
+        with self._lock:
+            self._clear()
+            if final:
+                self.stream.write(final + "\n")
+                self.stream.flush()
+
+    # ── context manager for safe printing ──
+    class _Block:
+        def __init__(self, outer):
+            self.outer = outer
+
+        def __enter__(self):
+            self.outer._lock.acquire()
+            self.outer._clear()
+            return self.outer
+
+        def __exit__(self, *exc):
+            try:
+                self.outer._paint()
+            finally:
+                self.outer._lock.release()
+            return False
+
+    def block(self):
+        return SpiderCrawl._Block(self)
+
+    # ── rendering ──
+    def _clear(self):
+        if self.enabled and self._drawn:
+            self.stream.write("\r\033[2K")
+            self.stream.flush()
+            self._drawn = False
+
+    def _loop(self):
+        while not self._stop.is_set():
+            with self._lock:
+                self._frame = next(self._frames)
+                self._paint()
+            self._stop.wait(0.13)
+
+    def _paint(self):
+        if not self.enabled or self._stop.is_set():
+            return
+        self.stream.write("\r\033[2K" + self._line())
+        self.stream.flush()
+        self._drawn = True
+
+    def _line(self):
+        frac = self.done / self.total
+        travel = max(0, self.strand - SPIDER_W)
+        pos = int(travel * frac)
+        spider = SPIDER_FRAMES[self._frame % len(SPIDER_FRAMES)]
+        silk = "═" * pos
+        ahead = "·" * max(0, travel - pos)
+        el = time.time() - self.start_ts
+        spin = BRAILLE[int(el * 8) % len(BRAILLE)]
+
+        base = (f"  {C.ACC}{spin}{C.RS}  "
+                f"{C.ACC}{silk}{C.RS}{C.W}{C.BD}{spider}{C.RS}{C.DM}{ahead}{C.RS}  "
+                f"{C.W}{self.done}{C.DM}/{self.total}{C.RS}  "
+                f"{C.DM}·{C.RS}  {C.GR}{el:4.1f}s{C.RS}")
+
+        # Append the in-flight module names only while they still fit on the row.
+        limit = max(20, _term_width() - 2)
+        used = _dwidth(_strip_ansi(base))
+        if self.pending and used < limit - 6:
+            shown = ", ".join(self.pending[:2])
+            extra = len(self.pending) - 2
+            if extra > 0:
+                shown += f" +{extra}"
+            room = limit - used - 2
+            if len(shown) > room:
+                shown = shown[:max(0, room - 1)] + "…"
+            if shown:
+                base += f"  {C.DM}{shown}{C.RS}"
+        return base
+
+
+def prompt_domain():
+    try:
+        raw = input(f"\n  {C.GR}target domain{C.DM} ❯ {C.RS}").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
+    d = clean_domain(raw)
+    if not d:
+        print(f"  {C.R}✗{C.RS} {C.GR}invalid domain: {raw or '(empty)'}{C.RS}")
+        return None
+    return d
+
+
+def interactive_select():
+    """Show the home screen and read a selection.
+    Returns (action, modules) with action in {'web', 'scan', 'quit'}."""
+    home_screen()
+    idx = {n: k for n, k, _ in module_index()}
+
+    while True:
+        try:
+            raw = input(f"  {C.ACC}{C.BD}kumo{C.RS}{C.DM} ❯ {C.RS}").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return ("quit", None)
+
+        if not raw:
+            continue
+        if raw in ("q", "quit", "exit"):
+            return ("quit", None)
+        if raw in ("w", "web"):
+            return ("web", None)
+        if raw in ("a", "all"):
+            return ("scan", list(ALL_MODULES.keys()))
+        if raw in ("f", "fast"):
+            return ("scan", [k for k in ALL_MODULES if k not in FAST_SKIP])
+        if raw in ("?", "h", "help"):
+            home_screen()
+            continue
+
+        picked, bad = [], []
+        for tok in raw.replace(",", " ").split():
+            if tok.isdigit() and int(tok) in idx:
+                key = idx[int(tok)]
+                if key not in picked:
+                    picked.append(key)
+            else:
+                bad.append(tok)
+
+        if bad:
+            print(f"  {C.R}✗{C.RS} {C.GR}not a module number: "
+                  f"{C.W}{' '.join(bad)}{C.RS}  {C.DM}(1–{len(idx)}, "
+                  f"or a/f/w/q){C.RS}")
+            continue
+        if picked:
+            names = ", ".join(SHORT_NAMES.get(k, k) for k in picked)
+            print(f"  {C.G}✓{C.RS} {C.GR}selected:{C.RS} {C.W}{names}{C.RS}")
+            return ("scan", picked)
 
 
 def section(title, icon="►"):
@@ -1206,11 +1660,18 @@ Modules ({len(ALL_MODULES)}):
     parser.add_argument("-p", "--port", type=int, default=8888, help="Web UI port (default: 8888)")
     parser.add_argument("--host", default="0.0.0.0", help="Web UI host (default: 0.0.0.0)")
     parser.add_argument("--list-modules", action="store_true", help="List all modules")
+    parser.add_argument("--theme", choices=list(THEMES.keys()),
+                        default=os.environ.get("KUMO_THEME", DEFAULT_THEME),
+                        help=f"Colour theme (default: {DEFAULT_THEME})")
+    parser.add_argument("--no-spider", action="store_true",
+                        help="Disable the crawl animation")
 
     args = parser.parse_args()
 
     if args.no_color:
         C.off()
+    else:
+        C.apply_theme(args.theme if args.theme in THEMES else DEFAULT_THEME)
 
     # ──── Web mode ────
     if args.web:
@@ -1226,15 +1687,41 @@ Modules ({len(ALL_MODULES)}):
     # ──── List modules ────
     if args.list_modules:
         banner()
+        web_panel()
+        module_menu()
+        print(f"  {C.DM}Run one with{C.RS} {C.GR}kumo <domain> -m <name>{C.RS}"
+              f"{C.DM} — names below.{C.RS}\n")
         for k, (desc, _) in ALL_MODULES.items():
-            print(f"  {C.Y}{k:<14}{C.RS} {desc}")
+            print(f"  {C.ACC}{k:<15}{C.RS}{C.GR}{desc}{C.RS}")
+        print()
         sys.exit(0)
 
-    # ──── CLI mode ────
+    # ──── No target: interactive home screen ────
     if not args.domain:
-        banner()
-        parser.print_help()
-        sys.exit(1)
+        if not sys.stdin.isatty():
+            banner()
+            parser.print_help()
+            sys.exit(1)
+
+        action, picked = interactive_select()
+        if action == "quit":
+            print(f"  {C.DM}bye.{C.RS}\n")
+            sys.exit(0)
+        if action == "web":
+            print(f"\n  {C.ACC}⬢{C.RS} {C.W}starting the web interface…{C.RS}")
+            try:
+                from web import start_web
+                start_web(host=args.host, port=args.port)
+            except ImportError:
+                print(f"{C.R}[✗] Flask required for web mode: pip install flask{C.RS}")
+                sys.exit(1)
+            return
+
+        domain = prompt_domain()
+        if not domain:
+            sys.exit(1)
+        args.domain = domain
+        args.modules = picked
 
     domain = clean_domain(args.domain)
     if not domain:
@@ -1262,26 +1749,45 @@ Modules ({len(ALL_MODULES)}):
     all_results = {}
     total_mods = len(to_run)
     counter = {"n": 0}
+    remaining = list(to_run)
+
+    crawl = SpiderCrawl(total_mods,
+                        enabled=(False if args.no_spider else None))
+    crawl.update(0, [SHORT_NAMES.get(k, k) for k in remaining])
+    crawl.start()
 
     def callback(key, desc, result):
         all_results[key] = result
         counter["n"] += 1
+        if key in remaining:
+            remaining.remove(key)
         el = time.time() - start
-        print(f"\n  {C.GR}[{counter['n']:>2}/{total_mods}] · {el:5.1f}s{C.RS}", end="")
-        renderer = RENDERERS.get(key)
-        if renderer:
-            try:
-                renderer(result)
-            except Exception as e:
-                fail(f"Render error for {key}: {e}")
-        else:
-            section(desc.upper(), "📋")
-            if isinstance(result, dict) and result.get("error"):
-                fail(result["error"])
-            else:
-                dimprint(json.dumps(result, indent=2, default=str)[:500], 4)
 
-    run_scan(domain, modules=to_run, fast=args.fast, callback=callback)
+        # Clear the animated row, print this module's output, then redraw.
+        with crawl.block():
+            print(f"\n  {C.GR}[{counter['n']:>2}/{total_mods}] · {el:5.1f}s{C.RS}", end="")
+            renderer = RENDERERS.get(key)
+            if renderer:
+                try:
+                    renderer(result)
+                except Exception as e:
+                    fail(f"Render error for {key}: {e}")
+            else:
+                section(desc.upper(), "📋")
+                if isinstance(result, dict) and result.get("error"):
+                    fail(result["error"])
+                else:
+                    dimprint(json.dumps(result, indent=2, default=str)[:500], 4)
+
+        crawl.update(counter["n"], [SHORT_NAMES.get(k, k) for k in remaining])
+
+    try:
+        run_scan(domain, modules=to_run, fast=args.fast, callback=callback)
+    finally:
+        el = time.time() - start
+        crawl.stop(f"\n  {C.G}✓{C.RS} {C.W}web spun{C.RS} {C.DM}·{C.RS} "
+                   f"{C.W}{counter['n']}/{total_mods}{C.RS} {C.GR}modules{C.RS} "
+                   f"{C.DM}·{C.RS} {C.GR}{el:.1f}s{C.RS}")
 
     elapsed = time.time() - start
 

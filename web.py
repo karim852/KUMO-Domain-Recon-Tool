@@ -83,21 +83,101 @@ HTML_TEMPLATE = r"""
 <title>Kumo — OSINT Recon · Kumo v2.0</title>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet">
 <style>
+/* ════════════════════════════════════════════════════════════
+   KUMO THEME SYSTEM — 4 variants, switchable at runtime.
+   Palette lives in [data-v] blocks on <html>; everything
+   structural stays on :root. The -dim tokens are derived with
+   color-mix so they track whichever palette is active.
+   ════════════════════════════════════════════════════════════ */
 :root{
-  --bg:#080b14;--bg2:#0d1117;--bg3:#161b27;--bg4:#1c2333;
-  --border:#21293d;--border2:#2d3a52;--border3:#3d4f70;
-  --text:#cdd5e0;--text2:#7d8fa8;--text3:#4a5568;
-  --green:#3ddc84;--green2:#2aab68;--green-dim:rgba(61,220,132,.1);
-  --red:#f85149;--red-dim:rgba(248,81,73,.1);
-  --yellow:#e3b341;--yellow-dim:rgba(227,179,65,.1);
-  --cyan:#58a6ff;--cyan-dim:rgba(88,166,255,.1);
-  --purple:#bc8cff;--purple-dim:rgba(188,140,255,.1);
+  color-scheme: dark;
+
+  /* ── VOID (default) — deepest navy, cyan bloom, flat surfaces ── */
+  --bg:#03050b;--bg2:#070c16;--bg3:#0c1322;--bg4:#121b2e;
+  --border:#18213a;--border2:#25314f;--border3:#33436b;
+  --text:#d4dce8;--text2:#7788a3;--text3:#465064;
+  --green:#3ddc84;--green2:#2aab68;
+  --red:#ff5f57;--yellow:#e3b341;--cyan:#5cb0ff;--purple:#bc8cff;
   --orange:#ffa657;--pink:#ff7b72;
-  --card-r:12px;--input-r:8px;
+  --glow-rgb:92,176,255;
+  --card-r:12px;--glow-o:.42;--glow-blur:26px;
+
+  /* surface treatment — flat */
+  --card-bg:var(--bg2);--card-edge:var(--border);
+  --head-bg:linear-gradient(180deg,var(--bg4),var(--bg3));
+  --head-line:var(--border);--panel-bg:var(--bg2);
+  --btn-r:var(--input-r);--prog-h:2px;
+
+  /* structural — shared by every variant */
+  --input-r:8px;
+  --font-mono:'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,monospace;
+  --font-sans:'Inter',system-ui,-apple-system,sans-serif;
+
+  /* derived — follow the active palette automatically */
+  --green-dim:color-mix(in srgb,var(--green) 10%,transparent);
+  --red-dim:color-mix(in srgb,var(--red) 10%,transparent);
+  --yellow-dim:color-mix(in srgb,var(--yellow) 10%,transparent);
+  --cyan-dim:color-mix(in srgb,var(--cyan) 10%,transparent);
+  --purple-dim:color-mix(in srgb,var(--purple) 10%,transparent);
+}
+
+/* ── VOID GLASS — lit top-left corner, light seam, under-glow ── */
+[data-v="glass"]{
+  --bg:#04080d;--bg2:#08101a;--bg3:#0d1724;--bg4:#132033;
+  --border:#172536;--border2:#22364d;--border3:#2f4a68;
+  --text:#dbe6f0;--text2:#8398ad;--text3:#4d5f72;
+  --green:#3ddc84;--green2:#2aab68;
+  --red:#ff5f57;--yellow:#e3b341;--cyan:#4fb3ff;--purple:#bc8cff;
+  --glow-rgb:64,168,255;
+  --card-r:16px;--glow-o:.45;--glow-blur:28px;
+  --card-bg:
+    radial-gradient(55% 3px at 50% 100%, rgba(var(--glow-rgb),.95), transparent) no-repeat bottom / 100% 3px,
+    linear-gradient(160deg,rgba(130,180,230,.075),rgba(130,180,230,.015) 42%,rgba(0,0,0,.25)),
+    var(--bg2);
+  --card-edge:rgba(120,170,220,.13);
+  --head-bg:transparent;
+  --head-line:rgba(120,170,220,.08);
+  --panel-bg:linear-gradient(165deg,rgba(120,170,220,.05),rgba(0,0,0,0) 40%),var(--bg2);
+  --btn-r:999px;--prog-h:3px;
+}
+
+/* ── WEB 蜘蛛 — violet, strongest glow ── */
+[data-v="web"]{
+  --bg:#05030e;--bg2:#0a0719;--bg3:#110c27;--bg4:#181035;
+  --border:#261b47;--border2:#372763;--border3:#4d3886;
+  --text:#e0d8f0;--text2:#9384b5;--text3:#57496f;
+  --green:#4dffa6;--green2:#2fd888;
+  --red:#ff6b81;--yellow:#ffcf5c;--cyan:#b98cff;--purple:#d9b3ff;
+  --glow-rgb:199,146,255;
+  --card-r:12px;--glow-o:.5;--glow-blur:30px;
+  --card-bg:var(--bg2);--card-edge:var(--border);
+  --head-bg:linear-gradient(180deg,var(--bg4),var(--bg3));
+  --head-line:var(--border);--panel-bg:var(--bg2);
+  --btn-r:var(--input-r);--prog-h:2px;
+}
+
+/* ── CARBON — neutral, restrained; best for client screenshots ── */
+[data-v="carbon"]{
+  --bg:#050607;--bg2:#0a0c0f;--bg3:#101418;--bg4:#171c22;
+  --border:#1e242b;--border2:#2b333c;--border3:#3b4550;
+  --text:#d6dade;--text2:#828c96;--text3:#4d565f;
+  --green:#3ddc84;--green2:#2aab68;
+  --red:#f85149;--yellow:#e3b341;--cyan:#58a6ff;--purple:#bc8cff;
+  --glow-rgb:88,166,255;
+  --card-r:12px;--glow-o:.26;--glow-blur:18px;
+  --card-bg:var(--bg2);--card-edge:var(--border);
+  --head-bg:linear-gradient(180deg,var(--bg4),var(--bg3));
+  --head-line:var(--border);--panel-bg:var(--bg2);
+  --btn-r:var(--input-r);--prog-h:2px;
 }
 *{margin:0;padding:0;box-sizing:border-box}
 html{scroll-behavior:smooth}
-body{background:var(--bg);color:var(--text);font-family:'Inter',system-ui,sans-serif;font-size:14px;min-height:100vh;overflow-x:hidden}
+body{background:
+    radial-gradient(900px 480px at 18% -4%, rgba(var(--glow-rgb),.13), transparent 70%),
+    radial-gradient(700px 420px at 92% 104%, rgba(var(--glow-rgb),.09), transparent 70%),
+    var(--bg);
+  background-attachment:fixed;
+  color:var(--text);font-family:var(--font-sans);font-size:14px;min-height:100vh;overflow-x:hidden}
 ::selection{background:var(--cyan-dim);color:var(--cyan)}
 ::-webkit-scrollbar{width:5px;height:5px}
 ::-webkit-scrollbar-track{background:var(--bg2)}
@@ -107,7 +187,7 @@ body{background:var(--bg);color:var(--text);font-family:'Inter',system-ui,sans-s
 .hdr{background:var(--bg2);border-bottom:1px solid var(--border);padding:10px 24px;height:auto;min-height:56px;display:flex;align-items:center;gap:12px;position:sticky;top:0;z-index:200}
 .logo-skull{font-size:20px}
 .logo-txt{font-family:'JetBrains Mono',monospace;font-size:15px;font-weight:700;letter-spacing:2px;color:#fff}
-.kumo-logo{font-family:'JetBrains Mono','Courier New',monospace;font-size:7.5px;line-height:1.35;color:#3b82f6;margin:0;padding:0;white-space:pre;font-weight:700;flex-shrink:0}
+.kumo-logo{font-family:var(--font-mono);font-size:7.5px;line-height:1.35;color:rgb(var(--glow-rgb));margin:0;padding:0;white-space:pre;font-weight:700;flex-shrink:0;text-shadow:0 0 18px rgba(var(--glow-rgb),.45)}
 .logo-ver{font-family:'JetBrains Mono',monospace;font-size:9px;letter-spacing:1px;background:var(--green-dim);border:1px solid rgba(61,220,132,.25);color:var(--green);padding:2px 7px;border-radius:4px}
 .hdr-right{margin-left:auto;font-size:11px;color:var(--text3);font-family:'JetBrains Mono',monospace}
 .hdr-right span{color:var(--cyan)}
@@ -116,7 +196,7 @@ body{background:var(--bg);color:var(--text);font-family:'Inter',system-ui,sans-s
 .search-bar{background:var(--bg2);border-bottom:1px solid var(--border);padding:16px 24px;display:flex;gap:10px;align-items:center}
 .search-hint{font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--green);font-weight:700;flex-shrink:0}
 .search-wrap{flex:1;display:flex;align-items:center;background:var(--bg3);border:1px solid var(--border2);border-radius:var(--input-r);padding:0 14px;transition:border-color .2s,box-shadow .2s}
-.search-wrap:focus-within{border-color:var(--cyan);box-shadow:0 0 0 3px rgba(88,166,255,.1)}
+.search-wrap:focus-within{border-color:rgb(var(--glow-rgb));box-shadow:0 0 0 3px rgba(var(--glow-rgb),.13),0 0 22px -8px rgba(var(--glow-rgb),.6)}
 #domInput{flex:1;background:transparent;border:none;outline:none;color:var(--text);font-family:'JetBrains Mono',monospace;font-size:13px;padding:12px 0;caret-color:var(--cyan)}
 #domInput::placeholder{color:var(--text3)}
 .btn{height:46px;padding:0 20px;border-radius:var(--input-r);font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:700;letter-spacing:1.5px;cursor:pointer;border:1px solid;transition:all .15s;display:flex;align-items:center;gap:6px;white-space:nowrap}
@@ -137,9 +217,10 @@ body{background:var(--bg);color:var(--text);font-family:'Inter',system-ui,sans-s
 .pill.running{border-color:var(--yellow);color:var(--yellow);background:var(--yellow-dim);animation:pulse .8s infinite}
 
 /* ── PROGRESS ── */
-.prog{height:2px;background:var(--border);display:none}
+.prog{height:var(--prog-h);background:var(--border);display:none}
 .prog.on{display:block}
-.prog-fill{height:100%;background:linear-gradient(90deg,var(--cyan),var(--green));transition:width .35s;width:0}
+.prog-fill{height:100%;background:linear-gradient(90deg,color-mix(in srgb,rgb(var(--glow-rgb)) 55%,#000),rgb(var(--glow-rgb)) 70%,var(--green));
+  box-shadow:0 0 14px rgba(var(--glow-rgb),.9);transition:width .35s;width:0}
 
 /* ── STATUS ── */
 .status{padding:7px 24px;background:var(--bg);border-bottom:1px solid var(--border);display:none;align-items:center;gap:12px}
@@ -184,11 +265,39 @@ body{background:var(--bg);color:var(--text);font-family:'Inter',system-ui,sans-s
 }
 
 /* ── CARDS ── */
-.card{break-inside:avoid;margin-bottom:14px;background:var(--bg2);border:1px solid var(--border);border-radius:var(--card-r);overflow:hidden;animation:slideUp .22s ease both;transition:border-color .2s}
-.card:hover{border-color:var(--border2)}
+.card{position:relative;break-inside:avoid;margin-bottom:14px;background:var(--card-bg);
+  border:1px solid var(--card-edge);border-radius:var(--card-r);overflow:hidden;
+  animation:slideUp .22s ease both;
+  transition:border-color .2s,box-shadow .25s,transform .25s;
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,.035),
+    0 14px 34px -22px #000,
+    0 0 var(--glow-blur) -14px rgba(var(--glow-rgb),var(--glow-o))}
+/* lit seam along the top edge */
+.card::before{content:"";position:absolute;top:0;left:0;right:0;height:1px;z-index:2;
+  background:linear-gradient(90deg,transparent 4%,rgba(var(--glow-rgb),.85) 50%,transparent 96%);
+  pointer-events:none}
+.card:hover{border-color:rgba(var(--glow-rgb),.45);transform:translateY(-1px);
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,.05),
+    0 18px 40px -22px #000,
+    0 0 0 1px rgba(var(--glow-rgb),.22),
+    0 0 calc(var(--glow-blur) + 12px) -9px rgba(var(--glow-rgb),calc(var(--glow-o) + .2))}
+/* severity-tinted glow — set by getSeverityClass() */
+.card.sev-crit{--glow-rgb:255,95,87}
+.card.sev-warn{--glow-rgb:227,179,65}
+.card.sev-ok{--glow-rgb:61,220,132}
+/* rotating edge while the module is still streaming */
+.card.running::after{content:"";position:absolute;inset:-1px;border-radius:inherit;padding:1px;z-index:3;
+  background:conic-gradient(from 0deg,transparent 0 62%,rgba(var(--glow-rgb),.9) 78%,transparent 92%);
+  -webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);
+  -webkit-mask-composite:xor;mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);
+  mask-composite:exclude;animation:spinEdge 2.6s linear infinite;pointer-events:none}
+@keyframes spinEdge{to{transform:rotate(1turn)}}
 @keyframes slideUp{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
-.c-head{display:flex;align-items:center;gap:8px;padding:11px 14px;cursor:pointer;user-select:none;border-bottom:1px solid var(--border);background:var(--bg3);transition:background .15s}
-.c-head:hover{background:var(--bg4)}
+.c-head{display:flex;align-items:center;gap:8px;padding:11px 14px;cursor:pointer;user-select:none;
+  border-bottom:1px solid var(--head-line);background:var(--head-bg);transition:background .15s}
+.c-head:hover{background:color-mix(in srgb,rgb(var(--glow-rgb)) 7%,var(--head-bg))}
 .c-icon{font-size:15px;flex-shrink:0;width:20px;text-align:center}
 .c-title{font-size:10px;font-weight:700;letter-spacing:.8px;color:var(--text);text-transform:uppercase;flex:1;font-family:'JetBrains Mono',monospace}
 .c-badges{display:flex;gap:4px;align-items:center;flex-wrap:wrap}
@@ -377,7 +486,71 @@ body{background:var(--bg);color:var(--text);font-family:'Inter',system-ui,sans-s
 .cmp-primary:hover{filter:brightness(1.08);transform:translateY(-1px)}
 .cmp-ghost{background:var(--bg3);color:var(--text2)}
 .cmp-ghost:hover{background:var(--bg);color:var(--text);border-color:var(--border3)}
+
+/* ════════════════════════════════════════════════════════════
+   THEME LAYER — glow accents, stat tiles, variant picker
+   ════════════════════════════════════════════════════════════ */
+
+/* panels + bars pick up the glass treatment */
+.search-bar,.pill-bar,.status,.summary{background:var(--panel-bg)}
+.btn-scan{border-radius:var(--btn-r);
+  box-shadow:0 0 22px -8px rgba(var(--glow-rgb),.75),inset 0 1px 0 rgba(255,255,255,.14)}
+.btn-fast,.btn-stop{border-radius:var(--btn-r)}
+
+/* pills + badges get a matching ring */
+.pill.done{box-shadow:0 0 12px -4px color-mix(in srgb,var(--green) 65%,transparent)}
+.pill.running{box-shadow:0 0 16px -4px color-mix(in srgb,var(--yellow) 75%,transparent)}
+.pill.on{box-shadow:0 0 14px -5px rgba(var(--glow-rgb),.8)}
+.b-fail{text-shadow:0 0 9px color-mix(in srgb,var(--red) 55%,transparent)}
+.b-pass{text-shadow:0 0 9px color-mix(in srgb,var(--green) 55%,transparent)}
+.b-warn{text-shadow:0 0 9px color-mix(in srgb,var(--yellow) 55%,transparent)}
+.b-info{text-shadow:0 0 9px color-mix(in srgb,var(--cyan) 55%,transparent)}
+
+/* stat tiles — compact counters at the top of a card body */
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(78px,1fr));gap:7px;margin-bottom:10px}
+.tile{position:relative;overflow:hidden;border-radius:10px;padding:7px 9px;
+  background:var(--tile-bg,var(--bg3));border:1px solid var(--card-edge)}
+.tile::before{content:"";position:absolute;top:0;left:12%;right:12%;height:1px;
+  background:linear-gradient(90deg,transparent,rgba(var(--glow-rgb),.7),transparent)}
+.tile-k{font-family:var(--font-mono);font-size:8.5px;letter-spacing:1px;color:var(--text3);text-transform:uppercase}
+.tile-v{font-family:var(--font-mono);font-size:17px;font-weight:700;margin-top:1px;font-variant-numeric:tabular-nums;color:var(--text)}
+.tile-v.crit{color:var(--red);text-shadow:0 0 14px color-mix(in srgb,var(--red) 55%,transparent)}
+.tile-v.high{color:var(--orange);text-shadow:0 0 14px color-mix(in srgb,var(--orange) 55%,transparent)}
+.tile-v.ok{color:var(--green);text-shadow:0 0 14px color-mix(in srgb,var(--green) 55%,transparent)}
+.tile-v.mute{color:var(--text2)}
+:root .tile{--tile-bg:var(--bg3)}
+[data-v="glass"] .tile{--tile-bg:linear-gradient(170deg,rgba(130,180,230,.06),rgba(0,0,0,.15))}
+
+/* ── variant picker ── */
+.theme-pick{display:flex;align-items:center;gap:5px;margin-left:10px}
+.theme-lbl{font-family:var(--font-mono);font-size:8.5px;letter-spacing:1px;color:var(--text3);
+  text-transform:uppercase;margin-right:2px}
+.theme-dot{width:19px;height:19px;border-radius:50%;cursor:pointer;padding:0;
+  border:1px solid var(--border2);transition:all .16s;position:relative}
+.theme-dot:hover{transform:scale(1.14);border-color:var(--border3)}
+.theme-dot[aria-pressed="true"]{border-color:#fff;
+  box-shadow:0 0 0 2px var(--bg),0 0 0 3px rgba(var(--glow-rgb),.9),0 0 14px rgba(var(--glow-rgb),.7)}
+.theme-dot:focus-visible{outline:2px solid rgb(var(--glow-rgb));outline-offset:3px}
+.td-glass{background:radial-gradient(circle at 32% 28%,#2f6fa8,#04080d 78%)}
+.td-void{background:radial-gradient(circle at 32% 28%,#5cb0ff,#03050b 78%)}
+.td-web{background:radial-gradient(circle at 32% 28%,#c792ff,#05030e 78%)}
+.td-carbon{background:radial-gradient(circle at 32% 28%,#8291a0,#050607 78%)}
+
+@media (max-width:720px){.theme-lbl{display:none}}
+@media (prefers-reduced-motion:reduce){
+  .card,.card.running::after,.theme-dot{animation:none!important;transition:none!important}
+  .card:hover{transform:none}
+}
 </style>
+<script>
+/* Apply the saved theme before first paint so there is no flash. */
+(function(){
+  var v = 'void';
+  try { v = localStorage.getItem('kumo-theme') || 'void'; } catch(e) {}
+  if (['void','glass','web','carbon'].indexOf(v) === -1) v = 'void';
+  document.documentElement.setAttribute('data-v', v);
+})();
+</script>
 </head>
 <body>
 
@@ -397,6 +570,13 @@ body{background:var(--bg);color:var(--text);font-family:'Inter',system-ui,sans-s
         <span class="logo-ver" style="background:transparent;border-color:var(--border)">no key needed</span>
       </div>
     </div>
+  </div>
+  <div class="theme-pick" role="group" aria-label="Dashboard theme">
+    <span class="theme-lbl">theme</span>
+    <button class="theme-dot td-void"   data-theme="void"   title="Void"       aria-label="Void theme"        aria-pressed="true"></button>
+    <button class="theme-dot td-glass"  data-theme="glass"  title="Void Glass" aria-label="Void Glass theme"  aria-pressed="false"></button>
+    <button class="theme-dot td-web"    data-theme="web"    title="Web 蜘蛛"    aria-label="Web theme"         aria-pressed="false"></button>
+    <button class="theme-dot td-carbon" data-theme="carbon" title="Carbon"     aria-label="Carbon theme"      aria-pressed="false"></button>
   </div>
   <div class="hdr-timer" id="hdrTimer"><span class="t-dot"></span><span>elapsed</span> <b id="hdrTimerVal">0.0s</b></div>
   <span class="hdr-right" id="hdrStat"></span>
@@ -776,8 +956,11 @@ function renderContent(id, data) {
     let h='';
     const c=data.severity_counts||{};
     const sc={critical:'var(--red)',high:'var(--orange)',medium:'var(--yellow)',low:'var(--text2)',info:'var(--cyan)'};
-    const parts=Object.entries(c).map(([s,n])=>`<span style="color:${sc[s]};font-weight:700;font-family:monospace">${s.toUpperCase()}: ${n}</span>`).join('  ');
-    if(parts) h+=`<div style="margin-bottom:10px;font-size:11px">${parts}</div>`;
+    const tv={critical:'crit',high:'high',medium:'',low:'mute',info:'mute'};
+    const tiles=['critical','high','medium','low','info'].filter(s=>c[s]).map(s=>
+      `<div class="tile"><div class="tile-k">${s}</div><div class="tile-v ${tv[s]||''}">${c[s]}</div></div>`).join('');
+    if(tiles) h+=`<div class="tiles">${tiles}</div>`;
+    else if(((data.total ?? data.total_found ?? 0)|0)===0) h+=`<div class="tiles"><div class="tile"><div class="tile-k">findings</div><div class="tile-v ok">0</div></div></div>`;
     h+=`<div class="c-dim" style="margin-bottom:8px;font-size:11px">${data.total_found||0} found / ${data.total_probed||0} probed</div>`;
     const findings=data.findings||[];
     if(!findings.length) return h+'<div class="alert a-green">✓ No sensitive endpoints found</div>';
@@ -791,8 +974,11 @@ function renderContent(id, data) {
     // Built-in vulnerability scanner — no external tools needed
     const c=data.severity_counts||{};
     const sc={critical:'var(--red)',high:'var(--orange)',medium:'var(--yellow)',low:'var(--green)',info:'var(--cyan)'};
-    const parts=Object.entries(c).map(([s,n])=>`<span style="color:${sc[s]};font-weight:700;font-family:monospace">${s.toUpperCase()}: ${n}</span>`).join('  ');
-    if(parts) h+=`<div style="margin-bottom:10px;font-size:11px">${parts}</div>`;
+    const tv={critical:'crit',high:'high',medium:'',low:'mute',info:'mute'};
+    const tiles=['critical','high','medium','low','info'].filter(s=>c[s]).map(s=>
+      `<div class="tile"><div class="tile-k">${s}</div><div class="tile-v ${tv[s]||''}">${c[s]}</div></div>`).join('');
+    if(tiles) h+=`<div class="tiles">${tiles}</div>`;
+    else if(((data.total ?? data.total_found ?? 0)|0)===0) h+=`<div class="tiles"><div class="tile"><div class="tile-k">findings</div><div class="tile-v ok">0</div></div></div>`;
     const findings=data.findings||[];
     if(!findings.length) return h+'<div class="alert a-green">✓ No findings</div>';
     h+='<table class="tbl"><thead><tr><th>Sev</th><th>Finding</th><th>URL</th><th>Size</th></tr></thead><tbody>';
@@ -1519,7 +1705,7 @@ function tryFallbackScreenshot(img, cardId, fallbacks, siteUrl) {
 // ── Card creation ──
 function createCard(id, desc) {
   const card = document.createElement('div');
-  card.className = 'card';
+  card.className = 'card running';
   card.id = 'card-'+id;
   card.innerHTML = `
     <div class="c-head" onclick="toggleCard('${id}')">
@@ -1542,6 +1728,19 @@ function fillCard(id, data) {
   const badges = document.getElementById('badges-'+id);
   if (body) body.innerHTML = renderContent(id, data);
   if (badges) badges.innerHTML = getBadges(id, data);
+  applyCardSeverity(id, badges);
+}
+
+/* Derive a card's glow colour from the badges it just rendered, so every
+   module gets severity glow without any per-module wiring. */
+function applyCardSeverity(id, badges) {
+  const card = document.getElementById('card-'+id);
+  if (!card) return;
+  card.classList.remove('running','sev-crit','sev-warn','sev-ok');
+  const b = badges ? badges.innerHTML : '';
+  if (/b-fail/.test(b))       card.classList.add('sev-crit');
+  else if (/b-warn/.test(b))  card.classList.add('sev-warn');
+  else if (/b-pass/.test(b))  card.classList.add('sev-ok');
 }
 
 // ── Scan ──
@@ -2142,6 +2341,38 @@ document.addEventListener('keydown', e => {
   if (e.key !== 'Escape') return;
   if (document.getElementById('cmpOverlay').classList.contains('on')) { closeCompletionModal(); return; }
   if (scanning) stopScan();
+});
+
+// ── Theme picker ──
+const THEMES = ['void','glass','web','carbon'];
+const THEME_NAMES = {void:'Void', glass:'Void Glass', web:'Web 蜘蛛', carbon:'Carbon'};
+
+function setTheme(v, announce) {
+  if (THEMES.indexOf(v) === -1) v = 'void';
+  document.documentElement.setAttribute('data-v', v);
+  try { localStorage.setItem('kumo-theme', v); } catch(e) {}
+  document.querySelectorAll('.theme-dot').forEach(d =>
+    d.setAttribute('aria-pressed', String(d.dataset.theme === v)));
+  if (announce && typeof toast === 'function') toast('ok', THEME_NAMES[v], 'Theme saved');
+}
+
+document.querySelectorAll('.theme-dot').forEach(d => {
+  d.addEventListener('click', () => setTheme(d.dataset.theme, true));
+});
+
+// Sync the picker with whatever the pre-paint script restored.
+(function(){
+  let v = 'void';
+  try { v = localStorage.getItem('kumo-theme') || 'void'; } catch(e) {}
+  setTheme(v, false);
+})();
+
+// Cycle themes with Ctrl+Shift+T
+document.addEventListener('keydown', e => {
+  if (!(e.ctrlKey && e.shiftKey && (e.key === 'T' || e.key === 't'))) return;
+  e.preventDefault();
+  const cur = document.documentElement.getAttribute('data-v') || 'void';
+  setTheme(THEMES[(THEMES.indexOf(cur) + 1) % THEMES.length], true);
 });
 </script>
 </body>

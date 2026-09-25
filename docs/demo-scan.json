@@ -1,0 +1,959 @@
+{
+  "_comment": "Synthetic scan results for a fictional target, shaped exactly like real module output. Used to generate the README screenshots without pointing Kumo at anyone. corp.demo is not a real domain, .demo is not a delegated TLD, and the addresses are RFC 5737 / RFC 3849 documentation ranges.",
+  "_domain": "corp.demo",
+  "dns": {
+    "ips": {
+      "v4": [
+        "203.0.113.24",
+        "203.0.113.25"
+      ],
+      "v6": [
+        "2001:db8:4f2::19"
+      ]
+    },
+    "records": {
+      "A": [
+        "203.0.113.24",
+        "203.0.113.25"
+      ],
+      "MX": [
+        "10 mail.corp.demo",
+        "20 mail2.corp.demo"
+      ],
+      "NS": [
+        "ns1.corp.demo",
+        "ns2.corp.demo"
+      ],
+      "TXT": [
+        "v=spf1 include:_spf.corp.demo ip4:203.0.113.0/24 -all",
+        "google-site-verification=xK2p9..."
+      ],
+      "CAA": [
+        "0 issue \"letsencrypt.org\""
+      ]
+    },
+    "email_security": {
+      "spf": {
+        "found": true,
+        "policy": "-all (strict)",
+        "record": "v=spf1 include:_spf.corp.demo -all"
+      },
+      "dmarc": {
+        "found": true,
+        "policy": "p=quarantine",
+        "record": "v=DMARC1; p=quarantine; rua=mailto:soc@corp.demo"
+      },
+      "dkim": {
+        "found": false,
+        "selector": ""
+      }
+    }
+  },
+  "geo": {
+    "ip": "203.0.113.24",
+    "hostname": "edge-01.corp.demo",
+    "city": "Amsterdam",
+    "region": "North Holland",
+    "country": "Netherlands",
+    "country_code": "NL",
+    "flag": "🇳🇱",
+    "lat": 52.3676,
+    "lon": 4.9041,
+    "timezone": "Europe/Amsterdam",
+    "isp": "Example Hosting BV",
+    "asn": "AS64500 Example Hosting",
+    "is_hosting": true
+  },
+  "whois": {
+    "domain": "corp.demo",
+    "registration": "2009-04-17",
+    "expiration": "2027-04-17",
+    "days_until_expiry": 568,
+    "last_changed": "2026-03-02",
+    "status": [
+      "clientTransferProhibited",
+      "serverDeleteProhibited"
+    ],
+    "nameservers": [
+      "ns1.corp.demo",
+      "ns2.corp.demo"
+    ],
+    "entities": [
+      {
+        "role": "Registrar",
+        "name": "Demo Registrar Inc."
+      }
+    ]
+  },
+  "ssl": {
+    "common_name": "corp.demo",
+    "issuer": "Let's Encrypt R11",
+    "valid_until": "2026-11-25",
+    "days_left": 61,
+    "protocol": "TLSv1.3",
+    "cipher": "TLS_AES_256_GCM_SHA384",
+    "cipher_bits": 256,
+    "sans": [
+      "corp.demo",
+      "www.corp.demo",
+      "api.corp.demo",
+      "m.corp.demo"
+    ]
+  },
+  "headers": {
+    "grade": "C",
+    "score": 62,
+    "status_code": 200,
+    "server": "nginx",
+    "headers": [
+      {
+        "header": "strict-transport-security",
+        "present": true,
+        "value": "max-age=31536000; includeSubDomains",
+        "description": "Forces HTTPS",
+        "severity": "high"
+      },
+      {
+        "header": "content-security-policy",
+        "present": false,
+        "value": "",
+        "description": "Controls which resources may load",
+        "severity": "high"
+      },
+      {
+        "header": "x-frame-options",
+        "present": false,
+        "value": "",
+        "description": "Clickjacking protection",
+        "severity": "medium"
+      },
+      {
+        "header": "x-content-type-options",
+        "present": true,
+        "value": "nosniff",
+        "description": "Blocks MIME sniffing",
+        "severity": "medium"
+      },
+      {
+        "header": "referrer-policy",
+        "present": true,
+        "value": "no-referrer",
+        "description": "Controls referrer leakage",
+        "severity": "low"
+      },
+      {
+        "header": "permissions-policy",
+        "present": false,
+        "value": "",
+        "description": "Restricts browser features",
+        "severity": "low"
+      }
+    ],
+    "disclosure": [
+      {
+        "header": "server",
+        "value": "nginx/1.24.0"
+      },
+      {
+        "header": "x-powered-by",
+        "value": "PHP/8.2.4"
+      }
+    ]
+  },
+  "wafw00f": {
+    "normal_status": 200,
+    "probe_status": 403,
+    "probe_blocked": true,
+    "detected": [
+      {
+        "waf": "Cloudflare",
+        "vendor": "Cloudflare Inc.",
+        "confidence": "high",
+        "evidence": [
+          "cf-ray header",
+          "__cfduid cookie",
+          "403 on probe"
+        ]
+      }
+    ]
+  },
+  "ports": {
+    "total_scanned": 72,
+    "open": [
+      {
+        "port": 22,
+        "service": "ssh",
+        "risk": "medium",
+        "version": "OpenSSH 8.9p1",
+        "banner": "SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.4"
+      },
+      {
+        "port": 80,
+        "service": "http",
+        "risk": "low",
+        "banner": "nginx/1.24.0"
+      },
+      {
+        "port": 443,
+        "service": "https",
+        "risk": "low",
+        "banner": "nginx/1.24.0"
+      },
+      {
+        "port": 3306,
+        "service": "mysql",
+        "risk": "critical",
+        "version": "8.0.35",
+        "banner": "5.7.44-log MySQL Community Server",
+        "source": "shodan_censys"
+      },
+      {
+        "port": 8080,
+        "service": "http-proxy",
+        "risk": "high",
+        "banner": "Apache Tomcat/9.0.71"
+      },
+      {
+        "port": 9200,
+        "service": "elasticsearch",
+        "risk": "critical",
+        "banner": "{ \"version\": { \"number\": \"7.17.9\" } }",
+        "source": "shodan_censys"
+      }
+    ]
+  },
+  "whatweb": {
+    "url": "https://corp.demo",
+    "total_detected": 14,
+    "detected": {
+      "Web Server": [
+        "nginx 1.24.0"
+      ],
+      "Language": [
+        "PHP 8.2.4"
+      ],
+      "CMS": [
+        "WordPress 6.4.2"
+      ],
+      "JavaScript": [
+        "jQuery 3.6.0",
+        "React 18.2.0"
+      ],
+      "Analytics": [
+        "Google Analytics",
+        "Matomo"
+      ],
+      "CDN / WAF": [
+        "Cloudflare"
+      ],
+      "Security": [
+        "HSTS",
+        "reCAPTCHA v3"
+      ]
+    }
+  },
+  "robots": {
+    "robots": {
+      "count": 18,
+      "disallowed": [
+        {
+          "path": "/wp-admin/",
+          "sensitive": true
+        },
+        {
+          "path": "/backup/",
+          "sensitive": true
+        },
+        {
+          "path": "/internal/api/",
+          "sensitive": true
+        },
+        {
+          "path": "/tmp/",
+          "sensitive": false
+        }
+      ],
+      "allowed": [
+        {
+          "path": "/wp-admin/admin-ajax.php",
+          "interesting": true
+        },
+        {
+          "path": "/public/",
+          "interesting": false
+        }
+      ]
+    },
+    "sitemaps": [
+      "https://corp.demo/sitemap.xml",
+      "https://corp.demo/sitemap-news.xml"
+    ],
+    "security_txt": {
+      "found": false
+    }
+  },
+  "endpoints": {
+    "total_probed": 84,
+    "total_found": 6,
+    "total": 6,
+    "severity_counts": {
+      "critical": 1,
+      "high": 2,
+      "medium": 3
+    },
+    "findings": [
+      {
+        "severity": "critical",
+        "name": "Environment File Exposed",
+        "path": "/.env",
+        "url": "https://corp.demo/.env",
+        "status": 200,
+        "size": 412
+      },
+      {
+        "severity": "high",
+        "name": "Git Config Exposed",
+        "path": "/.git/config",
+        "url": "https://corp.demo/.git/config",
+        "status": 200,
+        "size": 288
+      },
+      {
+        "severity": "high",
+        "name": "Database Backup",
+        "path": "/backup/db.sql",
+        "url": "https://corp.demo/backup/db.sql",
+        "status": 200,
+        "size": 4194304
+      },
+      {
+        "severity": "medium",
+        "name": "phpinfo() Exposed",
+        "path": "/phpinfo.php",
+        "url": "https://corp.demo/phpinfo.php",
+        "status": 200,
+        "size": 72311
+      },
+      {
+        "severity": "medium",
+        "name": "Swagger/OpenAPI Spec",
+        "path": "/swagger.json",
+        "url": "https://corp.demo/swagger.json",
+        "status": 200,
+        "size": 18422
+      },
+      {
+        "severity": "medium",
+        "name": ".DS_Store Exposed",
+        "path": "/.DS_Store",
+        "url": "https://corp.demo/.DS_Store",
+        "status": 200,
+        "size": 6148
+      }
+    ]
+  },
+  "nuclei": {
+    "nuclei_installed": false,
+    "total": 10,
+    "total_found": 10,
+    "severity_counts": {
+      "critical": 2,
+      "high": 3,
+      "medium": 5
+    },
+    "findings": [
+      {
+        "severity": "critical",
+        "name": "Environment File Exposed",
+        "path": "/.env",
+        "url": "https://corp.demo/.env",
+        "status": 200,
+        "size": 412,
+        "rule_id": "env-file",
+        "source": "rule_playbook",
+        "description": "A .env file with live credentials is readable without authentication."
+      },
+      {
+        "severity": "critical",
+        "name": "Spring Actuator /env Exposed",
+        "path": "/actuator/env",
+        "url": "https://corp.demo/actuator/env",
+        "status": 200,
+        "size": 9134,
+        "rule_id": "spring-actuator-env",
+        "source": "rule_playbook"
+      },
+      {
+        "severity": "high",
+        "name": "Git Config Exposed",
+        "path": "/.git/config",
+        "url": "https://corp.demo/.git/config",
+        "status": 200,
+        "size": 288,
+        "rule_id": "git-config",
+        "source": "rule_playbook"
+      },
+      {
+        "severity": "high",
+        "name": "etcd RAFT Unauthenticated API",
+        "path": "/members",
+        "url": "https://corp.demo/members",
+        "status": 200,
+        "size": 731,
+        "rule_id": "http-etcd-unauthenticated-raft",
+        "source": "rule_playbook"
+      },
+      {
+        "severity": "high",
+        "name": "Gitea Unauthenticated Repo Search",
+        "path": "/api/v1/repos/search?limit=1",
+        "url": "https://corp.demo/api/v1/repos/search?limit=1",
+        "status": 200,
+        "size": 1904,
+        "rule_id": "CVE-2026-59774",
+        "source": "rule_playbook",
+        "cve": "CVE-2026-59774"
+      },
+      {
+        "severity": "medium",
+        "name": "Swagger/OpenAPI Spec Exposed",
+        "path": "/swagger.json",
+        "url": "https://corp.demo/swagger.json",
+        "status": 200,
+        "size": 18422,
+        "rule_id": "swagger-spec",
+        "source": "rule_playbook"
+      },
+      {
+        "severity": "medium",
+        "name": "Prometheus Metrics Exposed",
+        "path": "/metrics",
+        "url": "https://corp.demo/metrics",
+        "status": 200,
+        "size": 55210,
+        "rule_id": "prometheus-metrics",
+        "source": "rule_playbook"
+      }
+    ]
+  },
+  "shodan": {
+    "api_key_used": false,
+    "summary": {
+      "total_ports": 6,
+      "total_cves": 4,
+      "critical_cves": [
+        {
+          "cve": "CVE-2026-19478",
+          "cvss": 9.8,
+          "ip": "203.0.113.24"
+        },
+        {
+          "cve": "CVE-2025-49001",
+          "cvss": 9.1,
+          "ip": "203.0.113.25"
+        }
+      ]
+    },
+    "ips": {
+      "203.0.113.24": {
+        "ports": [
+          22,
+          80,
+          443,
+          8080
+        ],
+        "os": "Ubuntu 22.04",
+        "tags": [
+          "cloud",
+          "self-signed"
+        ],
+        "cves": [
+          {
+            "id": "CVE-2026-19478",
+            "cvss": 9.8,
+            "summary": "Unauthenticated project listing discloses private repositories."
+          },
+          {
+            "id": "CVE-2025-49001",
+            "cvss": 9.1,
+            "summary": "JWT authentication bypass allows full API access."
+          },
+          {
+            "id": "CVE-2025-31720",
+            "cvss": 7.5,
+            "summary": "Denial of service via malformed request header."
+          }
+        ]
+      },
+      "203.0.113.25": {
+        "ports": [
+          3306,
+          9200
+        ],
+        "os": "Debian 12",
+        "tags": [
+          "database",
+          "elastic"
+        ],
+        "cves": [
+          {
+            "id": "CVE-2026-27796",
+            "cvss": 6.5,
+            "summary": "Information disclosure through an unauthenticated integrations endpoint."
+          }
+        ]
+      }
+    }
+  },
+  "subdomains": {
+    "total": 148,
+    "alive_count": 93,
+    "ct_total": 148,
+    "sources_failed": [],
+    "sensitive": [
+      {
+        "subdomain": "vpn.corp.demo",
+        "ip": "203.0.113.40"
+      },
+      {
+        "subdomain": "staging.corp.demo",
+        "ip": "203.0.113.41"
+      },
+      {
+        "subdomain": "jenkins.corp.demo",
+        "ip": "203.0.113.42"
+      }
+    ],
+    "ct_sensitive": [
+      "internal-api.corp.demo",
+      "backup.corp.demo",
+      "test-sso.corp.demo"
+    ],
+    "resolved": [
+      {
+        "subdomain": "api.corp.demo",
+        "ip": "203.0.113.30",
+        "alive": true,
+        "sensitive": false
+      },
+      {
+        "subdomain": "vpn.corp.demo",
+        "ip": "203.0.113.40",
+        "alive": true,
+        "sensitive": true
+      },
+      {
+        "subdomain": "staging.corp.demo",
+        "ip": "203.0.113.41",
+        "alive": true,
+        "sensitive": true
+      },
+      {
+        "subdomain": "mail.corp.demo",
+        "ip": "203.0.113.50",
+        "alive": true,
+        "sensitive": false
+      },
+      {
+        "subdomain": "jenkins.corp.demo",
+        "ip": "203.0.113.42",
+        "alive": true,
+        "sensitive": true
+      },
+      {
+        "subdomain": "cdn.corp.demo",
+        "ip": "203.0.113.60",
+        "alive": true,
+        "sensitive": false
+      },
+      {
+        "subdomain": "m.corp.demo",
+        "ip": "203.0.113.24",
+        "alive": true,
+        "sensitive": false
+      }
+    ]
+  },
+  "brute": {
+    "total_checked": 2048,
+    "wildcard_detected": true,
+    "wildcard_ip": "203.0.113.99",
+    "found": [
+      {
+        "subdomain": "dev.corp.demo",
+        "ip": "203.0.113.70"
+      },
+      {
+        "subdomain": "git.corp.demo",
+        "ip": "203.0.113.71"
+      },
+      {
+        "subdomain": "grafana.corp.demo",
+        "ip": "203.0.113.72"
+      }
+    ]
+  },
+  "wayback": {
+    "total": 12840,
+    "range": "2011 → 2026",
+    "snapshot": {
+      "timestamp": "2026-09-02 14:21",
+      "url": "https://web.archive.org/web/2026/https://corp.demo"
+    },
+    "interesting": [
+      "https://corp.demo/admin/login.php?debug=1",
+      "https://corp.demo/api/v1/internal/users.json",
+      "https://corp.demo/backup/2019-db.sql.gz"
+    ]
+  },
+  "breachintel": {
+    "summary": {
+      "total_infostealer_hits": 7,
+      "total_employees_leaked": 23,
+      "total_clients_leaked": 4,
+      "total_emails_found": 34,
+      "critical_findings": [
+        {
+          "source": "Hudson Rock",
+          "type": "Infostealer infection",
+          "detail": "7 employee machines infected — corporate credentials for vpn.corp.demo captured, last seen 2026-08-30."
+        },
+        {
+          "source": "HaveIBeenPwned",
+          "type": "Credential breach",
+          "detail": "23 employee addresses appear across 4 breach corpora, most recently in 2025."
+        }
+      ]
+    },
+    "sources": {
+      "hudsonrock": {
+        "found": true,
+        "employees": 7,
+        "clients": 4
+      },
+      "hibp": {
+        "found": true,
+        "breaches": 4
+      }
+    },
+    "osint_links": []
+  },
+  "email_harvest": {
+    "domain": "corp.demo",
+    "sources_used": [
+      "crt.sh",
+      "wayback",
+      "homepage crawl",
+      "Hudson Rock"
+    ],
+    "emails": [
+      "contact@corp.demo",
+      "support@corp.demo",
+      "soc@corp.demo",
+      "n.delaunay@corp.demo"
+    ]
+  },
+  "favicon": {
+    "favicon_found": true,
+    "favicon_url": "https://corp.demo/favicon.ico",
+    "size_bytes": 15406,
+    "hash_md5": "9f2c1d4b8e7a3056c1f9b2d4e8a71c30",
+    "hash_shodan": "-1274855244",
+    "technology": "WordPress",
+    "search_links": {
+      "Shodan": "https://www.shodan.io/search?query=http.favicon.hash%3A-1274855244",
+      "FOFA": "https://fofa.info/result?qbase64=..."
+    }
+  },
+  "cloud_buckets": {
+    "checked": 96,
+    "exposed": [
+      {
+        "name": "corp-demo-backups",
+        "provider": "AWS S3",
+        "url": "https://corp-demo-backups.s3.amazonaws.com",
+        "severity": "critical",
+        "status": 200,
+        "files": 1284
+      },
+      {
+        "name": "corpdemo-assets",
+        "provider": "AWS S3",
+        "url": "https://corpdemo-assets.s3.amazonaws.com",
+        "severity": "medium",
+        "status": 403
+      },
+      {
+        "name": "corp-demo-static",
+        "provider": "Google Cloud Storage",
+        "url": "https://storage.googleapis.com/corp-demo-static",
+        "severity": "medium",
+        "status": 403
+      }
+    ]
+  },
+  "js_secrets": {
+    "js_files": [
+      "https://corp.demo/static/js/main.4f2a.js",
+      "https://corp.demo/static/js/vendor.91cd.js",
+      "https://corp.demo/static/js/config.js"
+    ],
+    "secrets": [
+      {
+        "type": "AWS Access Key ID",
+        "severity": "critical",
+        "value": "AKIA****************",
+        "file": "static/js/config.js",
+        "line": "const AWS_KEY = \"AKIA****************\"; // TODO remove before prod"
+      },
+      {
+        "type": "Google Maps API Key",
+        "severity": "high",
+        "value": "AIzaSy*******************",
+        "file": "static/js/main.4f2a.js",
+        "line": "mapsApiKey: \"AIzaSy*******************\","
+      },
+      {
+        "type": "Internal API endpoint",
+        "severity": "medium",
+        "value": "https://internal-api.corp.demo/v2",
+        "file": "static/js/main.4f2a.js",
+        "line": "const BASE = \"https://internal-api.corp.demo/v2\";"
+      },
+      {
+        "type": "Sentry DSN",
+        "severity": "low",
+        "value": "https://****@o12345.ingest.sentry.io/456",
+        "file": "static/js/vendor.91cd.js",
+        "line": "Sentry.init({ dsn: \"https://****@o12345.ingest.sentry.io/456\" });"
+      }
+    ]
+  },
+  "http_inspect": {
+    "summary": {
+      "final_status": 200,
+      "final_url": "https://corp.demo/",
+      "hops": 2,
+      "tls": "TLSv1.3"
+    },
+    "redirect_chain": [
+      {
+        "status": 301,
+        "url": "http://corp.demo/",
+        "location": "https://corp.demo/"
+      },
+      {
+        "status": 200,
+        "url": "https://corp.demo/"
+      }
+    ],
+    "methods": {
+      "allowed": [
+        "GET",
+        "HEAD",
+        "POST",
+        "OPTIONS"
+      ],
+      "dangerous": [
+        "TRACE"
+      ]
+    },
+    "cookies": [
+      {
+        "name": "session",
+        "secure": true,
+        "httponly": true,
+        "samesite": "Lax"
+      },
+      {
+        "name": "analytics_id",
+        "secure": false,
+        "httponly": false,
+        "samesite": "None"
+      }
+    ],
+    "cors": {
+      "acao": "*",
+      "credentials": false,
+      "risk": "medium"
+    },
+    "notable_headers": [
+      {
+        "header": "server",
+        "value": "nginx/1.24.0"
+      },
+      {
+        "header": "x-powered-by",
+        "value": "PHP/8.2.4"
+      },
+      {
+        "header": "cf-ray",
+        "value": "8f2c1d4b8e7a3056-TUN"
+      }
+    ],
+    "request": {
+      "method": "GET",
+      "url": "https://corp.demo/"
+    },
+    "response": {
+      "status": 200,
+      "size": 48211
+    }
+  },
+  "content_intel": {
+    "total": 214,
+    "sources_scanned": {
+      "js_files": 9,
+      "inline_scripts": 14
+    },
+    "counts": {
+      "urls_internal": 118,
+      "emails": 12,
+      "api_endpoints": 21,
+      "internal_hosts": 9,
+      "cloud_storage": 3,
+      "databases": 2
+    },
+    "categories": {
+      "internal_hosts": [
+        "internal-api.corp.demo",
+        "ldap.corp.internal",
+        "jenkins.corp.demo"
+      ],
+      "api_endpoints": [
+        "/api/v2/accounts",
+        "/api/v2/transfers",
+        "/api/internal/admin"
+      ],
+      "cloud_storage": [
+        "corp-demo-backups.s3.amazonaws.com"
+      ],
+      "databases": [
+        "mysql://db01.corp.internal:3306"
+      ],
+      "emails": [
+        "soc@corp.demo",
+        "dev@corp.demo"
+      ],
+      "urls_internal": [
+        "/wp-admin/admin-ajax.php",
+        "/api/v2/health",
+        "/assets/config.js"
+      ],
+      "ip_addresses": [
+        "10.12.4.18",
+        "203.0.113.24"
+      ]
+    }
+  },
+  "api_fuzzer": {
+    "total": 11,
+    "base_found": "/api/v2",
+    "bases_found": [
+      "/api/v1",
+      "/api/v2"
+    ],
+    "graphql": {
+      "path": "/graphql",
+      "size": 41233,
+      "severity": "high",
+      "detail": "Introspection is enabled — the full schema is readable without authentication."
+    },
+    "specs": [
+      {
+        "name": "Swagger / OpenAPI",
+        "path": "/swagger.json",
+        "status": 200,
+        "size": 18422,
+        "severity": "medium"
+      },
+      {
+        "name": "OpenAPI YAML",
+        "path": "/openapi.yaml",
+        "status": 200,
+        "size": 15104,
+        "severity": "medium"
+      }
+    ],
+    "discovered": [
+      {
+        "path": "/api/v2/accounts",
+        "status": 401,
+        "auth": true
+      },
+      {
+        "path": "/api/v2/transfers",
+        "status": 401,
+        "auth": true
+      },
+      {
+        "path": "/api/v2/health",
+        "status": 200,
+        "auth": false
+      },
+      {
+        "path": "/api/internal/admin",
+        "status": 200,
+        "auth": false,
+        "risk": "high"
+      }
+    ],
+    "endpoints": [
+      {
+        "path": "/api/v2/accounts",
+        "status": 401,
+        "size": 92
+      },
+      {
+        "path": "/api/v2/transfers",
+        "status": 401,
+        "size": 92
+      },
+      {
+        "path": "/api/v2/health",
+        "status": 200,
+        "size": 47
+      },
+      {
+        "path": "/api/internal/admin",
+        "status": 200,
+        "size": 8841,
+        "risk": "high"
+      }
+    ]
+  },
+  "censys": {
+    "api_used": false,
+    "ips": [
+      "203.0.113.24",
+      "203.0.113.25"
+    ],
+    "certificates": [
+      {
+        "subject": "corp.demo",
+        "issuer": "Let's Encrypt R11",
+        "validity": "2026-08-26 → 2026-11-25"
+      },
+      {
+        "subject": "*.corp.demo",
+        "issuer": "Let's Encrypt R11",
+        "validity": "2026-07-14 → 2026-10-12"
+      }
+    ],
+    "links": {
+      "Censys": "https://search.censys.io/hosts/203.0.113.24"
+    }
+  },
+  "screenshot": {
+    "title": "Corp Demo — Internal Services Portal",
+    "description": "Accounts, transfers and internal tooling for Corp Demo staff and partners.",
+    "url": "https://corp.demo",
+    "cms": "WordPress 6.4.2",
+    "ransomware_status": "clean",
+    "ransomware": [],
+    "threat_feeds": {
+      "checked": 3,
+      "hits": 0
+    }
+  }
+}
