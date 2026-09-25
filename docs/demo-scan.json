@@ -955,5 +955,385 @@
       "checked": 3,
       "hits": 0
     }
+  },
+  "dorks": {
+    "File & Directory Discovery": [
+      [
+        "Directory Listings",
+        "site:corp.demo intitle:\"index of\""
+      ],
+      [
+        "Config Files",
+        "site:corp.demo ext:xml | ext:conf | ext:cnf | ext:cfg | ext:ini | ext:env"
+      ],
+      [
+        "Database Files",
+        "site:corp.demo ext:sql | ext:dbf | ext:mdb"
+      ],
+      [
+        "Log Files",
+        "site:corp.demo ext:log"
+      ],
+      [
+        "Backup Files",
+        "site:corp.demo ext:bkf | ext:bkp | ext:bak | ext:old | ext:backup"
+      ],
+      [
+        "Exposed Documents",
+        "site:corp.demo ext:doc | ext:docx | ext:pdf | ext:rtf | ext:ppt | ext:csv | ext:xls"
+      ],
+      [
+        ".env Files",
+        "site:corp.demo ext:env | inurl:.env"
+      ],
+      [
+        ".git Exposure",
+        "site:corp.demo inurl:\".git\" intitle:\"index of\""
+      ],
+      [
+        "YAML Configs",
+        "site:corp.demo ext:yml | ext:yaml inurl:config"
+      ],
+      [
+        "/etc/ Listing",
+        "site:corp.demo intitle:\"index of\" \"/etc/\""
+      ],
+      [
+        "pom.xml",
+        "site:corp.demo inurl:pom.xml"
+      ],
+      [
+        "PHP Config",
+        "site:corp.demo inurl:conf.php"
+      ],
+      [
+        "download.php",
+        "site:corp.demo inurl:download.php"
+      ]
+    ],
+    "WordPress & CMS": [
+      [
+        "WordPress Sites",
+        "site:corp.demo inurl:wp-content | inurl:wp-includes"
+      ],
+      [
+        "WP Login",
+        "site:corp.demo inurl:wp-login.php"
+      ],
+      [
+        "WP Config Backup",
+        "site:corp.demo inurl:wp-config ext:bak | ext:txt | ext:old"
+      ],
+      [
+        "WP Debug Log",
+        "site:corp.demo inurl:wp-content/debug.log"
+      ],
+      [
+        "WP Uploads",
+        "site:corp.demo intitle:\"index of\" \"wp-content/uploads\""
+      ],
+      [
+        "WP Plugin Vulns",
+        "site:corp.demo inurl:wp-content/plugins/contact-form-7"
+      ],
+      [
+        "WP xmlrpc.php",
+        "site:corp.demo inurl:xmlrpc.php"
+      ],
+      [
+        "Drupal Login",
+        "site:corp.demo inurl:user/login intitle:Drupal"
+      ],
+      [
+        "Joomla DB",
+        "site:corp.demo inurl:joomla/database"
+      ]
+    ],
+    "Database & SQL": [
+      [
+        "SQL Errors",
+        "site:corp.demo intext:\"sql syntax near\" | intext:\"Warning: mysql_connect()\" | intext:\"Warning: pg_connect()\""
+      ],
+      [
+        "SQL Files",
+        "site:corp.demo ext:sql intext:insert | intext:select"
+      ],
+      [
+        "MySQL Config",
+        "site:corp.demo ext:cnf intext:password"
+      ],
+      [
+        "SQL Dumps",
+        "site:corp.demo intitle:\"index of\" ext:sql | ext:dump"
+      ],
+      [
+        "MongoDB",
+        "site:corp.demo inurl:mongodb | inurl:27017"
+      ]
+    ],
+    "Auth & Admin": [
+      [
+        "Login Pages",
+        "site:corp.demo inurl:login | inurl:signin | inurl:auth"
+      ],
+      [
+        "Admin Pages",
+        "site:corp.demo inurl:admin | inurl:administrator"
+      ],
+      [
+        "Admin Portal ASPX",
+        "site:corp.demo inurl:admin.aspx"
+      ],
+      [
+        "phpMyAdmin",
+        "site:corp.demo inurl:phpmyadmin"
+      ],
+      [
+        "cPanel",
+        "site:corp.demo inurl:cpanel | inurl:2082 | inurl:2083"
+      ],
+      [
+        "Admin Backups",
+        "site:corp.demo inurl:admin ext:bak | ext:old"
+      ]
+    ],
+    "Vulnerabilities": [
+      [
+        "phpinfo()",
+        "site:corp.demo ext:php intitle:phpinfo \"published by the PHP Group\""
+      ],
+      [
+        "Backdoors/Shells",
+        "site:corp.demo inurl:shell | inurl:backdoor | inurl:wso | inurl:cmd"
+      ],
+      [
+        "Install/Setup",
+        "site:corp.demo inurl:install | inurl:setup ext:php"
+      ],
+      [
+        "Open Redirects",
+        "site:corp.demo inurl:url= | inurl:return= | inurl:next= | inurl:redirect="
+      ],
+      [
+        "Apache Struts",
+        "site:corp.demo ext:action | ext:struts | ext:do"
+      ],
+      [
+        ".htaccess",
+        "site:corp.demo inurl:.htaccess"
+      ],
+      [
+        "crossdomain.xml",
+        "site:corp.demo inurl:crossdomain.xml"
+      ],
+      [
+        "File Upload",
+        "site:corp.demo inurl:upload | inurl:file_upload"
+      ],
+      [
+        "SSRF Params",
+        "site:corp.demo inurl:url= | inurl:uri= | inurl:path= | inurl:src="
+      ],
+      [
+        "Debug/Trace",
+        "site:corp.demo intext:\"stack trace\" | intext:\"traceback\""
+      ],
+      [
+        "Server Status",
+        "site:corp.demo inurl:server-status | inurl:server-info"
+      ],
+      [
+        "GeoServer",
+        "site:corp.demo inurl:geoserver"
+      ],
+      [
+        "ArcGIS REST",
+        "site:corp.demo inurl:ArcGIS/rest/services"
+      ]
+    ],
+    "API & Config": [
+      [
+        "API Endpoints",
+        "site:corp.demo inurl:api | inurl:v1 | inurl:v2 | inurl:graphql"
+      ],
+      [
+        "Swagger/OpenAPI",
+        "site:corp.demo inurl:swagger | inurl:api-docs"
+      ],
+      [
+        "JWKS Files",
+        "site:corp.demo inurl:jwks-rsa | inurl:.well-known/jwks"
+      ],
+      [
+        "docker-compose",
+        "site:corp.demo inurl:docker-compose.yml"
+      ],
+      [
+        "Firebase Config",
+        "site:corp.demo inurl:firebaseio.com"
+      ],
+      [
+        "GraphQL",
+        "site:corp.demo inurl:graphiql | inurl:graphql/console"
+      ],
+      [
+        "JSON-RPC",
+        "site:corp.demo inurl:jsonrpc"
+      ],
+      [
+        "main.yml",
+        "site:corp.demo inurl:main.yml"
+      ]
+    ],
+    "OSINT & Social": [
+      [
+        "Pastebin",
+        "site:pastebin.com \"corp.demo\""
+      ],
+      [
+        "LinkedIn",
+        "site:linkedin.com employees \"corp.demo\""
+      ],
+      [
+        "GitHub Code",
+        "site:github.com \"corp.demo\""
+      ],
+      [
+        "Reddit",
+        "site:reddit.com \"corp.demo\""
+      ],
+      [
+        "StackOverflow",
+        "site:stackoverflow.com \"corp.demo\""
+      ],
+      [
+        "Trello",
+        "site:trello.com \"corp.demo\""
+      ],
+      [
+        "GitHub Secrets",
+        "site:github.com \"corp.demo\" password | secret | token | api_key"
+      ]
+    ]
+  },
+  "osint": {
+    "Subdomain & Cert Discovery": [
+      [
+        "crt.sh",
+        "https://crt.sh/?q=%25.corp.demo"
+      ],
+      [
+        "DNSDumpster",
+        "https://dnsdumpster.com/"
+      ],
+      [
+        "SecurityTrails",
+        "https://securitytrails.com/domain/corp.demo/dns"
+      ]
+    ],
+    "Threat Intelligence": [
+      [
+        "VirusTotal",
+        "https://www.virustotal.com/gui/domain/corp.demo"
+      ],
+      [
+        "AlienVault OTX",
+        "https://otx.alienvault.com/indicator/domain/corp.demo"
+      ],
+      [
+        "URLScan.io",
+        "https://urlscan.io/search/#corp.demo"
+      ],
+      [
+        "AbuseIPDB",
+        "https://www.abuseipdb.com/check/corp.demo"
+      ],
+      [
+        "IBM X-Force",
+        "https://exchange.xforce.ibmcloud.com/url/corp.demo"
+      ],
+      [
+        "Pulsedive",
+        "https://pulsedive.com/indicator/?ioc=corp.demo"
+      ],
+      [
+        "ThreatCrowd",
+        "https://www.threatcrowd.org/domain.php?domain=corp.demo"
+      ]
+    ],
+    "Infrastructure": [
+      [
+        "Shodan",
+        "https://www.shodan.io/search?query=corp.demo"
+      ],
+      [
+        "Censys Hosts",
+        "https://platform.censys.io/search?q=%28%22corp.demo%22%29+and+host.ip%3A+*"
+      ],
+      [
+        "Censys Certs",
+        "https://search.censys.io/certificates?q=corp.demo"
+      ],
+      [
+        "ZoomEye",
+        "https://www.zoomeye.org/searchResult?q=corp.demo"
+      ],
+      [
+        "FullHunt",
+        "https://fullhunt.io/search?query=corp.demo"
+      ]
+    ],
+    "Archive & History": [
+      [
+        "Wayback Machine",
+        "https://web.archive.org/web/*/corp.demo"
+      ],
+      [
+        "Wayback URLs",
+        "https://web.archive.org/cdx/search/cdx?url=*.corp.demo&output=text&fl=original&collapse=urlkey"
+      ]
+    ],
+    "Bug Bounty": [
+      [
+        "OpenBugBounty",
+        "https://www.openbugbounty.org/search/?search=corp.demo"
+      ],
+      [
+        "HackerOne",
+        "https://hackerone.com/directory/programs?query=corp.demo"
+      ]
+    ],
+    "Code & Leaks": [
+      [
+        "GitHub Code",
+        "https://github.com/search?q=%22corp.demo%22&type=code"
+      ],
+      [
+        "GitLab",
+        "https://gitlab.com/search?search=corp.demo"
+      ],
+      [
+        "Grep.app",
+        "https://grep.app/search?q=corp.demo"
+      ],
+      [
+        "IntelX",
+        "https://intelx.io/?s=corp.demo"
+      ],
+      [
+        "Pastebin",
+        "https://www.google.com/search?q=site:pastebin.com+%22corp.demo%22"
+      ]
+    ],
+    "Email": [
+      [
+        "Hunter.io",
+        "https://hunter.io/try/search/results?domain=corp.demo"
+      ],
+      [
+        "EmailRep",
+        "https://emailrep.io/query/corp.demo"
+      ]
+    ]
   }
 }
