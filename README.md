@@ -115,7 +115,7 @@ with the web interface on top.
 Then enter the domain when prompted. Or skip the menu entirely:
 
 ```bash
-python3 kumo.py example.com -m dns ssl nuclei
+python3 kumo.py example.com -m dns ssl
 ```
 
 ### Step 3 — Watch the spider work
@@ -145,13 +145,7 @@ layout, tables and severity colouring.
 |---|---|
 | Home screen | all modules numbered, grouped, sized to the terminal |
 | Selection | by number, or `a` / `f` / `w` |
-| Progress | spider crawl with live counter and in-flight module names |
 | Themes | four palettes in 24-bit colour, `--theme` or `KUMO_THEME` |
-| Piping | `--no-color` strips every escape sequence |
-
-The module menu is generated from the module registry itself, so anything
-registered always appears — a new module cannot silently go missing from the
-list.
 
 ---
 
@@ -162,8 +156,7 @@ python3 kumo.py --web             # → http://127.0.0.1:8888
 python3 kumo.py --web -p 9000     # custom port
 ```
 
-The dashboard streams over SSE. Each module gets a card that appears
-immediately, shows a rotating edge while it is still running, then fills and
+Each module gets a card that appears immediately, shows a rotating edge while it is still running, then fills and
 takes on the colour of what it found — red for critical, amber for warnings,
 green for clean.
 
@@ -507,7 +500,6 @@ Everything above works with no key at all. These only unlock richer data:
 | `HIBP_API_KEY` | per-email HaveIBeenPwned lookup |
 | `CHIASMODON_API_KEY` | Chiasmodon pro tier — more results |
 | `RANSOMWARE_LIVE_API_KEY` | Ransomware.live pro feed |
-| `GOOGLE_CSE_KEY` + `GOOGLE_CSE_ID` | execute the generated dorks live |
 
 ```bash
 export SHODAN_API_KEY="your_key_here"
@@ -569,8 +561,6 @@ deserve the star far more than this repo does:
 | [Hudson Rock](https://hudsonrock.com) | infostealer infection intelligence |
 | [ProjectDiscovery](https://github.com/projectdiscovery/nuclei-templates) | the templates behind most vulnerability rules |
 | [Wayback Machine](https://web.archive.org) | archived URLs and historical surface |
-| [RDAP](https://rdap.org) / regional registries | registration and ASN data |
-| [HaveIBeenPwned](https://haveibeenpwned.com) | breach corpus |
 
 Respect each source's own terms of use and rate limits.
 
