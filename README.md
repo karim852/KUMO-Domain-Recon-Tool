@@ -34,6 +34,8 @@ python3 kumo.py example.com        # straight to a full scan
 
 <p align="center">
   <img src="dashboard.png" alt="Kumo web dashboard" width="100%">
+  
+  <img src="kumo-dashboard.gif" alt="Kumo web dashboard" width="100%">
   <br><sub>The dashboard mid-scan: cards stream in as each module finishes,
   glowing by severity, with the vulnerability scanner leading on findings.</sub>
 </p>
