@@ -473,6 +473,30 @@ Verified: `evil-acme-corp.com`, `acme-corp.com.evil.com`, `sub.acme-corp.com`,
 subdomain scans now find the organisation's addresses. `chia["client_logins"]`
 is read for the summary count and never for the lookup.
 
+## Sixth pass — a new subdomain source, added carefully
+
+Shodan's InternetDB is free and keyless, and Kumo was already calling it in the
+Shodan module and parsing its `hostnames` field before discarding it. Those
+hostnames are frequently subdomains of the target, so the subdomain module now
+reads them too.
+
+The trap, and the reason this is in this document rather than just the
+changelog: **InternetDB answers per IP.** Its hostname list describes the
+address, not your target. On shared hosting, or behind a CDN — which Kumo now
+detects for exactly this family of reasons — one address serves many customers,
+so the list contains other tenants' domains. Wiring it in naively would have
+put strangers' hostnames into the operator's subdomain list and called them
+findings: a false positive that also leaks third parties into a client report.
+
+Every name is therefore filtered to the target domain before being kept, with
+the apex excluded, wildcards and trailing dots normalised, and lookalikes
+(`acme-corp.com.evil.net`, `evil-acme-corp.com`, `notacme-corp.com`) rejected
+by the same parse-don't-suffix-match rule used for the email boundary.
+
+Each subdomain also records which source produced it, and the per-source counts
+are shown in both UIs. When a name looks wrong, the operator can see where it
+came from instead of guessing.
+
 ## Rules of thumb for new checks
 
 1. **Never let a status code alone be evidence.** Pair it with a word matcher.
@@ -498,6 +522,11 @@ is read for the summary count and never for the lookup.
    collected, what was checked and what was skipped.
 12. **Match a domain by parsing, not by suffix.** `endswith("@" + domain)`
    admits `x@evil-domain.com` shapes and misses subdomain scans entirely.
-13. **Don't claim absence you cannot establish.** DKIM selectors can't be
+13. **Data keyed by IP is not data about the domain.** Anything an address
+   reports (hostnames, certs, ports) may belong to another tenant on shared or
+   CDN infrastructure. Filter to the target before reporting it as the target's.
+14. **Record where each finding came from.** Per-source attribution turns "is
+   this real?" into a question the operator can answer.
+15. **Don't claim absence you cannot establish.** DKIM selectors can't be
    enumerated, so a miss is "not found at the names we tried". Where absence is
    unprovable, the finding earns credit when present but costs nothing when not.

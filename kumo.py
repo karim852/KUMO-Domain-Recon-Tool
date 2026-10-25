@@ -862,12 +862,15 @@ def render_brute(data):
 
 
 def render_subdomains(data):
-    section("SUBDOMAIN SCANNER (4 SOURCES)", "🌐")
+    section("SUBDOMAIN SCANNER (5 SOURCES)", "🌐")
     sources_used = data.get("sources_used", [])
     sources_failed = data.get("sources_failed", [])
     ok(f"Sources used: {', '.join(sources_used) if sources_used else 'none'}")
     if sources_failed:
         warn(f"Sources failed: {', '.join(sources_failed)}")
+    counts = data.get("source_counts") or {}
+    if counts:
+        dimprint("Per source: " + " · ".join(f"{k}={v}" for k, v in sorted(counts.items())), 6)
     ok(f"{data.get('total', 0)} unique subdomains discovered")
     ok(f"{data.get('alive_count', 0)} alive")
     sensitive = data.get("sensitive", [])

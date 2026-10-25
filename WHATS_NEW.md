@@ -1,5 +1,29 @@
 # Kumo — themed build
 
+## Subdomains: Shodan InternetDB added as a fifth source (free, no key)
+
+Kumo already called `internetdb.shodan.io/{ip}` in the Shodan module and parsed
+its `hostnames` field, then dropped it. Those hostnames are often subdomains of
+the target, and the subdomain module never saw them. It now does, so crt.sh,
+HackerTarget, RapidDNS, AlienVault and InternetDB all feed one list. Still no
+API key required.
+
+**The reason this needed care:** InternetDB answers per IP, and its hostname
+list belongs to the *address*, not to your target. On shared hosting or behind
+a CDN, one address serves many customers, so that list routinely contains other
+people's domains. Adding it unfiltered would have put strangers' hostnames in
+your subdomain list and presented them as findings.
+
+Every name is checked against the target domain before it is kept, and each
+one now records which source produced it. The per-source counts show in both
+UIs, so a questionable entry can be traced instead of guessed at.
+
+`test_subdomain_sources.py` feeds in a realistic shared-IP response — the
+target's own names mixed with `shop.othercompany.com`, `cdn.cloudflare.net`,
+`acme-corp.com.evil.net`, `evil-acme-corp.com` and `notacme-corp.com` — and
+asserts only the target's own subdomains survive.
+
+
 ## Per-email stealer check now checks every address
 
 The breachintel card's "Per-Email Stealer Check" was checking far fewer

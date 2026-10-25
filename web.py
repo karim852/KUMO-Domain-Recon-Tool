@@ -1363,6 +1363,9 @@ function renderContent(id, data) {
     const emailList=[...allEmails].sort();
     h+=`<div class="stat-row" style="margin-bottom:10px"><div class="stat-box"><div class="stat-n c-cyan">${emailList.length}</div><div class="stat-l">Emails Found</div></div></div>`;
     if(data.sources_used?.length) h+=kv('Scraped from',`<span class="c-dim" style="font-size:10px">${escH(data.sources_used.join(' · '))}</span>`);
+    if(data.source_counts&&Object.keys(data.source_counts).length){
+      h+=kv('Per source',`<span class="c-dim" style="font-size:10px">${escH(Object.entries(data.source_counts).sort().map(([k,v])=>k+'='+v).join(' · '))}</span>`);
+    }
     if(!emailList.length) return h+'<div class="c-dim" style="margin-top:10px">No emails found</div>';
     h+='<div class="sec">📧 Discovered Emails</div>';
     h+='<div style="display:flex;flex-direction:column;gap:2px">';

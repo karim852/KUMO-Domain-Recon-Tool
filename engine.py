@@ -6033,18 +6033,85 @@ def scan_bruteforce(domain):
 # MODULE: SUBDOMAIN SCANNER (multi-source)
 # ═══════════════════════════════════════════════════════════════
 
+def _shodan_internetdb_hostnames(domain, max_ips=5, timeout=10):
+    """
+    Subdomains from Shodan's InternetDB, free and keyless.
+
+    InternetDB answers per IP and returns a `hostnames` list for it. Kumo
+    already fetched that in scan_shodan and then dropped it on the floor; this
+    reads the same endpoint for subdomain discovery.
+
+    The catch, and the reason for the filter below: those hostnames belong to
+    the IP, not to the target. On shared hosting, or behind a CDN, the same
+    address serves many customers, so the list routinely contains other
+    people's domains. Feeding it in unfiltered would put strangers' hostnames
+    in the operator's subdomain list and call them findings. Only names that
+    are genuinely under the target domain are kept.
+    """
+    out = set()
+    try:
+        ips = resolve(domain) or {}
+    except Exception:
+        return out, "error"
+    v4 = (ips.get("v4") or [])[:max_ips]
+    if not v4:
+        return out, "no_ips"
+
+    suffix = "." + domain.lower().strip(".")
+    status = {"ok": False, "err": False}
+
+    def one(ip):
+        try:
+            r = req(f"https://internetdb.shodan.io/{ip}", timeout=timeout)
+            if not r:
+                status["err"] = True
+                return set()
+            status["ok"] = True
+            found = set()
+            for h in (r.json().get("hostnames") or []):
+                h = str(h).strip().lower().rstrip(".").lstrip("*.")
+                # strictly under the target domain, and not the apex itself
+                if h.endswith(suffix) and h != domain.lower():
+                    found.add(h)
+            return found
+        except Exception:
+            status["err"] = True
+            return set()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(5, len(v4))) as ex:
+        for s in ex.map(one, v4):
+            out |= s
+    if status["ok"]:
+        return out, "ok"
+    return out, "error" if status["err"] else "no_data"
+
+
 def scan_subdomains(domain):
     """
-    Aggregate subdomains from 4 free passive sources (no API keys):
+    Aggregate subdomains from 5 free passive sources (no API keys):
       1. crt.sh   — certificate transparency logs
       2. HackerTarget — hostsearch API
       3. RapidDNS — web scrape
       4. AlienVault OTX — passive DNS
+      5. Shodan InternetDB — hostnames seen on the domain's own IPs
     Then resolve all unique results in parallel.
     """
     subs = set()
     sources_used = []
     sources_failed = []
+    # Which source produced each name, so a questionable entry can be traced
+    # back rather than appearing in one undifferentiated list.
+    attribution = {}
+
+    def _add(name, source):
+        name = (name or "").strip().lower().rstrip(".").lstrip("*.")
+        if name and name.endswith(f".{domain}") and name != domain:
+            subs.add(name)
+            attribution.setdefault(name, [])
+            if source not in attribution[name]:
+                attribution[name].append(source)
+            return True
+        return False
 
     # --- Source 1: crt.sh ---
     try:
@@ -6052,9 +6119,7 @@ def scan_subdomains(domain):
         if r:
             for entry in r.json():
                 for name in entry.get("name_value", "").split("\n"):
-                    name = name.strip().lower().lstrip("*.")
-                    if name and name.endswith(f".{domain}") and name != domain:
-                        subs.add(name)
+                    _add(name, "crt.sh")
             sources_used.append("crt.sh")
         else:
             sources_failed.append("crt.sh")
@@ -6069,8 +6134,7 @@ def scan_subdomains(domain):
                 parts = line.split(",")
                 if parts:
                     name = parts[0].strip().lower()
-                    if name.endswith(f".{domain}") and name != domain:
-                        subs.add(name)
+                    _add(name, "hackertarget")
             sources_used.append("hackertarget")
         else:
             sources_failed.append("hackertarget")
@@ -6084,9 +6148,7 @@ def scan_subdomains(domain):
         if r:
             found = re.findall(r'<td>([a-zA-Z0-9\-\.]+\.' + re.escape(domain) + r')</td>', r.text)
             for name in found:
-                name = name.strip().lower()
-                if name.endswith(f".{domain}") and name != domain:
-                    subs.add(name)
+                _add(name, "rapiddns")
             sources_used.append("rapiddns")
         else:
             sources_failed.append("rapiddns")
@@ -6099,14 +6161,29 @@ def scan_subdomains(domain):
         if r:
             data = r.json()
             for entry in data.get("passive_dns", []):
-                hostname = entry.get("hostname", "").strip().lower()
-                if hostname.endswith(f".{domain}") and hostname != domain:
-                    subs.add(hostname)
+                _add(entry.get("hostname", ""), "alienvault")
             sources_used.append("alienvault")
         else:
             sources_failed.append("alienvault")
     except Exception:
         sources_failed.append("alienvault")
+
+    # --- Source 5: Shodan InternetDB (free, no API key) ---
+    # Reads the hostnames InternetDB reports for the domain's own IPs. Already
+    # filtered to names under the target domain, because an IP's hostname list
+    # can contain other tenants on shared hosting or a CDN edge.
+    _shodan_before = len(subs)
+    try:
+        _sh_names, _sh_status = _shodan_internetdb_hostnames(domain)
+        for _h in _sh_names:
+            _add(_h, "shodan-internetdb")
+        if _sh_status == "ok":
+            sources_used.append("shodan-internetdb")
+        else:
+            sources_failed.append("shodan-internetdb")
+    except Exception:
+        sources_failed.append("shodan-internetdb")
+    _shodan_new = len(subs) - _shodan_before
 
     subs = sorted(subs)
 
@@ -6178,6 +6255,14 @@ def scan_subdomains(domain):
         "sources_failed": sources_failed,
         "ct_total":      ct_total,
         "ct_sensitive":  ct_sensitive,
+        # Which source produced each name. An entry that looks wrong can be
+        # traced to where it came from instead of being guessed at.
+        "attribution":   attribution,
+        "source_counts": {
+            src: sum(1 for srcs in attribution.values() if src in srcs)
+            for src in sorted({s for srcs in attribution.values() for s in srcs})
+        },
+        "shodan_new":    _shodan_new,
     }
 
 
