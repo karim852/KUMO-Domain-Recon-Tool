@@ -2070,7 +2070,17 @@ VULN_RULES_EXTENDED = [
         "severity": 'critical', "path": '/wp-admin/install.php?step=1',
         "matchers_condition": "and", "origin": "nuclei",
         "description": 'WordPress Exposed Installation (ported from nuclei template http/misconfiguration/installer/wp-install.yaml)',
-        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['<title>WordPress &rsaquo; Installation</title>', 'Site Title'], 'condition': 'or'}],
+        # The "already installed" page carries this exact title, so the title
+        # alone fires on every installed WordPress -- reported critical against
+        # a stock 6.7.10. Reject the refusal, and require the setup form.
+        "matchers": [{'type': 'status', 'status': [200]},
+                     {'type': 'word', 'part': 'all', 'words': ['<title>WordPress &rsaquo; Installation</title>', 'Site Title'], 'condition': 'or'},
+                     {'type': 'word', 'part': 'all', 'negative': True,
+                      'words': ['already installed', 'Already Installed',
+                                'clear your old database tables'], 'condition': 'or'},
+                     {'type': 'word', 'part': 'body',
+                      'words': ['name="weblog_title"', 'name="admin_email"', 'Information needed'],
+                      'condition': 'or'}],
     },
     {
         "id": 'asus-rtn16-default-login', "name": 'ASUS RT-N16 - Default Login',
@@ -4671,13 +4681,12 @@ VULN_RULES_EXTENDED = [
         "description": 'Wavlink Panel - Unauthenticated Access (ported from nuclei template http/misconfiguration/unauth-wavink-panel.yaml)',
         "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['<title>APP</title>'], 'condition': 'or'}, {'type': 'word', 'part': 'all', 'words': ['var passphraseKey12="";'], 'condition': 'or'}],
     },
-    {
-        "id": 'wordpress-click2shell', "name": 'WordPress Click2Shell Theme Preview Selector Injection',
-        "severity": 'high', "path": '/wp-admin/js/theme.js',
-        "matchers_condition": 'and', "origin": 'nuclei',
-        "description": 'WordPress Click2Shell Theme Preview Selector Injection (ported from nuclei template http/vulnerabilities/wordpress/wordpress-click2shell.yaml)',
-        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ["self.view.collection.once( 'query:success', function() {"], 'condition': 'and'}, {'type': 'word', 'part': 'all', 'words': ['escapeSelector'], 'condition': 'or'}],
-    },
+    # REMOVED: wordpress-click2shell. It matched a line of WordPress core's own
+    # wp-admin/js/theme.js, which ships with every install, so it fired on
+    # 100% of WordPress sites -- confirmed against a stock 6.7.10. A signature
+    # with no discriminating power is not a detection, it is a constant, and
+    # the real issue is version-bound in a way this rule never expressed.
+
     {
         "id": 'wordpress-total-upkeep-backup-download', "name": 'WordPress Total Upkeep Database and Files Backup Download',
         "severity": 'high', "path": '/wp-content/plugins/boldgrid-backup/cron/restore-info.json',
@@ -5070,8 +5079,9 @@ def scan_tech(domain):
                      "Imperva": [("h", r'incap_ses|visid_incap|X-Iinfo'), r'/_Incapsula_Resource']},
     }
 
-    header_blob = str(resp.headers) + " " + str(resp.cookies.get_dict()
-                                                if hasattr(resp.cookies, "get_dict") else "")
+    header_blob = _header_lines(resp.headers,
+                                resp.cookies.get_dict()
+                                if hasattr(resp.cookies, "get_dict") else None)
 
     def _hit(pattern):
         if isinstance(pattern, tuple):
@@ -6519,6 +6529,32 @@ _WW_SIGNATURES = {
 }
 
 
+def _header_lines(headers, cookies=None):
+    r"""
+    Headers as the wire writes them: "Key: value" per line.
+
+    str(dict) renders {'Server': 'gunicorn'}, where the key is quoted and the
+    colon sits outside it, so a pattern like r'Server:\s*gunicorn' never
+    matches. Every header-scoped signature written in Header: value form was
+    therefore dead -- found by comparing against the browser port, which built
+    this blob correctly, on a live pypi.org.
+    """
+    out = []
+    try:
+        for k, v in (headers or {}).items():
+            out.append(f"{k}: {v}")
+    except Exception:
+        pass
+    if cookies:
+        try:
+            items = cookies.items() if hasattr(cookies, "items") else []
+            for k, v in items:
+                out.append(f"Set-Cookie: {k}={v}")
+        except Exception:
+            pass
+    return "\n".join(out)
+
+
 def _platform_fingerprint(body, headers, cookies=""):
     """
     Identify CMS / storefront platforms from one already-fetched response.
@@ -6527,7 +6563,7 @@ def _platform_fingerprint(body, headers, cookies=""):
     module can share a single homepage request instead of each making one.
     Returns a sorted list of platform names.
     """
-    header_blob = str(headers) + " " + str(cookies)
+    header_blob = _header_lines(headers, cookies)
     combined = body + str(headers)
     out = []
     for table in (_WW_CMS_SIGS, _WW_ECOM_SIGS):
@@ -6595,7 +6631,7 @@ def _whatweb_python(domain):
     #   "h" -> response headers and cookies only
     #   "b" -> response body only
     #   plain string -> either (asset URLs and JS globals, safe in both)
-    header_blob = str(hdrs) + " " + str(cookies)
+    header_blob = _header_lines(hdrs, cookies)
 
     def _ww_hit(pattern):
         if isinstance(pattern, tuple):
@@ -11343,6 +11379,37 @@ _CMS_PATHS = {
 
 # Markers proving a probed CMS path really is what it claims, so an HTML error
 # page or a catch-all cannot stand in for it.
+# Proof that a feature is NOT exposed, even though the path answers 200.
+#
+# This exists because a real WordPress answers 200 on /wp-admin/install.php
+# with "You appear to have already installed WordPress", and 200 on
+# maint/repair.php with "please add the following line to your wp-config" --
+# meaning repair is switched off. Both read as reachable installers to a check
+# that only looks at the status code, and both were reported, one as critical,
+# against a stock install with nothing wrong with it.
+#
+# A positive marker cannot settle this: the "already installed" page contains
+# the same words ("WordPress", "wp-admin") as the live installer. What
+# separates them is the refusal message, so these are matched to REJECT.
+_CMS_PATH_ANTI_MARKERS = {
+    "/wp-admin/install.php": [
+        b"already installed", b"Already Installed",
+        b"clear your old database tables",
+    ],
+    "/wp-admin/setup-config.php": [
+        b"already", b"delete it first",
+    ],
+    "/wp-admin/maint/repair.php": [
+        b"WP_ALLOW_REPAIR", b"allow use of this page",
+        b"please add the following line",
+    ],
+    # Drupal and Joomla refuse the same way once set up
+    "/core/install.php": [b"already installed", b"Drupal already installed"],
+    "/install.php": [b"already installed"],
+    "/update.php": [b"access denied", b"Access denied", b"update.php?op=login"],
+    "/installation/": [b"already installed", b"Joomla! is already installed"],
+}
+
 _CMS_PATH_MARKERS = {
     "/wp-config.php.bak": [b"DB_NAME", b"DB_PASSWORD", b"<?php"],
     "/wp-config.php~": [b"DB_NAME", b"DB_PASSWORD", b"<?php"],
@@ -11510,6 +11577,14 @@ def _cms_probe_paths(domain, cms, base_sigs, brand, findings):
         # A directory-listing finding has to actually be a listing.
         if path.endswith("/") and "listing" in label:
             if not any(m in content for m in _DIRLIST_MARKERS):
+                return None
+
+        # A path that answers but says the feature is switched off is not an
+        # exposure. Checked before the positive markers, because the refusal
+        # page usually satisfies those too.
+        anti = _CMS_PATH_ANTI_MARKERS.get(path)
+        if anti and r.status_code == 200:
+            if any(m in content for m in anti):
                 return None
 
         markers = _CMS_PATH_MARKERS.get(path)

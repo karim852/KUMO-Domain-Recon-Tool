@@ -30,7 +30,8 @@ import time
 
 HOST = "0.0.0.0"
 VHOSTS = ["wp.cmstest", "joomla.cmstest", "drupal.cmstest",
-          "blog.cmstest", "plain.cmstest", "magento.cmstest"]
+          "blog.cmstest", "plain.cmstest", "magento.cmstest",
+          "wpdone.cmstest"]
 
 # ── WordPress ────────────────────────────────────────────────────────────
 WP_HOME = """<!DOCTYPE html>
@@ -214,7 +215,62 @@ Mage.Cookies.path = '/';</script>
 <form action="/checkout/cart/add/" method="post"><button>Add to cart</button></form>
 </body></html>"""
 
+# ── a correctly set-up WordPress ─────────────────────────────────────────
+# These are the REAL pages WordPress 6.7.10 serves once it is installed,
+# captured from a live install rather than written by hand. All three answer
+# 200, and all three are refusals: the installer says it has already run, and
+# database repair says it is switched off unless wp-config enables it.
+#
+# A check that only looks at the status code reports an exposed installer
+# (critical) and an exposed repair page (high) on a stock site with nothing
+# wrong with it. Both were reported, until a real install was scanned. This
+# host exists so that cannot come back.
+WP_ALREADY_INSTALLED = """<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+	<meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
+	<meta name="robots" content="noindex,nofollow" />
+	<title>WordPress &rsaquo; Installation</title>
+	<link rel='stylesheet' id='dashicons-css' href='http://wplive.test/wp-includes/css/dashicons.min.css?ver=6.7.10' media='all' />
+<link rel='stylesheet' id='buttons-css' href='http://wplive.test/wp-includes/css/buttons.min.css?ver=6.7.10' media='all' />
+<link rel='stylesheet' id='forms-css' href='http://wplive.test/wp-admin/css/forms.min.css?ver=6.7.10' media='all' />
+<link rel='stylesheet' id='l10n-css' href='http://wplive.test/wp-admin/css/l10n.min.css?ver=6.7.10' media='all' />
+<link rel='stylesheet' id='install-css' href='http://wplive.test/wp-admin/css/install.min.css?ver=6.7.10' media='all' />
+</head>
+<body class="wp-core-ui">
+<p id="logo">WordPress</p>
+
+	<h1>Already Installed</h1><p>You appear to have already installed WordPress. To reinstall please clear your old database tables first.</p><p class="step"><a href="http://wplive.test/wp-login.php">Log In</a></p></body></html>"""
+
+WP_REPAIR_DISABLED = """<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+	<meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
+	<meta name="robots" content="noindex,nofollow" />
+	<title>WordPress &rsaquo; Database Repair</title>
+	<link rel='stylesheet' id='dashicons-css' href='http://wplive.test/wp-includes/css/dashicons.min.css?ver=6.7.10' media='all' />
+<link rel='stylesheet' id='buttons-css' href='http://wplive.test/wp-includes/css/buttons.min.css?ver=6.7.10' media='all' />
+<link rel='stylesheet' id='forms-css' href='http://wplive.test/wp-admin/css/forms.min.css?ver=6.7.10' media='all' />
+<link rel='stylesheet' id='l10n-css' href='http://wplive.test/wp-admin/css/l10n.min.css?ver=6.7.10' media='all' />
+<link rel='stylesheet' id='install-css' href='http://wplive.test/wp-admin/css/install.min.css?ver=6.7.10' media='all' />
+</head>
+<body class="wp-core-ui">
+<p id="logo"><a href="https://wordpress.org/">WordPress</a></p>
+
+<h1 class="screen-reader-text">Allow automatic database repair</h1><p>To allow use of this page to automatically repair database problems, please add the following line to your <code>wp-config.php</code> file. Once this line is added to your config, reload this page.</p><p><code>define('WP_ALLOW_REPAIR', true);</code></p><h2 class="screen-reader-text">Check secret keys</h2><p>While you are editing your <code>wp-config.php</code> file, take a moment to make sure you have all 8 keys and that they are unique. You can generate these using the <a href="https://api.wordpress.org/secret-key/1.1/salt/">WordPress.org secret key service</a>.</p></body>
+</html>
+"""
+
+WPDONE_ROUTES = {
+    "/": (200, "text/html", WP_HOME),
+    "/wp-admin/install.php": (200, "text/html", WP_ALREADY_INSTALLED),
+    "/wp-admin/maint/repair.php": (200, "text/html", WP_REPAIR_DISABLED),
+}
+
 PROFILES = {
+    "wpdone.cmstest": WPDONE_ROUTES,
     "magento.cmstest": {"/": (200, "text/html", MAGENTO_HOME)},
     "wp.cmstest": WP_ROUTES,
     "joomla.cmstest": JOOMLA_ROUTES,
@@ -232,6 +288,8 @@ EXPECTED_CMS = {
     "plain.cmstest": None,
     # fingerprinted as Magento, but not one of the three with deep checks
     "magento.cmstest": None,
+    # a properly installed WordPress: detected, but nothing to report
+    "wpdone.cmstest": "wordpress",
 }
 
 

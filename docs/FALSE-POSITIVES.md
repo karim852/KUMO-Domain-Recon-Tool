@@ -720,3 +720,64 @@ card, which reads as "nothing here". It now reports the platform and says
 plainly that there are no deep checks for it yet. Same rule as rule 10, applied
 to coverage rather than to lookups: never let a gap in Kumo look like a clean
 result on the target.
+
+## Scanning real software, not fixtures
+
+A real WordPress 6.7.10 (PHP 8.3.6, MariaDB) was installed and scanned. Every
+finding was then verified by hand against what the server actually returns.
+Four false positives came out of it that no fixture had caught, because the
+fixtures served these paths as genuinely exposed while real software serves a
+refusal:
+
+| Reported | Reality | Severity claimed |
+|---|---|---|
+| `/wp-admin/install.php` reachable | "You appear to have already installed WordPress" | **critical** |
+| `/wp-admin/maint/repair.php` reachable | "please add the following line to your wp-config" — repair is off | high |
+| `wp-install` rule | matched the title that the *already installed* page also has | **critical** |
+| `wordpress-click2shell` rule | matched a line of WordPress core's own `theme.js`, present on every install | high |
+
+The first two are fixed with `_CMS_PATH_ANTI_MARKERS`: evidence that a feature
+is switched OFF, matched to reject. A positive marker cannot settle it, because
+the refusal page contains the same words as the live installer. The third gets
+a negative matcher plus a requirement that the setup form actually be present.
+The fourth was deleted — a signature that fires on 100% of installs is not a
+detection, it is a constant.
+
+What survived on the real stock install: a PHP runtime genuinely predating the
+php2shell fix (8.3.6 against a 8.3.36 boundary), and `readme.html` genuinely
+leaking the version. Both true. `.git` findings appeared while the webroot
+contained a clone and disappeared when it was removed, which is the behaviour
+a rule should have.
+
+24. **Test against the real product, not only a fixture you wrote.** A fixture
+   encodes what you already believe the vulnerable state looks like. Real
+   software answers 200 on paths that are *refusals*, and a check reading only
+   the status code calls that an exposure. Four of these, two rated critical,
+   survived every fixture in the repo.
+25. **A signature that fires on every install is not a signature.** If the
+   token is in the product's own shipped files, it has no discriminating power
+   whatever the template says.
+26. **Prove the negative too.** After fixing a false positive, recreate the
+   genuinely vulnerable state and confirm the check still fires. An installer
+   on an empty database was used here: both the rule and the CMS module
+   correctly went back to critical.
+
+## The header blob was the wrong shape
+
+Cross-checking the two engines against a live pypi.org showed the browser port
+reporting `Python` where `engine.py` reported nothing, from the same
+`server: gunicorn` response.
+
+`engine.py` built its header blob with `str(dict)`, which renders
+`{'Server': 'gunicorn'}` — the key quoted, the colon outside it. So every
+header-scoped signature written in `Header: value` form matched nothing:
+Python, PHP, Express.js, Node.js, Fastly, Netlify and Imperva were all dead.
+Patterns without a colon (`cf-ray`, `incap_ses`) worked, which is why the
+breakage was invisible.
+
+`_header_lines()` now renders the blob the way the wire does, and
+`test_cms.py` asserts each of those six signatures fires from its own header.
+
+27. **A scoped pattern depends on the shape of what it is scoped to.** Decide
+   the representation once, render it there, and test one pattern of each
+   form against it.

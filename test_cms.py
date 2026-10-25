@@ -103,6 +103,19 @@ def main():
     check("no WordPress path was probed on a Drupal site",
           not any("wp-" in (f.get("path") or "") for f in dr.get("findings", [])))
 
+    print(f"\n{B}A correctly installed WordPress reports nothing{X}  "
+          f"{D}(real 6.7.10 refusal pages, captured from a live install){X}")
+    done = results["wpdone.cmstest"]
+    names = [f["name"] for f in done.get("findings", [])]
+    check("still identified as WordPress", done.get("cms") == "wordpress")
+    check("an installer that says 'already installed' is not an exposure",
+          not any("installer" in n.lower() for n in names), str(names))
+    check("a repair page that says it is disabled is not an exposure",
+          not any("repair" in n.lower() for n in names), str(names))
+    check("nothing above low severity on a stock install",
+          all(f["severity"] in ("low", "info") for f in done.get("findings", [])),
+          str([(f["severity"], f["name"]) for f in done.get("findings", [])]))
+
     print(f"\n{B}Platform fingerprinting{X}  "
           f"{D}(20 platforms recognised, 3 deep-scanned){X}")
     for host, cms in (("wp.cmstest", "WordPress"), ("joomla.cmstest", "Joomla"),
@@ -152,7 +165,7 @@ def main():
                "</body></html>")
     def _scan_all(body, headers):
         """Run the FULL signature table the way _whatweb_python does."""
-        hblob = str(headers)
+        hblob = engine._header_lines(headers)
         hay = body + hblob
         out = []
         for cat, sigs in engine._WW_SIGNATURES.items():
@@ -183,6 +196,23 @@ def main():
     check("Cloudflare NOT detected from the same words in the body",
           not any("Cloudflare" in x
                   for x in _scan_all("<p>we use cloudflare, see cf-ray</p>", {})))
+
+    # Every header-scoped pattern written in "Header: value" form depends on
+    # the blob being rendered as wire-format lines. str(dict) renders
+    # {'Server': 'gunicorn'}, where the colon sits outside the quoted key, and
+    # all of these silently matched nothing.
+    print(f"\n{B}Header-scoped signatures that name a header{X}  "
+          f"{D}(these go dead if the blob is not wire-format){X}")
+    for label, hdrs, want in [
+        ("Python from Server: gunicorn",      {"Server": "gunicorn"}, "Python"),
+        ("PHP from X-Powered-By",             {"X-Powered-By": "PHP/8.3.6"}, "PHP"),
+        ("Express from X-Powered-By",         {"X-Powered-By": "Express"}, "Express"),
+        ("Fastly from X-Served-By",           {"X-Served-By": "cache-iad-1"}, "Fastly"),
+        ("Netlify from Server",               {"Server": "Netlify"}, "Netlify"),
+        ("Imperva from X-CDN",                {"X-CDN": "Incapsula"}, "Imperva"),
+    ]:
+        got = _scan_all("", hdrs)
+        check(label, any(want in x for x in got), str(got) or "nothing")
 
     print(f"\n{B}Evidence discipline{X}")
     allf = [f for r in results.values() for f in r.get("findings", [])]
