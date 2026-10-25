@@ -31,6 +31,7 @@ G = "\033[92m"; Y = "\033[93m"; R = "\033[91m"; D = "\033[90m"; B = "\033[1m"; X
 # ones a false positive actually hurts. Pure-inventory modules (dns, whois,
 # geo, ports...) need outbound internet and are covered by test_live.py.
 EXPOSURE_MODULES = [
+    "cms",
     "endpoints",
     "nuclei",
     "robots",
@@ -103,6 +104,13 @@ def findings_of(mod, data):
     elif mod == "cloud_buckets":
         for b in (data.get("found") or data.get("buckets") or []):
             out.append(("bucket", str(b)[:70]))
+
+    elif mod == "cms":
+        if data.get("cms"):
+            out.append((f"cms {data['cms']}", f"confidence={data.get('confidence')}"))
+        for f in (data.get("findings") or []):
+            out.append((f"{f.get('severity','?'):8} {f.get('name','?')}",
+                        str(f.get("path") or f.get("detail"))[:60]))
 
     elif mod == "favicon":
         for m in (data.get("matches") or []):

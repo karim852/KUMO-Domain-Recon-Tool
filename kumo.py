@@ -171,6 +171,7 @@ SHORT_NAMES = {
     "content_intel": "Content Intel",
     "http_inspect":  "HTTP Inspector",
     "api_fuzzer":    "API Endpoint Fuzzer",
+    "cms":           "CMS Deep Scan",
 }
 
 CATEGORY_LAYOUT = [
@@ -1518,6 +1519,47 @@ def render_api_fuzzer(data):
         ok("No API surface detected")
 
 
+
+def render_cms(data):
+    section("CMS DEEP SCAN", "🧱")
+    if data.get("error"):
+        fail(data["error"]); return
+    if not data.get("cms"):
+        warn(data.get("note") or "No CMS identified")
+        return
+    info("CMS", f"{data.get('cms_name') or data['cms']}  ({data.get('confidence')} confidence)")
+    if data.get("version"):
+        info("Version", f"{data['version']}  (from {data.get('version_source')})")
+    if data.get("signals"):
+        dimprint("detected by: " + ", ".join(data["signals"]), 6)
+
+    findings = data.get("findings") or []
+    if findings:
+        print(f"\n    {C.M}Findings:{C.RS}")
+        order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+        for f in sorted(findings, key=lambda x: order.get(x.get("severity"), 9)):
+            sev = (f.get("severity") or "").upper()
+            col = {"CRITICAL": C.R, "HIGH": C.Y, "MEDIUM": C.Y,
+                   "LOW": C.G}.get(sev, C.W)
+            tag = " [inferred]" if f.get("confidence") == "version-inference" else ""
+            print(f"      {col}{sev:<9}{C.RS} {f.get('name','')}{C.DM}{tag}{C.RS}")
+            if f.get("path"):
+                dimprint(str(f["path"])[:76], 8)
+
+    if data.get("users"):
+        print(f"\n    {C.M}Users exposed:{C.RS}")
+        dimprint(", ".join(u.get("slug", "") for u in data["users"]), 6)
+    for key, label in (("plugins", "Plugins"), ("themes", "Themes")):
+        items = data.get(key) or []
+        if items:
+            print(f"\n    {C.M}{label} ({len(items)}):{C.RS}")
+            dimprint(", ".join(
+                i["name"] + (f"=={i['version']}" if i.get("version") else "")
+                for i in items), 6)
+    print()
+    dimprint(f"{data.get('paths_probed', 0)} {data['cms']} path(s) probed", 4)
+
+
 RENDERERS = {
     "dns": render_dns, "whois": render_whois, "ssl": render_ssl,
     "crtsh": render_crtsh, "headers": render_headers, "ports": render_ports,
@@ -1532,6 +1574,7 @@ RENDERERS = {
     "http_inspect": render_http_inspect,
     "js_secrets": render_js_secrets,
     "api_fuzzer": render_api_fuzzer,
+    "cms": render_cms,
     "shodan": render_shodan,
     "censys": render_censys,
     "wafw00f": render_wafw00f,

@@ -1,5 +1,34 @@
 # Kumo — themed build
 
+## Module 28 — CMS deep scan
+
+Identifies **WordPress, Joomla or Drupal**, then runs only that CMS's checks:
+its version, its own sensitive paths, and what it publishes about itself.
+
+| | |
+|---|---|
+| version | generator meta, `/feed/`, `joomla.xml`, `CHANGELOG.txt` |
+| WordPress | 14 paths, users via the REST API, plugins and themes with versions |
+| Joomla | 10 paths including `configuration.php` backups and a live installer |
+| Drupal | 10 paths including `settings.php` backups and `/core/install.php` |
+
+Plugins and themes are read from the asset paths the homepage already serves,
+with versions from each one's `readme.txt` — not from brute-forcing a wordlist.
+The site names the plugins it actually loads.
+
+**Detection ignores the product name in page text.** A blog comparing CMS
+platforms mentions all three and runs none, so only structural signals count:
+generator meta tags, `/wp-content/` and `/wp-includes/` paths, `com_`
+components, `/sites/default/`, `X-Generator` and `X-Pingback`. Below a
+confidence threshold the module reports no CMS and probes nothing — a Drupal
+site is never probed for WordPress paths.
+
+New `cmslab.py` serves all three CMSes plus two decoys: a blog that writes
+about WordPress, Joomla and Drupal without running any, and an ordinary site.
+`test_cms.py` covers 31 cases, and the CMS module is now part of the
+false-positive harness, which stays clean across all 9 trap hosts.
+
+
 ## Fix: the ports card never stopped loading
 
 On a real scan the ports pill showed **done** while the ports card sat on its

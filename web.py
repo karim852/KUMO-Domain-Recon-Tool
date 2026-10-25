@@ -777,6 +777,14 @@ function getBadges(id, data) {
   const b = [];
   if (id==='headers'&&data.grade){const gc={A:'b-pass',B:'b-info',C:'b-warn',D:'b-warn',F:'b-fail'}[data.grade]||'b-fail';b.push(`<span class="badge ${gc}">${data.grade} · ${Math.round(data.score||0)}%</span>`);}
   if (id==='ports'&&data.open?.length) b.push(`<span class="badge b-info">${data.open.length} open</span>`);
+  if (id==='cms'){
+    if(data.cms){
+      b.push(`<span class="badge b-purple">${escH(data.cms_name||data.cms)}${data.version?' '+escH(data.version):''}</span>`);
+      const c=data.severity_counts||{};
+      if(c.critical) b.push(`<span class="badge b-fail">${c.critical} critical</span>`);
+      else if(c.high) b.push(`<span class="badge b-warn">${c.high} high</span>`);
+    } else b.push('<span class="badge b-info">no CMS</span>');
+  }
   if (id==='subdomains'){b.push(`<span class="badge b-info">${data.total||0} found</span>`);if(data.alive_count)b.push(`<span class="badge b-pass">${data.alive_count} alive</span>`);if(data.ct_total)b.push(`<span class="badge b-purple">${data.ct_total} CT</span>`);}
   if (id==='brute'&&data.found?.length) b.push(`<span class="badge b-info">${data.found.length} found</span>`);
   if (id==='ssl'&&data.days_left!==undefined) b.push(`<span class="badge ${data.days_left<30?'b-fail':data.days_left<90?'b-warn':'b-pass'}">${data.days_left<0?'EXPIRED':data.days_left+'d left'}</span>`);
@@ -1640,6 +1648,54 @@ function renderContent(id, data) {
       if(items.length>40) h+=`<div class="c-dim" style="font-size:9px;padding:2px 4px">+ ${items.length-40} more…</div>`;
       h+='</div>';
     });
+    return h;
+  }
+
+  case 'cms':{
+    if(!data.cms){
+      return '<div class="c-dim">No CMS identified'
+        + (data.note? ' — ' + escH(data.note) : '')
+        + '</div>';
+    }
+    let h='';
+    const conf = data.confidence==='high'?'b-pass':'b-info';
+    h+=kv('CMS',`<span class="c-cyan" style="font-weight:700">${escH(data.cms_name||data.cms)}</span>`
+      + ` <span class="badge ${conf}" style="margin-left:6px">${escH(data.confidence)} confidence</span>`);
+    if(data.version) h+=kv('Version',`<span class="c-yellow mono">${escH(data.version)}</span>`
+      + ` <span class="c-dim" style="font-size:10px">from ${escH(data.version_source||'')}</span>`);
+    if(data.signals?.length) h+=kv('Detected by',`<span class="c-dim" style="font-size:10px">${escH(data.signals.join(' · '))}</span>`);
+
+    const f=data.findings||[];
+    if(f.length){
+      const sc={critical:'var(--red)',high:'var(--orange)',medium:'var(--yellow)',low:'var(--green)',info:'var(--text3)'};
+      h+='<div class="sec">Findings</div>';
+      h+='<table class="tbl"><thead><tr><th>Severity</th><th>Finding</th><th>Path</th></tr></thead><tbody>';
+      f.forEach(x=>{
+        const inf = x.confidence==='version-inference'
+          ? ' <span class="badge b-info" style="font-size:8px">inferred</span>' : '';
+        h+=`<tr><td style="color:${sc[x.severity]||'var(--text)'};font-weight:700;font-size:10px">${escH((x.severity||'').toUpperCase())}</td>`
+         + `<td style="font-size:11px">${escH(x.name||'')}${inf}</td>`
+         + `<td class="mono c-cyan" style="font-size:10px">${escH(x.path||'')}</td></tr>`;
+      });
+      h+='</tbody></table>';
+    }
+
+    const u=data.users||[];
+    if(u.length){
+      h+='<div class="sec" style="color:var(--yellow)">Users exposed</div>';
+      h+='<div style="display:flex;gap:4px;flex-wrap:wrap">';
+      u.forEach(x=>h+=`<span class="tag">${escH(x.slug||'')}${x.name?` <span class="c-dim">(${escH(x.name)})</span>`:''}</span>`);
+      h+='</div>';
+    }
+    [['plugins','Plugins'],['themes','Themes']].forEach(([k,label])=>{
+      const items=data[k]||[];
+      if(!items.length) return;
+      h+=`<div class="sec">${label} (${items.length})</div>`;
+      h+='<div style="display:flex;gap:4px;flex-wrap:wrap">';
+      items.forEach(x=>h+=`<span class="tag">${escH(x.name)}${x.version?` <span class="c-yellow">${escH(x.version)}</span>`:''}</span>`);
+      h+='</div>';
+    });
+    h+=`<div class="c-dim" style="font-size:10px;margin-top:8px">${data.paths_probed||0} ${escH(data.cms)} path(s) probed</div>`;
     return h;
   }
 

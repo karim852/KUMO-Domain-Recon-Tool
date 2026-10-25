@@ -11083,6 +11083,412 @@ def scan_api_fuzzer(domain):
     return result
 
 
+
+# ═══════════════════════════════════════════════════════════════
+# MODULE: CMS DEEP SCAN (WordPress / Joomla / Drupal)
+# ═══════════════════════════════════════════════════════════════
+# Detect the CMS first, then run only that CMS's checks. Firing WordPress
+# probes at a Drupal site is noise in the report and wasted requests at the
+# target, so nothing CMS-specific runs until detection is confident.
+#
+# Detection deliberately ignores the bare product name in page text. A blog
+# post about WordPress contains the word "WordPress"; a WordPress site serves
+# /wp-content/ paths, a generator meta, or a wp-login form. Only the latter
+# count, which is why an article about a CMS is not reported as running it.
+
+# Proper display names: .title() turns "wordpress" into "Wordpress".
+_CMS_NAMES = {"wordpress": "WordPress", "joomla": "Joomla", "drupal": "Drupal"}
+
+
+def _cms_name(cms):
+    return _CMS_NAMES.get(cms, (cms or "").title())
+
+
+_CMS_UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                         "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/525.36",
+           "Accept": "*/*"}
+
+
+def _cms_get(domain, path, timeout=8, allow_redirects=True):
+    """Fetch a path over https then http. Returns a response or None."""
+    if not HAS_REQUESTS:
+        return None
+    for scheme in ("https", "http"):
+        try:
+            return requests.get(f"{scheme}://{domain}{path}", headers=_CMS_UA,
+                                timeout=timeout, verify=False,
+                                allow_redirects=allow_redirects)
+        except Exception:
+            continue
+    return None
+
+
+# Each signal is (weight, where, pattern, what it proves). Weight 3 is on its
+# own conclusive; weight 1 needs corroboration.
+_CMS_SIGNALS = {
+    "wordpress": [
+        (3, "body", r'<meta[^>]+name=["\']generator["\'][^>]+content=["\']\s*WordPress', "generator meta"),
+        (3, "body", r'/wp-content/(?:themes|plugins|uploads)/', "wp-content asset path"),
+        (3, "body", r'/wp-includes/(?:js|css)/', "wp-includes asset path"),
+        (2, "body", r'<generator>https?://wordpress\.org', "RSS generator"),
+        (2, "header", r'x-pingback:[^\n]*xmlrpc\.php', "X-Pingback header"),
+        (1, "body", r'wp-json/wp/v2', "REST API link"),
+        (1, "body", r'wp-embed\.min\.js', "wp-embed script"),
+    ],
+    "joomla": [
+        (3, "body", r'<meta[^>]+name=["\']generator["\'][^>]+content=["\']\s*Joomla', "generator meta"),
+        (3, "body", r'/media/(?:system|jui)/js/', "Joomla media path"),
+        (3, "body", r'(?:index\.php\?option=|/)com_[a-z_]{3,}', "com_ component"),
+        (2, "body", r'/templates/[a-z0-9_\-]+/css/', "Joomla template path"),
+        (1, "body", r'joomla\.javascript', "Joomla JS namespace"),
+    ],
+    "drupal": [
+        (3, "body", r'<meta[^>]+name=["\']generator["\'][^>]+content=["\']\s*Drupal', "generator meta"),
+        (3, "header", r'x-generator:[^\n]*drupal', "X-Generator header"),
+        (3, "body", r'/sites/(?:default|all)/(?:files|modules|themes)/', "Drupal sites path"),
+        (3, "body", r'/core/(?:misc|modules|themes)/', "Drupal core path"),
+        (2, "body", r'Drupal\.settings|drupal-settings-json', "Drupal JS settings"),
+        (1, "body", r'<body[^>]+class=["\'][^"\']*\bpath-node\b', "Drupal body class"),
+    ],
+}
+
+# Where each CMS states its version, and how to read it.
+_CMS_VERSION_SOURCES = {
+    "wordpress": [
+        ("/", r'<meta[^>]+name=["\']generator["\'][^>]+content=["\']\s*WordPress\s+([\d.]+)'),
+        ("/feed/", r'<generator>https?://wordpress\.org/\?v=([\d.]+)'),
+        ("/readme.html", r'[Vv]ersion\s+([\d.]+)'),
+    ],
+    "joomla": [
+        ("/administrator/manifests/files/joomla.xml", r'<version>\s*([\d.]+)\s*</version>'),
+        ("/language/en-GB/en-GB.xml", r'<version>\s*([\d.]+)\s*</version>'),
+        ("/", r'<meta[^>]+name=["\']generator["\'][^>]+content=["\']\s*Joomla[^"\']*?([\d.]+)'),
+    ],
+    "drupal": [
+        ("/CHANGELOG.txt", r'Drupal\s+([\d.]+),'),
+        ("/core/CHANGELOG.txt", r'Drupal\s+([\d.]+),'),
+        ("/", r'<meta[^>]+name=["\']generator["\'][^>]+content=["\']\s*Drupal\s+([\d.]+)'),
+    ],
+}
+
+# CMS-specific paths worth probing once the CMS is known. Kept to things that
+# are genuinely sensitive when exposed, rather than a plugin brute-force list:
+# individual plugin CVEs already live in the vulnerability playbook.
+_CMS_PATHS = {
+    "wordpress": [
+        ("/wp-config.php.bak", "wp-config backup", "critical"),
+        ("/wp-config.php~", "wp-config backup (~)", "critical"),
+        ("/wp-config.php.save", "wp-config backup (.save)", "critical"),
+        ("/.wp-config.php.swp", "wp-config vim swap", "critical"),
+        ("/wp-content/debug.log", "WordPress debug log", "high"),
+        ("/wp-content/backup-db/", "database backup directory", "critical"),
+        ("/wp-content/uploads/", "uploads directory listing", "medium"),
+        ("/wp-content/plugins/", "plugins directory listing", "medium"),
+        ("/wp-admin/install.php", "installer reachable", "critical"),
+        ("/wp-admin/setup-config.php", "setup wizard reachable", "critical"),
+        ("/wp-admin/maint/repair.php", "database repair page", "high"),
+        ("/wp-app.log", "WordPress app log", "medium"),
+        ("/wp-cli.yml", "WP-CLI config", "medium"),
+        ("/xmlrpc.php", "XML-RPC enabled", "low"),
+    ],
+    "joomla": [
+        ("/configuration.php.bak", "Joomla configuration backup", "critical"),
+        ("/configuration.php~", "Joomla configuration backup (~)", "critical"),
+        ("/configuration.php.old", "Joomla configuration backup (.old)", "critical"),
+        ("/administrator/", "administrator panel", "medium"),
+        ("/administrator/logs/error.php", "administrator error log", "high"),
+        ("/logs/error.php", "error log", "high"),
+        ("/installation/", "installer still present", "critical"),
+        ("/administrator/manifests/files/joomla.xml", "version manifest", "low"),
+        ("/htaccess.txt", "default htaccess template", "low"),
+        ("/web.config.txt", "default web.config template", "low"),
+    ],
+    "drupal": [
+        ("/sites/default/settings.php.bak", "settings.php backup", "critical"),
+        ("/sites/default/settings.php~", "settings.php backup (~)", "critical"),
+        ("/sites/default/files/.ht.sqlite", "SQLite database", "critical"),
+        ("/core/install.php", "installer reachable", "critical"),
+        ("/install.php", "installer reachable", "critical"),
+        ("/update.php", "update script reachable", "high"),
+        ("/CHANGELOG.txt", "version changelog", "low"),
+        ("/sites/default/files/", "files directory listing", "medium"),
+        ("/user/register", "open registration", "low"),
+        ("/admin", "admin area", "low"),
+    ],
+}
+
+# Markers proving a probed CMS path really is what it claims, so an HTML error
+# page or a catch-all cannot stand in for it.
+_CMS_PATH_MARKERS = {
+    "/wp-config.php.bak": [b"DB_NAME", b"DB_PASSWORD", b"<?php"],
+    "/wp-config.php~": [b"DB_NAME", b"DB_PASSWORD", b"<?php"],
+    "/wp-config.php.save": [b"DB_NAME", b"DB_PASSWORD", b"<?php"],
+    "/.wp-config.php.swp": [b"DB_NAME", b"DB_PASSWORD"],
+    "/wp-content/debug.log": [b"PHP ", b"Warning", b"Notice", b"Fatal", b"Stack trace"],
+    "/wp-admin/install.php": [b"WordPress", b"wp-admin"],
+    "/wp-admin/setup-config.php": [b"wp-config", b"database"],
+    "/wp-cli.yml": [b"path:", b"url:", b"user:"],
+    "/configuration.php.bak": [b"JConfig", b"<?php", b"public $"],
+    "/configuration.php~": [b"JConfig", b"<?php", b"public $"],
+    "/configuration.php.old": [b"JConfig", b"<?php", b"public $"],
+    "/administrator/manifests/files/joomla.xml": [b"<version>", b"<extension"],
+    "/sites/default/settings.php.bak": [b"$databases", b"<?php", b"drupal"],
+    "/sites/default/settings.php~": [b"$databases", b"<?php", b"drupal"],
+    "/CHANGELOG.txt": [b"Drupal"],
+    "/core/install.php": [b"Drupal", b"install"],
+}
+
+_DIRLIST_MARKERS = (b"Index of /", b"<title>Index of", b"Parent Directory",
+                    b"[To Parent Directory]")
+
+
+def _cms_detect(domain):
+    """
+    Identify the CMS from the homepage, scoring weighted signals.
+
+    Returns {cms, confidence, score, signals, candidates}. A score below 3 is
+    reported as unidentified rather than guessed at: a wrong CMS sends the
+    whole module down the wrong path.
+    """
+    out = {"cms": None, "confidence": "none", "score": 0, "signals": [],
+           "candidates": {}, "error": None}
+    r = _cms_get(domain, "/")
+    if r is None:
+        out["error"] = "homepage unreachable"
+        return out
+    try:
+        body = r.text or ""
+    except Exception:
+        body = ""
+    headers = "\n".join(f"{k}: {v}" for k, v in r.headers.items()).lower()
+
+    import re as _re
+    scores, hits = {}, {}
+    for cms, sigs in _CMS_SIGNALS.items():
+        total, found = 0, []
+        for weight, where, pattern, label in sigs:
+            hay = headers if where == "header" else body
+            if _re.search(pattern, hay, _re.I):
+                total += weight
+                found.append(f"{label} ({where})")
+        if total:
+            scores[cms] = total
+            hits[cms] = found
+    out["candidates"] = scores
+    if not scores:
+        return out
+
+    best = max(scores, key=lambda k: scores[k])
+    out["score"] = scores[best]
+    out["signals"] = hits[best]
+    # 3+ means at least one conclusive signal, or several weaker ones agreeing.
+    if scores[best] >= 3:
+        out["cms"] = best
+        out["confidence"] = "high" if scores[best] >= 5 else "medium"
+    return out
+
+
+def _cms_version(domain, cms):
+    """Read the CMS version from wherever it states it."""
+    import re as _re
+    for path, pattern in _CMS_VERSION_SOURCES.get(cms, []):
+        r = _cms_get(domain, path, timeout=7)
+        if r is None or r.status_code != 200:
+            continue
+        try:
+            txt = r.text or ""
+        except Exception:
+            continue
+        m = _re.search(pattern, txt, _re.I)
+        if m:
+            return {"version": m.group(1), "source": path}
+    return {"version": None, "source": None}
+
+
+def _cms_enumerate_wordpress(domain, findings):
+    """Users, plugins and themes, from what WordPress already publishes."""
+    import re as _re
+    out = {"users": [], "plugins": [], "themes": []}
+
+    # Users via the REST API. This is WordPress's own public endpoint, not a
+    # brute force, and it is the usual way author names leak.
+    r = _cms_get(domain, "/wp-json/wp/v2/users")
+    if r is not None and r.status_code == 200 and "json" in (r.headers.get("Content-Type") or "").lower():
+        try:
+            for u in (r.json() or [])[:50]:
+                if isinstance(u, dict) and (u.get("slug") or u.get("name")):
+                    out["users"].append({"id": u.get("id"),
+                                         "name": str(u.get("name", ""))[:60],
+                                         "slug": str(u.get("slug", ""))[:60]})
+        except Exception:
+            pass
+    if out["users"]:
+        findings.append({
+            "name": "WordPress user enumeration via REST API",
+            "severity": "medium", "path": "/wp-json/wp/v2/users",
+            "detail": f"{len(out['users'])} username(s) exposed: "
+                      + ", ".join(u["slug"] for u in out["users"][:6]),
+            "confidence": "confirmed",
+        })
+
+    # Plugins and themes, read out of the homepage rather than guessed. Brute
+    # forcing a plugin list is thousands of requests; the page names the ones
+    # actually loaded.
+    home = _cms_get(domain, "/")
+    body = (home.text if home is not None else "") or ""
+    for kind, pat in (("plugins", r'/wp-content/plugins/([a-z0-9_\-]{2,40})/'),
+                      ("themes", r'/wp-content/themes/([a-z0-9_\-]{2,40})/')):
+        names = sorted({m.group(1).lower() for m in _re.finditer(pat, body, _re.I)})
+        out[kind] = [{"name": n, "version": None} for n in names[:40]]
+
+    # Version each one from its own readme, which is where WordPress keeps it.
+    def _ver(item, kind):
+        for fn in ("readme.txt", "README.txt", "style.css"):
+            rr = _cms_get(domain, f"/wp-content/{kind}/{item['name']}/{fn}", timeout=6)
+            if rr is None or rr.status_code != 200:
+                continue
+            try:
+                t = rr.text or ""
+            except Exception:
+                continue
+            m = _re.search(r'(?:Stable tag|Version):\s*([\d.]+)', t, _re.I)
+            if m:
+                item["version"] = m.group(1)
+                return item
+        return item
+
+    todo = [(i, k) for k in ("plugins", "themes") for i in out[k]]
+    if todo:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+            list(ex.map(lambda a: _ver(a[0], a[1]), todo))
+    return out
+
+
+def _cms_probe_paths(domain, cms, base_sigs, brand, findings):
+    """Probe the CMS's own sensitive paths, with the usual suppression."""
+    probed = 0
+
+    def one(item):
+        path, label, sev = item
+        r = _cms_get(domain, path, timeout=7, allow_redirects=False)
+        if r is None:
+            return None
+        if base_sigs and _is_catchall(r, base_sigs, path):
+            return None
+        if _looks_soft_404(r):
+            return None
+        if r.status_code not in (200, 401, 403):
+            return None
+        content = r.content or b""
+        if not content:
+            return None
+
+        # A directory-listing finding has to actually be a listing.
+        if path.endswith("/") and "listing" in label:
+            if not any(m in content for m in _DIRLIST_MARKERS):
+                return None
+
+        markers = _CMS_PATH_MARKERS.get(path)
+        if markers and r.status_code == 200:
+            if not any(m in content for m in markers):
+                return None
+            # a backup of a PHP config that comes back as rendered HTML is the
+            # app's error page, not the file
+            if path.endswith((".bak", "~", ".old", ".save", ".swp")) and _looks_like_html(content):
+                return None
+
+        sev2 = sev
+        if r.status_code in (401, 403):
+            sev2 = {"critical": "high", "high": "medium",
+                    "medium": "low", "low": "info"}.get(sev, sev)
+        return {
+            "name": f"{_cms_name(cms)}: {label}",
+            "severity": sev2, "path": path,
+            "status": r.status_code, "size": len(content),
+            "url": r.url,
+            "detail": label + (" [requires auth]" if r.status_code in (401, 403) else ""),
+            "confidence": "confirmed",
+        }
+
+    items = _CMS_PATHS.get(cms, [])
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        for res in ex.map(one, items):
+            probed += 1
+            if res:
+                findings.append(res)
+    return probed
+
+
+def scan_cms(domain):
+    """
+    CMS-aware deep scan.
+
+    Identifies WordPress, Joomla or Drupal, then runs only that CMS's checks:
+    version, its own sensitive paths, and what it publishes about itself
+    (WordPress users, plugins and themes). Nothing CMS-specific runs unless
+    detection is confident, so a Drupal site is never probed for WordPress
+    paths.
+    """
+    if not HAS_REQUESTS:
+        return {"error": "requests required"}
+
+    det = _cms_detect(domain)
+    result = {
+        "cms": det["cms"], "confidence": det["confidence"],
+        "detection_score": det["score"], "signals": det["signals"],
+        "candidates": det["candidates"], "version": None, "version_source": None,
+        "findings": [], "users": [], "plugins": [], "themes": [],
+        "paths_probed": 0, "severity_counts": {},
+    }
+    if det.get("error"):
+        result["error"] = det["error"]
+        return result
+    if not det["cms"]:
+        # Say what was seen rather than nothing, so a near miss is debuggable.
+        result["note"] = ("No CMS identified. Weak signals: "
+                          + (", ".join(f"{k}={v}" for k, v in det["candidates"].items())
+                             or "none")) if det["candidates"] else "No CMS identified."
+        return result
+
+    cms = det["cms"]
+    findings = result["findings"]
+
+    ver = _cms_version(domain, cms)
+    result["version"] = ver["version"]
+    result["version_source"] = ver["source"]
+    if ver["version"]:
+        findings.append({
+            "name": f"{_cms_name(cms)} version disclosed",
+            "severity": "low", "path": ver["source"],
+            "detail": f"{_cms_name(cms)} {ver['version']} (from {ver['source']})",
+            # read from what the site states; a backported patch may not change it
+            "confidence": "version-inference",
+        })
+
+    base_sigs = _catchall_baseline(domain)
+    brand = None
+    try:
+        _home = _cms_get(domain, "/")
+        brand = _site_brand(domain, _home) if _home is not None else None
+    except Exception:
+        pass
+
+    result["paths_probed"] = _cms_probe_paths(domain, cms, base_sigs, brand, findings)
+
+    if cms == "wordpress":
+        enum = _cms_enumerate_wordpress(domain, findings)
+        result["users"] = enum["users"]
+        result["plugins"] = enum["plugins"]
+        result["themes"] = enum["themes"]
+
+    counts = {}
+    for f in findings:
+        counts[f["severity"]] = counts.get(f["severity"], 0) + 1
+    result["severity_counts"] = counts
+    result["total_findings"] = len(findings)
+    result["cms_name"] = _cms_name(cms)
+    return result
+
 ALL_MODULES = {
     "screenshot":      ("Website Screenshot",                    scan_screenshot),
     "dns":             ("DNS Records + Email Security",          scan_dns),
@@ -11111,6 +11517,7 @@ ALL_MODULES = {
     "content_intel":   ("Content Intel (JS/HTML URL & info extractor)", scan_content_intel),
     "http_inspect":    ("HTTP Inspector (request/response headers)", scan_http_inspect),
     "api_fuzzer":      ("API Endpoint Fuzzer",                  scan_api_fuzzer),
+    "cms":             ("CMS Deep Scan (WP/Joomla/Drupal)",     scan_cms),
 }
 
 FAST_SKIP = {"wayback", "brute", "subdomains", "screenshot", "email_harvest",

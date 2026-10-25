@@ -549,6 +549,52 @@ the `d`/`data` typo and `node --check` still passes while this test fails with
 The lesson generalises: a syntax check proves a file parses, not that its code
 runs. Anything that renders needs to be executed against realistic data.
 
+## Module 28 — CMS deep scan, and the decoy that shaped it
+
+A CMS-aware module identifies WordPress, Joomla or Drupal and then runs only
+that CMS's checks. The value is as much in what it does *not* do: firing
+WordPress probes at a Drupal site is noise in the report and wasted requests at
+the target.
+
+### Detection ignores the product name in page text
+
+The obvious detection is to grep the homepage for "WordPress". That is wrong,
+and it fails in the direction that matters: a blog post comparing CMS platforms
+mentions all three by name while running none of them. A scanner that believes
+the text then probes dozens of paths that cannot exist and reports whatever the
+catch-all returns.
+
+Detection therefore scores *structural* signals only — generator meta tags,
+`/wp-content/` and `/wp-includes/` asset paths, `/media/system/js/` and `com_`
+components, `/sites/default/` and `/core/` paths, `X-Generator` and
+`X-Pingback` headers. A weight of 3 is conclusive on its own; lighter signals
+have to agree. Below a total of 3, the module reports no CMS rather than
+guessing, and probes nothing.
+
+`cmslab.py` includes `blog.cmstest` for exactly this: a site that writes about
+WordPress, Joomla and Drupal at length, with every product name in the prose
+and none of the structure. It must come back as no CMS, with zero paths probed.
+
+### Enumeration reads what the CMS publishes
+
+Plugins and themes come from the asset paths in the homepage HTML and their
+versions from each one's own `readme.txt`, not from brute-forcing a plugin
+wordlist. The site names the plugins it actually loads; guessing thousands of
+paths would be louder and less accurate. Users come from WordPress's own public
+REST endpoint.
+
+### Probed paths still need proof
+
+Every CMS path goes through the existing catch-all and soft-404 suppression,
+and the sensitive ones carry content markers: a `wp-config.php.bak` must contain
+`DB_NAME` or `DB_PASSWORD`, a Joomla `configuration.php.bak` must contain
+`JConfig`, a directory-listing finding must actually be a listing. A config
+backup that comes back as rendered HTML is the application's error page, not the
+file, and is rejected.
+
+Version findings are marked `version-inference`, as everywhere else: the CMS
+states its version, and a backported patch may not change it.
+
 ## Rules of thumb for new checks
 
 1. **Never let a status code alone be evidence.** Pair it with a word matcher.
@@ -584,6 +630,8 @@ runs. Anything that renders needs to be executed against realistic data.
    an empty object.
 16. **A failed render must be visible.** If a card can be left in a loading
    state by an exception, a display bug becomes a silent hang.
-17. **Don't claim absence you cannot establish.** DKIM selectors can't be
+17. **Identify before you probe.** Technology-specific checks need confident
+   detection first, from structure rather than from a product name in prose.
+18. **Don't claim absence you cannot establish.** DKIM selectors can't be
    enumerated, so a miss is "not found at the names we tried". Where absence is
    unprovable, the finding earns credit when present but costs nothing when not.
