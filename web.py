@@ -652,6 +652,20 @@ body{background:
       <div class="right-section-title">🔗 <span>OSINT Platform Links</span> <span class="badge b-purple" style="margin-left:auto">26 tools</span></div>
       <div id="osintPanel"><div style="color:var(--text3);font-size:11px;text-align:center;padding:20px 0">Run a scan to generate links</div></div>
     </div>
+
+    <div style="border-top:1px solid var(--border);padding-top:12px;margin-top:4px">
+      <div class="right-section-title">🧰 <span>More tools</span></div>
+      <a href="https://github.com/karim852/kumo-recon-browser-extension" target="_blank" rel="noopener"
+         style="display:block;text-decoration:none;border:1px solid var(--border2);border-radius:6px;padding:8px 9px;margin-bottom:6px">
+        <div style="font-weight:700;font-size:11px;color:var(--text)">🕸 Kumo Recon — browser extension</div>
+        <div style="font-size:10px;color:var(--text3);margin-top:2px">the passive modules, straight from the browser</div>
+      </a>
+      <a href="https://github.com/karim852/Kage-DFIR-toolkit" target="_blank" rel="noopener"
+         style="display:block;text-decoration:none;border:1px solid var(--border2);border-radius:6px;padding:8px 9px">
+        <div style="font-weight:700;font-size:11px;color:var(--text)">🌑 Kage 影 — DFIR toolkit</div>
+        <div style="font-size:10px;color:var(--text3);margin-top:2px">Windows host triage, same author</div>
+      </a>
+    </div>
   </div>
 
 </div>

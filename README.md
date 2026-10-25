@@ -572,6 +572,7 @@ Respect each source's own terms of use and rate limits.
 | | Tool | Domain |
 |---|---|---|
 | ☁️ | **Kumo** 蜘蛛 | domain OSINT & reconnaissance |
+| 🕸 | [**Kumo Recon** — browser extension](https://github.com/karim852/kumo-recon-browser-extension) | the passive modules, straight from the browser |
 | 🌑 | [**Kage** 影](https://github.com/karim852/Kage-DFIR-toolkit) | DFIR host triage |
 
 ---

@@ -316,6 +316,16 @@ def home_screen():
           f"{C.RS}{C.GR}a{C.DM} for all, {C.RS}{C.GR}f{C.DM} for fast, "
           f"{C.RS}{C.GR}w{C.DM} for the web interface, "
           f"{C.RS}{C.GR}q{C.DM} to quit.{C.RS}\n")
+    ecosystem()
+
+
+def ecosystem():
+    """Two sibling tools, one line each. Kept to the bottom of the home screen
+    so it is findable without competing with the module menu."""
+    print(f"  {C.DM}🕸 browser extension{C.RS}  {C.GR}"
+          f"github.com/karim852/kumo-recon-browser-extension{C.RS}")
+    print(f"  {C.DM}🌑 Kage 影 · DFIR{C.RS}     {C.GR}"
+          f"github.com/karim852/Kage-DFIR-toolkit{C.RS}\n")
 
 
 # ═══════════════════════════════════════════════════════════════
