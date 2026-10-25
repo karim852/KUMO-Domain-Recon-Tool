@@ -659,7 +659,7 @@ def render_dns(data):
             dimprint(v[:85], 6)
     es = data.get("email_security", {})
     grade = es.get("grade")
-    print(f"\n    {C.M}Email Security:{C.RS}" + (f"  {C.D}grade {grade}{C.RS}" if grade else ""))
+    print(f"\n    {C.M}Email Security:{C.RS}" + (f"  {C.GR}grade {grade}{C.RS}" if grade else ""))
 
     spf = es.get("spf", {})
     if spf.get("found"):

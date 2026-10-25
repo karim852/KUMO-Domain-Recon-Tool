@@ -104,6 +104,84 @@ def _txt_values(answers):
     return [t for t in out if t]
 
 
+# Multi-label public suffixes, so the organisational domain of
+# "mail.example.co.uk" is "example.co.uk" and not "co.uk". This is a pragmatic
+# subset of the Public Suffix List covering the registry suffixes seen in
+# practice; an unlisted one simply means the walk stops one level early, which
+# costs a lookup rather than producing a wrong answer.
+_MULTI_SUFFIX = {
+    "co.uk", "org.uk", "me.uk", "ltd.uk", "plc.uk", "net.uk", "sch.uk",
+    "ac.uk", "gov.uk", "nhs.uk", "police.uk", "mod.uk",
+    "com.au", "net.au", "org.au", "edu.au", "gov.au", "asn.au", "id.au",
+    "co.nz", "net.nz", "org.nz", "govt.nz", "ac.nz", "school.nz",
+    "co.za", "org.za", "net.za", "web.za", "gov.za", "ac.za",
+    "com.br", "net.br", "org.br", "gov.br", "edu.br",
+    "com.mx", "org.mx", "gob.mx", "com.ar", "gob.ar", "org.ar",
+    "co.jp", "or.jp", "ne.jp", "ac.jp", "go.jp", "ad.jp",
+    "co.kr", "or.kr", "go.kr", "re.kr", "ac.kr",
+    "com.cn", "net.cn", "org.cn", "gov.cn", "edu.cn", "ac.cn",
+    "com.hk", "org.hk", "net.hk", "gov.hk", "edu.hk",
+    "com.sg", "net.sg", "org.sg", "gov.sg", "edu.sg",
+    "com.tr", "org.tr", "net.tr", "gov.tr", "edu.tr",
+    "com.tn", "ens.tn", "fin.tn", "gov.tn", "ind.tn", "intl.tn",
+    "nat.tn", "net.tn", "org.tn", "info.tn", "perso.tn", "tourism.tn",
+    "com.eg", "org.eg", "net.eg", "gov.eg", "edu.eg",
+    "com.sa", "net.sa", "org.sa", "gov.sa", "edu.sa",
+    "co.ma", "net.ma", "org.ma", "gov.ma", "ac.ma",
+    "com.ng", "org.ng", "net.ng", "gov.ng", "edu.ng",
+    "co.ke", "or.ke", "ne.ke", "go.ke", "ac.ke",
+    "com.ua", "net.ua", "org.ua", "gov.ua", "in.ua",
+    "com.pl", "net.pl", "org.pl", "gov.pl", "edu.pl",
+    "co.in", "net.in", "org.in", "gov.in", "ac.in", "edu.in", "firm.in",
+    "com.pk", "net.pk", "org.pk", "gov.pk", "edu.pk",
+    "com.my", "net.my", "org.my", "gov.my", "edu.my",
+    "com.ph", "net.ph", "org.ph", "gov.ph", "edu.ph",
+    "com.vn", "net.vn", "org.vn", "gov.vn", "edu.vn",
+    "com.co", "net.co", "org.co", "com.pe", "com.ve", "com.ec",
+    "com.uy", "com.py", "com.bo", "com.do", "com.gt", "com.pa",
+    "co.il", "org.il", "net.il", "gov.il", "ac.il",
+    "com.cy", "com.mt", "com.gr", "com.pt", "com.es", "com.it",
+    "co.id", "or.id", "ac.id", "go.id", "web.id",
+    "co.th", "in.th", "ac.th", "go.th", "or.th",
+    "com.ru", "net.ru", "org.ru", "com.kw", "com.qa", "com.bh",
+    "com.om", "com.jo", "com.lb", "com.ly", "com.dz",
+}
+
+
+def _parent_domains(domain):
+    """
+    Progressively shorter parent domains of a hostname, nearest first.
+
+    Used for the DMARC organisational-domain fallback: a receiver that finds no
+    record at the exact name queries the organisational domain (RFC 7489
+    §6.6.3), so a scan of www.example.com must still see the policy published at
+    example.com. The walk stops before a public suffix, so _dmarc.co.uk is never
+    queried and a registry suffix can never be mistaken for a domain.
+    """
+    host = (domain or "").strip(".").lower()
+    try:
+        import ipaddress
+        ipaddress.ip_address(host)
+        return []            # an IP address has no parent domain to inherit from
+    except Exception:
+        pass
+    labels = host.split(".")
+    out = []
+    # a hostname needs at least two labels to be a domain at all
+    for i in range(1, max(0, len(labels) - 1)):
+        cand = ".".join(labels[i:])
+        if len(cand.split(".")) < 2:
+            break
+        if cand in _MULTI_SUFFIX:
+            break            # the remainder is a registry suffix, not a domain
+        out.append(cand)
+        # stop once we have reached the organisational domain itself
+        rest = ".".join(labels[i + 1:])
+        if len(rest.split(".")) < 2 or rest in _MULTI_SUFFIX:
+            break
+    return out
+
+
 def _parse_tags(record):
     """
     Parse a tag-value record ('v=DMARC1; p=reject; sp=none') into a dict.
@@ -302,13 +380,36 @@ def scan_dns(domain):
     # A DMARC record must begin with v=DMARC1 (RFC 7489 §6.3). Other TXT records
     # do live at _dmarc (verification tokens, comments), and treating those as a
     # policy was a false positive in both directions.
-    dmarc_txt = _txt_values(raw.get("dmarc", []))
-    dmarc_records = [t for t in dmarc_txt
-                     if t.lower().replace(" ", "").startswith("v=dmarc1")]
+    def _dmarc_at(answers):
+        return [t for t in _txt_values(answers)
+                if t.lower().replace(" ", "").startswith("v=dmarc1")]
+
+    dmarc_records = _dmarc_at(raw.get("dmarc", []))
     lookup_failed = status.get("dmarc") == "error"
+    found_at, inherited = domain, False
+
+    # Organisational-domain fallback (RFC 7489 §6.6.3). A receiver that finds no
+    # record at the exact name queries the organisational domain, so DMARC
+    # published at example.com applies to mail from www.example.com. Kumo used to
+    # make only the first query, which meant EVERY subdomain scan reported
+    # "DMARC missing — spoofing risk" on domains that have DMARC enabled. That
+    # is the single worst false negative this module had.
+    if not dmarc_records and not lookup_failed:
+        for parent in _parent_domains(domain):
+            answers, st = dns_query_ex(f"_dmarc.{parent}", "TXT")
+            if st == "error":
+                lookup_failed = True
+                break
+            got = _dmarc_at(answers)
+            if got:
+                dmarc_records, found_at, inherited = got, parent, True
+                break
+
     dmarc = {"found": bool(dmarc_records), "record": None, "policy": "",
              "subdomain_policy": "", "pct": None, "rua": None,
              "record_count": len(dmarc_records), "valid": True,
+             "found_at": found_at if dmarc_records else None,
+             "inherited": inherited,
              "lookup_failed": lookup_failed and not dmarc_records, "notes": []}
     if len(dmarc_records) > 1:
         # RFC 7489 §6.6.3: multiple records means DMARC is not applied at all.
@@ -325,9 +426,21 @@ def scan_dns(domain):
         sp = (tags.get("sp") or "").lower()
         dmarc["subdomain_policy"] = sp
         if dmarc["valid"]:
+            # For an inherited record the policy that actually applies to this
+            # name is sp= when present, falling back to p= (RFC 7489 §6.3). A
+            # subdomain of a "p=reject; sp=none" domain is NOT protected, and
+            # reporting the parent's p= here would overstate its posture.
+            effective = (sp or p) if inherited else p
             dmarc["policy"] = {"none": "none (not enforcing)",
                                "quarantine": "quarantine",
-                               "reject": "reject (strict)"}.get(p, p or "missing p tag")
+                               "reject": "reject (strict)"}.get(
+                                   effective, effective or "missing p tag")
+            if inherited:
+                dmarc["policy"] += f" — inherited from {found_at}"
+                dmarc["notes"].append(
+                    f"no record at _dmarc.{domain}; policy inherited from the "
+                    f"organisational domain {found_at}, which is how receivers "
+                    f"evaluate it" + (f" (sp={sp} applies to subdomains)" if sp else ""))
             if not p:
                 dmarc["valid"] = False
                 dmarc["notes"].append("no p= tag, so the record is ignored by receivers")

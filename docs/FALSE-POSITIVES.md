@@ -297,6 +297,32 @@ Records are now parsed into tags (`_parse_tags`) and the `p` tag is read
 directly. `sp=none` is reported separately, as what it is: the organisational
 domain is protected but subdomains are not.
 
+### 12b. DMARC was never looked up at the organisational domain
+
+This is the one a user reported from the field: DMARC enabled, Kumo said off.
+
+DMARC was resolved with a single query — `_dmarc.<target>` — and nothing else.
+RFC 7489 §6.6.3 requires a receiver that finds no record at the exact name to
+query the **organisational domain**, which is how a policy published at
+`example.com` governs mail from `www.example.com`. Kumo only ever made the
+first query, so **every scan of a subdomain reported "DMARC missing — spoofing
+risk"** on a domain that has DMARC enabled and enforced.
+
+`_parent_domains` now walks up label by label, stopping before a public suffix
+so `_dmarc.co.uk` is never queried and a registry suffix can never be mistaken
+for a domain. The result records `found_at` and `inherited`.
+
+One subtlety worth keeping right: for an inherited record the policy that
+applies to the subdomain is `sp=` when present, falling back to `p=`. A
+subdomain of a `p=reject; sp=none` domain is genuinely **not** protected, so
+reporting the parent's `reject` there would overstate the posture. The scan
+reports `none (not enforcing)` for the subdomain and `reject (strict)` for the
+apex — both correct, from the same record.
+
+For the record, this was not caused by a predefined list. DMARC has no list in
+its path; the only predefined list in the module is `DKIM_SELECTORS`, which
+affects DKIM alone (see below).
+
 ### 13. Anything at `_dmarc` counted as a policy
 
 The test was `if "dmarc" in record.lower()`. A DMARC record must begin with

@@ -772,7 +772,12 @@ function getBadges(id, data) {
   if (id==='censys'){const s=data.summary||{};b.push(`<span class="badge b-info">${s.ips_found||0} IPs</span>`);if(s.certs_found)b.push(`<span class="badge b-info">${s.certs_found} certs</span>`);}
   if (id==='geo'&&data.country) b.push(`<span class="badge b-info">${data.country_code||data.country}</span>`);
   if (id==='breachintel'){const s=data.summary||{};const hits=(s.total_infostealer_hits||0)+(s.total_employees_leaked||0);if(s.critical_findings?.length)b.push(`<span class="badge b-fail">${s.critical_findings.length} CRIT</span>`);b.push(hits>0?`<span class="badge b-warn">${hits} leaked</span>`:`<span class="badge b-pass">CLEAN</span>`);}
-  if (id==='dns'&&data.email_security){const es=data.email_security;b.push(!es.dmarc?.found?`<span class="badge b-warn">NO DMARC</span>`:`<span class="badge b-pass">DMARC OK</span>`);}
+  if (id==='dns'&&data.email_security){const es=data.email_security;const dm=es.dmarc||{};
+    // "not determined" is not the same as "absent": a failed lookup, or a
+    // policy inherited from the organisational domain, must not read as NO DMARC.
+    b.push(dm.found?`<span class="badge b-pass">DMARC ${dm.inherited?'INHERITED':'OK'}</span>`
+          :dm.lookup_failed?`<span class="badge b-info">DMARC ?</span>`
+          :`<span class="badge b-warn">NO DMARC</span>`);}
   if (id==='screenshot'&&data.data) b.push(`<span class="badge b-pass">CAPTURED</span>`);
   return b.join('');
 }

@@ -7,10 +7,21 @@ records that inverts findings. The worst case: **`p=none` is a substring of
 `sp=none`**, so a domain publishing `v=DMARC1; p=reject; sp=none` — the
 strictest policy there is — was reported as *"none (not enforcing)"*.
 
-Six false positives fixed:
+**The one reported from the field:** DMARC was resolved with a single query to
+`_dmarc.<target>`. RFC 7489 §6.6.3 requires falling back to the organisational
+domain, which is how a policy at `example.com` governs `www.example.com`. Kumo
+never made that second query, so **every subdomain scan reported DMARC as
+missing** on domains that have it enabled. Fixed: the lookup now walks up to
+the organisational domain, stopping before a public suffix, and reports where
+the policy was found. An inherited policy correctly uses `sp=` when present, so
+a subdomain of a `p=reject; sp=none` domain is reported as unprotected rather
+than inheriting the parent's `reject`.
+
+Seven false positives fixed:
 
 | was | now |
 |---|---|
+| subdomain scans read DMARC as missing | falls back to the organisational domain (RFC 7489 §6.6.3) |
 | `p=reject; sp=none` read as "not enforcing" | records parsed into tags; `sp=none` reported separately |
 | any TXT at `_dmarc` read as a policy | must begin with `v=DMARC1` (RFC 7489) |
 | two SPF or DMARC records read as working | flagged invalid — receivers reject both (RFC 7208/7489) |

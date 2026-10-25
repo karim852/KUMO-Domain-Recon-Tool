@@ -148,7 +148,7 @@ def main():
     # and "the lookup failed".
     print(f"\n{B}scan_dns end to end{X}  {D}(stubbed resolver){X}")
 
-    def run_scan(zone, failing=()):
+    def run_scan(zone, failing=(), target="example.com"):
         """zone: {(qname, qtype): [txt strings]}; failing: qnames whose lookup errors."""
         def fake_query_ex(qname, qtype):
             if qname in failing:
@@ -161,7 +161,7 @@ def main():
         engine.dns_query_ex = fake_query_ex
         engine.resolve = lambda d: {"v4": ["198.51.100.7"], "v6": []}
         try:
-            return engine.scan_dns("example.com")["email_security"]
+            return engine.scan_dns(target)["email_security"]
         finally:
             engine.dns_query_ex, engine.resolve = real_q, real_r
 
@@ -230,6 +230,75 @@ def main():
     # 8. +all is dangerous and must cost score
     es8 = run_scan({("example.com", "TXT"): ["v=spf1 +all"]})
     checks += [("+all flagged dangerous", "DANGEROUS" in es8["spf"]["policy"])]
+
+    for label, good in checks:
+        fails += [] if good else [("scan_dns", label, "True", "False")]
+        print(f"  {G+'ok  '+X if good else R+'FAIL'+X} {label}")
+    checks = []
+
+    # ── DMARC organisational-domain fallback ────────────────────────────
+    # The reported bug: a domain with DMARC enabled was reported as having it
+    # off, because the policy is published at the organisational domain and
+    # only the exact name was queried. RFC 7489 6.6.3 requires the fallback.
+    print(f"\n{B}DMARC organisational-domain inheritance{X}  "
+          f"{D}(RFC 7489 §6.6.3){X}")
+
+    apex = {("_dmarc.example.com", "TXT"): ["v=DMARC1; p=reject; rua=mailto:d@example.com"]}
+
+    e_apex = run_scan(apex, target="example.com")["dmarc"]
+    e_www = run_scan(apex, target="www.example.com")["dmarc"]
+    e_deep = run_scan(apex, target="mail.corp.example.com")["dmarc"]
+
+    checks += [
+        ("apex: found directly, not inherited",
+         e_apex["found"] and not e_apex["inherited"] and e_apex["found_at"] == "example.com"),
+        ("www: policy inherited rather than reported missing",
+         e_www["found"] and e_www["inherited"] and e_www["found_at"] == "example.com"),
+        ("www: inherited policy is the parent's reject",
+         e_www["policy"].startswith("reject")),
+        ("www: inheritance explained in a note",
+         any("inherited" in n and "example.com" in n for n in e_www["notes"])),
+        ("deep subdomain walks up to the org domain",
+         e_deep["found"] and e_deep["found_at"] == "example.com"),
+    ]
+
+    # sp= governs what applies to a subdomain. A subdomain of a
+    # "p=reject; sp=none" domain is genuinely unprotected, and saying "reject"
+    # here would overstate it.
+    sp_none = {("_dmarc.example.com", "TXT"): ["v=DMARC1; p=reject; sp=none"]}
+    e_sp = run_scan(sp_none, target="www.example.com")["dmarc"]
+    e_sp_apex = run_scan(sp_none, target="example.com")["dmarc"]
+    checks += [
+        ("subdomain of sp=none reports not enforcing",
+         e_sp["policy"].startswith("none")),
+        ("apex of the same domain still reports reject",
+         e_sp_apex["policy"].startswith("reject")),
+    ]
+
+    # multi-label public suffixes must not be walked into
+    e_uk = run_scan({("_dmarc.example.co.uk", "TXT"): ["v=DMARC1; p=quarantine"]},
+                    target="shop.example.co.uk")["dmarc"]
+    checks += [("co.uk: inherits from example.co.uk",
+                e_uk["found"] and e_uk["found_at"] == "example.co.uk")]
+
+    e_tn = run_scan({("_dmarc.example.com.tn", "TXT"): ["v=DMARC1; p=reject"]},
+                    target="mail.example.com.tn")["dmarc"]
+    checks += [("com.tn: inherits from example.com.tn",
+                e_tn["found"] and e_tn["found_at"] == "example.com.tn")]
+
+    # and the fallback must not invent a policy where there is none
+    e_none = run_scan({}, target="www.nodmarc.com")["dmarc"]
+    checks += [
+        ("genuinely absent DMARC still reported missing",
+         not e_none["found"] and not e_none["lookup_failed"]),
+    ]
+
+    # a public suffix must never be queried as if it were a domain
+    checks += [
+        ("co.uk not treated as a domain", "co.uk" not in engine._parent_domains("example.co.uk")),
+        ("apex has no parents", engine._parent_domains("example.com") == []),
+        ("IP target has no parents", engine._parent_domains("127.0.0.1") == []),
+    ]
 
     for label, good in checks:
         fails += [] if good else [("scan_dns", label, "True", "False")]
