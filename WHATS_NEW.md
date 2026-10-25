@@ -34,7 +34,7 @@ the table knows twenty. A Magento storefront used to return an empty CMS card,
 which reads as "nothing here". It now names the platform and says there are no
 deep checks for it yet.
 
-Also fixed a flaw in the test harness itself: `test_renderers.py` derived
+Also fixed a flaw in the test harness itself: the renderer suite derived
 renderer ids by stripping only `_plain`, so the `cms_none` and `panels_none`
 fixtures were calling an id that does not exist, falling through to the default
 branch, and passing having rendered nothing. It now asserts what each card
@@ -56,7 +56,7 @@ Two guards, because this module is unusually prone to false positives:
 **A hosting company's own website sells these products.** Its pages say
 "cPanel Login", "WHM Login", "Login to Webmin" and "Plesk Obsidian" in plain
 prose. Detection matches a panel's *login interface* — its title, its session
-cookie, its form markup — never the product name in text. `panellab.py`
+cookie, its form markup — never the product name in text. The panel lab
 includes a hosting provider's marketing site as a decoy, and it reports none.
 
 **Cloudflare proxies 2082, 2083, 2086, 2087, 2095, 2096 and 8443** for every
@@ -67,7 +67,7 @@ Non-proxied panel ports are still checked.
 A port that answers without a recognisable panel is reported as an open port,
 not a panel: something is listening, nothing proves what.
 
-New `test_panels.py` covers 21 cases. The module is in the false-positive
+A new panel suite covers 21 cases. The module is in the false-positive
 harness, which stays clean across all 9 trap hosts.
 
 
@@ -94,9 +94,9 @@ components, `/sites/default/`, `X-Generator` and `X-Pingback`. Below a
 confidence threshold the module reports no CMS and probes nothing — a Drupal
 site is never probed for WordPress paths.
 
-New `cmslab.py` serves all three CMSes plus two decoys: a blog that writes
+A new CMS lab serves all three CMSes plus two decoys: a blog that writes
 about WordPress, Joomla and Drupal without running any, and an ordinary site.
-`test_cms.py` covers 31 cases, and the CMS module is now part of the
+The CMS suite covers 31 cases, and the CMS module is now part of the
 false-positive harness, which stays clean across all 9 trap hosts.
 
 
@@ -116,7 +116,7 @@ the skeleton stayed up while the scan reported itself complete. `fillCard` now
 catches, shows the error in the card, and always leaves the running state, so a
 render bug can no longer present as a hang.
 
-New `test_renderers.py` executes every renderer in Node against real engine
+A new renderer suite executes every renderer in Node against real engine
 output, an error dict and an empty object. Put the typo back and `node --check`
 still passes while this test fails.
 
@@ -139,7 +139,7 @@ Every name is checked against the target domain before it is kept, and each
 one now records which source produced it. The per-source counts show in both
 UIs, so a questionable entry can be traced instead of guessed at.
 
-`test_subdomain_sources.py` feeds in a realistic shared-IP response — the
+the subdomain-source suite feeds in a realistic shared-IP response — the
 target's own names mixed with `shop.othercompany.com`, `cdn.cloudflare.net`,
 `acme-corp.com.evil.net`, `evil-acme-corp.com` and `notacme-corp.com` — and
 asserts only the target's own subdomains survive.
@@ -185,7 +185,7 @@ scanning a subdomain used to collect **zero** addresses (nothing ends with
 `someone@acme-corp.com` out of `someone@acme-corp.com.evil.com`. Lookalike
 domains, subdomains and malformed addresses are all rejected.
 
-New `test_stealer_coverage.py` proves all 60 of 60 collected addresses get
+New the stealer-coverage suite proves all 60 of 60 collected addresses get
 checked, that no client address is ever looked up, that nothing is dropped
 silently, and that a failed lookup is never reported as clean.
 
@@ -234,7 +234,7 @@ Also added: **MTA-STS, TLS-RPT and BIMI** detection, a `pct<100` warning (a
 sampled DMARC policy is commonly mistaken for full enforcement), and an email
 security **grade** the web UI already had a slot for.
 
-New `test_email_security.py`: every record shape, plus `scan_dns` end to end through a
+New the email-security suite: every record shape, plus `scan_dns` end to end through a
 stubbed resolver — including the case where absence must *not* be claimed.
 
 
@@ -255,7 +255,7 @@ reconnaissance.
 because that is what it still supports, but NVD records no lower bound, PHP
 backported to 7.4/8.0/8.1, and AlmaLinux patched 7.2/7.3/7.4. So every branch
 with no fix of its own is treated as affected: 8.1, 8.0, all of 7.x, all of 5.x.
-`test_versions.py` checks 31 versions from 5.0.0 to 8.5.20 over real HTTP,
+the version suite checks 31 versions from 5.0.0 to 8.5.20 over real HTTP,
 through both the `X-Powered-By` and `Server` header forms.
 
 Two rules, because they are two different facts with different remedies:
@@ -318,7 +318,7 @@ Full inventory: [`docs/RULES.md`](docs/RULES.md).
 
 * **Fourteen rules could never fire.** The anti-echo scrub was stripping the
   very words those rules matched on, `docker-api` and `graphql-introspection`
-  among them. `test_rules.py` never caught it because it evaluated rules
+  among them. the rule suite never caught it because it evaluated rules
   *without* the scrub the scanner applies. It now runs them exactly as the
   scanner does and carries a dead-rule check.
 * **Binary bodies were mis-decoded**, so the `.DS_Store` rule never matched its
@@ -330,8 +330,8 @@ Full inventory: [`docs/RULES.md`](docs/RULES.md).
 
 ## Precision pass — false positives
 
-Kumo now ships with a **false-positive lab** (`fplab.py`) alongside the
-vulnerable lab, and a harness (`test_fp.py`) that scans seven shapes of
+Kumo now ships with a **false-positive lab** (the false-positive lab) alongside the
+vulnerable lab, and a harness (the false-positive suite) that scans seven shapes of
 ordinary web host where the correct answer is always "nothing found": an SPA
 catch-all, a soft-404 site, a WAF that 403s everything, a CMS search page that
 echoes the requested path, a JSON API gateway, a redirect-everything host, and
@@ -356,9 +356,9 @@ rather than the homepage they actually return, so a **high**-severity ClickHouse
 finding appeared on hosts running no ClickHouse at all.
 
 Both are fixed at the source, and an evidence floor in `_eval_rule` retro-fits
-the 335 rules already shipped. `test_rules.py` now covers the whole playbook —
+the 335 rules already shipped. the rule suite now covers the whole playbook —
 **all 365 rules against 11 decoy responses** — not just the 30 hand-written
-ones. Full write-up in [`docs/FALSE-POSITIVES.md`](docs/FALSE-POSITIVES.md).
+ones. The false-positive log is kept with the test suite, not published here.
 
 Detection is unchanged: every planted exposure is still found.
 

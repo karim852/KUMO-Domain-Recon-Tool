@@ -8,3 +8,11 @@ screenshots/
 
 # local-only: full inventory of every check (not published)
 docs/CHECKS.md
+
+# test suite and lab fixtures: kept locally, not published
+test_*.py
+lab.py
+fplab.py
+cmslab.py
+panellab.py
+docs/FALSE-POSITIVES.md
