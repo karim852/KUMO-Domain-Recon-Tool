@@ -93,6 +93,22 @@ NEGATIVE = {
                                    "</body></html>", HTML),
     "redirect": R(302, "", {"Location": "https://example.com/login"}),
     "json-error": R(200, '{"error":"not found","status":404}', JSON),
+    # Shapes that the live fplab.py hosts serve. A rule that fires on any of
+    # these fires on a large slice of the ordinary web.
+    "generic-json-api": R(200, '{"status":"ok","title":"Resource","message":"No handler matched",'
+                               '"comment":"","pageId":0,"version":"2.4.0","data":[],'
+                               '"_links":{"self":{"href":"/x"}},"timestamp":"2026-10-25T00:00:00Z"}', JSON),
+    "spa-shell": R(200, "<!DOCTYPE html><html><head><title>Northwind Analytics</title>"
+                        "<script type='module' src='/assets/index.js'></script></head>"
+                        "<body><div id='root'></div></body></html>", HTML),
+    "echo-search": R(200, "<!DOCTYPE html><html><head><title>admin login · BrandMart</title></head>"
+                          "<body><h1>Search results for \"admin login\"</h1>"
+                          "<p>Showing products matching admin login in our catalog.</p>"
+                          + "<p class='c'>product </p>" * 80 + "</body></html>", HTML),
+    "marketing-site": R(200, "<!DOCTYPE html><html><head><title>Acme Cloud — Platform</title></head>"
+                             "<body><h1>Build faster</h1><p>Our API, status page, metrics dashboard, "
+                             "admin console and user management help teams ship. Read the docs, see "
+                             "pricing, contact sales. version 3</p><footer>© Acme</footer></body></html>", HTML),
 }
 
 
@@ -123,12 +139,40 @@ def main():
         for _, why in bad:
             print(f"          └─ {why}")
 
+    # ── the ported playbook ──────────────────────────────────────────
+    # The ~335 rules mined from nuclei-templates have no hand-written positive
+    # fixture, but they must still survive every decoy. This half of the harness
+    # is what caught the condition-flattening bug in the porting pipeline.
+    ext = engine.VULN_RULES_EXTENDED
+    ext_fails = []
+    for rule in ext:
+        for nname, nresp in NEGATIVE.items():
+            try:
+                if engine._eval_rule(nresp, rule):
+                    ext_fails.append((rule["id"], rule["severity"], rule["name"][:46], nname))
+            except Exception as e:
+                ext_fails.append((rule["id"], rule["severity"], f"CRASH: {e}"[:46], nname))
+
+    print(f"\n  Ported playbook: {len(ext)} rules × {len(NEGATIVE)} decoys")
+    for rid, sev, name, nname in ext_fails[:30]:
+        print(f"    \033[91mFALSE POSITIVE\033[0m [{sev:<8}] {rid:<40} fires on '{nname}'  {name}")
+    if len(ext_fails) > 30:
+        print(f"    … and {len(ext_fails)-30} more")
+    if not ext_fails:
+        print("    \033[92mno ported rule fires on any decoy\033[0m")
+
     print()
-    if fails:
-        print(f"\033[91m{len(fails)} problem(s) across {len(set(f[0] for f in fails))} rule(s)\033[0m")
+    if fails or ext_fails:
+        if fails:
+            print(f"\033[91m{len(fails)} problem(s) across "
+                  f"{len(set(f[0] for f in fails))} hand-written rule(s)\033[0m")
+        if ext_fails:
+            print(f"\033[91m{len(ext_fails)} false positive(s) across "
+                  f"{len(set(f[0] for f in ext_fails))} ported rule(s)\033[0m")
         return 1
-    print(f"\033[92mALL {len(rules)} RULES PASS — every rule fires on its vulnerable "
-          f"fixture and on none of the {len(NEGATIVE)} decoys\033[0m")
+    print(f"\033[92mALL {len(rules)} hand-written rules fire on their vulnerable fixture, "
+          f"and none of the {len(rules) + len(ext)} rules fire on any of the "
+          f"{len(NEGATIVE)} decoys\033[0m")
     return 0
 
 

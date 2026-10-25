@@ -867,6 +867,88 @@ def _resp_part(resp, part, scrub=None):
     return text
 
 
+# Tokens that carry no product evidence on their own. A ported rule whose only
+# satisfied word is one of these has matched the shape of ordinary web traffic,
+# not the product it claims to have found. Punctuation and quoting are stripped
+# before the comparison, so "title", '"title"' and '"title":' all count as weak.
+_WEAK_EVIDENCE = {
+    "admin", "login", "logout", "password", "username", "user", "users", "error",
+    "errors", "true", "false", "null", "none", "index", "home", "page", "pages",
+    "welcome", "search", "submit", "form", "name", "title", "email", "sign in",
+    "log in", "dashboard", "settings", "setting", "status", "version", "data",
+    "id", "ids", "type", "value", "values", "server", "content", "text", "code",
+    "message", "messages", "success", "ok", "yes", "no", "time", "timestamp",
+    "date", "created", "updated", "method", "url", "uri", "path", "route",
+    "routes", "memory", "location", "comment", "comments", "description",
+    "profile", "build", "builds", "token", "key", "keys", "count", "total",
+    "list", "items", "item", "result", "results", "query", "response",
+    "request", "session", "config", "log", "logs", "info", "debug", "state",
+    "label", "labels", "size", "length", "start", "end", "next", "prev",
+    "title:", "handle", "link", "links", "href", "self", "meta", "html", "body",
+    "head", "script", "style", "div", "span", "test", "demo", "example",
+    # structured-but-ubiquitous keys: present in almost every JSON/HAL API
+    "_links", "_embedded", "pageid", "page_id", "user_id", "userid", "item_id",
+    "created_at", "updated_at", "is_active", "first_name", "last_name",
+    "content-type", "application/json", "text/html", "api", "v1", "v2",
+    "management", "console", "overview", "account", "accounts", "service",
+    "services", "platform", "report", "reports", "metrics", "health", "ready",
+    "enabled", "disabled", "active", "inactive", "default", "general",
+}
+
+
+def _norm_token(w):
+    """Strip quoting/punctuation so matcher words compare like plain tokens."""
+    return (w or "").strip().strip('"\'`:,;=<>[](){} \t').lower()
+
+
+def _is_strong_evidence(word):
+    """
+    True if a matcher word is specific enough to prove a product by itself.
+
+    Specificity is decided by the curated weak list above rather than by length,
+    because real product tokens are often short ("traefik", "grafana", "swagger",
+    or a health enum like "UP") while the tokens that cause false positives are
+    ordinary web vocabulary, which the list enumerates.
+    """
+    tok = _norm_token(word)
+    if not tok or tok in _WEAK_EVIDENCE:
+        return False
+    return len(tok) >= 2
+
+
+def _matcher_has_strong_hit(resp, m, scrub=None):
+    """
+    True if this word matcher was satisfied by at least one specific word.
+
+    Nuclei templates often list several alternative indicators. Kumo's porting
+    pipeline flattened every template's word blocks into a single OR list and
+    dropped their `condition: and`, so one generic token ("title", "version",
+    "profile") was enough to claim a finding — the single largest source of
+    false positives in the playbook. This measures whether a matcher brought
+    real product evidence, so the rule can insist on having some.
+
+    A list that is one word in several casings ("traefik"/"Traefik") counts as a
+    single alternative, not a menu of weak options.
+    """
+    if m.get("type", "word") != "word" or m.get("negative"):
+        return False
+    words = m.get("words", []) or []
+    if not words:
+        return False
+    hay = _resp_part(resp, m.get("part", "body"), scrub)
+    if not m.get("case_sensitive"):
+        hay = hay.lower()
+        probe = [(w, w.lower()) for w in words]
+    else:
+        probe = [(w, w) for w in words]
+    matched = [w for w, needle in probe if needle in hay]
+    if not matched:
+        return False
+    if len({_norm_token(w) for w in words}) <= 1:
+        return True
+    return any(_is_strong_evidence(w) for w in matched)
+
+
 def _match_one(resp, m, scrub=None):
     """Evaluate a single matcher against a response. Returns True/False."""
     mtype = m.get("type", "word")
@@ -935,9 +1017,32 @@ def _eval_rule(resp, rule, scrub=None):
     matchers = rule.get("matchers", [])
     if not matchers:
         return False
+    # A rule that claims a raw file is exposed cannot be satisfied by an HTML
+    # page: a CMS article mentioning DB_PASSWORD or aws_access_key_id is not an
+    # exposed credentials file. Rules that deliberately target an HTML product
+    # page (panels, dashboards) are unaffected — this only applies to paths that
+    # name a config/secret file.
+    if _is_rawfile_path(rule.get("path", "")):
+        try:
+            if _looks_like_html(resp.content):
+                return False
+        except Exception:
+            pass
     cond = rule.get("matchers_condition", "and")
     results = [_match_one(resp, m, scrub) for m in matchers]
-    return all(results) if cond == "and" else any(results)
+    fired = all(results) if cond == "and" else any(results)
+    if not fired:
+        return False
+
+    # Evidence floor: a rule that identifies a product by words must have at
+    # least one word matcher satisfied by a specific token. Supporting matchers
+    # built from generic vocabulary ("<form", "login") are fine alongside a
+    # strong one, but they cannot carry a finding on their own.
+    word_matchers = [m for m, ok in zip(matchers, results)
+                     if ok and m.get("type", "word") == "word" and not m.get("negative")]
+    if word_matchers and not any(_matcher_has_strong_hit(resp, m, scrub) for m in word_matchers):
+        return False
+    return True
 
 
 # ── The playbook: each rule identifies the PRODUCT and the EXPOSURE ──
@@ -1329,10 +1434,12 @@ VULN_RULES_EXTENDED = [
     },
     {
         "id": 'wpconfig-aws-keys', "name": 'AWS S3 keys Leak',
-        "severity": 'high', "path": '/%c0',
+        "severity": 'high', "path": '/wp-config.php.bak',
         "matchers_condition": "and", "origin": "nuclei",
         "description": 'AWS S3 keys Leak (ported from nuclei template http/exposures/configs/wpconfig-aws-keys.yaml)',
-        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['access-key-id', 'secret-access-key', 'DB_NAME', 'DB_PASSWORD'], 'condition': 'or'}],
+        "matchers": [{'type': 'status', 'status': [200]},
+                     {'type': 'word', 'part': 'all', 'words': ['access-key-id', 'secret-access-key', 'DB_NAME', 'DB_PASSWORD'], 'condition': 'or'},
+                     {'type': 'dsl', 'dsl': ['not_html']}],
     },
     {
         "id": 'dockercfg-config', "name": 'Detect .dockercfg',
@@ -1570,7 +1677,10 @@ VULN_RULES_EXTENDED = [
         "severity": 'high', "path": '/api/security/ticket',
         "matchers_condition": "and", "origin": "nuclei",
         "description": 'Apache Zeppelin - Unauthenticated Access (ported from nuclei template http/misconfiguration/apache/apache-zeppelin-unauth.yaml)',
-        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['status":"OK', '"ticket":"anonymous"'], 'condition': 'or'}],
+        # The anonymous ticket is the actual evidence of unauthenticated access.
+        # Pairing it with a bare status":"OK made any API that answers
+        # {"status":"ok"} look like an exposed Zeppelin.
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['"ticket":"anonymous"'], 'condition': 'or'}],
     },
     {
         "id": 'saltbo-zpan-installer', "name": 'Saltbo/zpan Installer - Exposure',
@@ -3645,7 +3755,7 @@ def _run_vuln_rules(domain, base_sigs=None, timeout=7, brand=None):
                                  verify=False, allow_redirects=False)
             except Exception:
                 continue
-            if base_sigs and _is_catchall(r, base_sigs):
+            if base_sigs and _is_catchall(r, base_sigs, rule["path"]):
                 return
             if _looks_soft_404(r):
                 return
@@ -4013,14 +4123,19 @@ def _catchall_baseline(domain, prefix="/", n=3, timeout=6):
     """
     import random as _rnd
     import string as _s
-    base = {"statuses": set(), "sizes": [], "redirect": False, "samples": []}
+    base = {"statuses": set(), "sizes": [], "redirect": False, "samples": [],
+            "qs_statuses": set(), "qs_sizes": [], "qs_samples": []}
     if not HAS_REQUESTS:
         return base
     UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"}
+
+    def _rand(k=16):
+        return "".join(_rnd.choices(_s.ascii_lowercase + _s.digits, k=k))
+
     for scheme in ("https", "http"):
         got = False
         for _ in range(n):
-            rnd = prefix.rstrip("/") + "/" + "".join(_rnd.choices(_s.ascii_lowercase + _s.digits, k=16))
+            rnd = prefix.rstrip("/") + "/" + _rand()
             try:
                 r = requests.get(f"{scheme}://{domain}{rnd}", timeout=timeout, verify=False,
                                  allow_redirects=False, headers=UA)
@@ -4035,19 +4150,73 @@ def _catchall_baseline(domain, prefix="/", n=3, timeout=6):
                 got = True
             except Exception:
                 pass
-        if got:
-            break   # one working scheme is enough
+        if not got:
+            continue
+        # Second baseline: the ROOT with a meaningless query string. Probe paths
+        # like /?view=log or /?query=SHOW%20DATABASES do not address a file at
+        # all — the server answers them with its homepage. Without this baseline
+        # every such check "finds" something on every site that has a homepage.
+        if prefix in ("", "/"):
+            for _ in range(2):
+                try:
+                    r = requests.get(f"{scheme}://{domain}/?{_rand(8)}={_rand(8)}",
+                                     timeout=timeout, verify=False,
+                                     allow_redirects=False, headers=UA)
+                    base["qs_statuses"].add(r.status_code)
+                    base["qs_sizes"].append(len(r.content))
+                    try:
+                        base["qs_samples"].append((r.text or "")[:600])
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+        break   # one working scheme is enough
     return base
 
 
-def _is_catchall(r, base):
+def _is_root_query_echo(r, path, base):
+    """
+    True if a root-with-query probe just got the host's homepage back.
+
+    Paths such as /?view=log or /?pp=env name no resource: any server returns
+    its index page. Comparing against the ordinary random-path baseline does not
+    help, because a 404 page and the homepage are different responses — this
+    needs the homepage baseline collected alongside it.
+    """
+    if not base or not base.get("qs_sizes"):
+        return False
+    p = (path or "")
+    if "?" not in p:
+        return False
+    if p.split("?")[0].strip("/") != "":
+        return False          # a real path that happens to carry a query string
+    try:
+        if r.status_code not in base["qs_statuses"]:
+            return False
+        size = len(r.content)
+        for bs in base["qs_sizes"]:
+            if abs(size - bs) <= max(256, bs * 0.15):
+                return True
+        txt = (r.text or "")[:600]
+        for sample in base.get("qs_samples", []):
+            if txt and sample and _similar(txt, sample) > 0.85:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _is_catchall(r, base, path=None):
     """
     True if response r is just the host's generic answer for any path.
 
     Matches on status + body size within a tolerance (path echoes change the
-    length slightly), or on near-identical body text.
+    length slightly), or on near-identical body text. When `path` is a bare
+    query on the root, the homepage baseline is used instead.
     """
     try:
+        if path and _is_root_query_echo(r, path, base):
+            return True
         if not base or not base.get("sizes"):
             return False
         if r.status_code in (301, 302, 307, 308) and base.get("redirect"):
@@ -4180,13 +4349,44 @@ _RAWFILE_MARKERS = {
 }
 
 
+# Extensions that name a file on disk rather than a page an app renders.
+_RAWFILE_EXT = (
+    ".env", ".yml", ".yaml", ".json", ".ini", ".conf", ".cfg", ".config",
+    ".properties", ".sql", ".bak", ".old", ".orig", ".swp", ".log", ".pem",
+    ".key", ".crt", ".p12", ".pfx", ".sqlite", ".db", ".dump", ".tar", ".gz",
+    ".zip", ".rar", ".7z", ".npmrc", ".s3cfg", ".netrc", ".pgpass", ".toml",
+    ".lock", ".xml", ".txt.bak", ".inc", ".dist",
+)
+
+
+def _is_rawfile_path(path):
+    """
+    True if the path names a file whose contents would be served raw.
+
+    Used to reject HTML answers for such a path: a rendered page returned where a
+    .env or .s3cfg was requested is the app's own routing, never the file.
+    """
+    p = (path or "").lower().split("?")[0].split("#")[0]
+    if not p:
+        return False
+    if p.endswith("/"):
+        return False         # a directory: an "Index of /…" listing is real HTML
+    if any(tok in p for tok in (
+            "/.git", "/.svn", "/.hg", ".htpasswd", ".htaccess", ".env", "wp-config",
+            ".ds_store", "backup", "dump", ".sql", ".bak", "database", "db.sqlite",
+            "/.aws", "config.php.bak", "credentials", "id_rsa", "id_dsa", "id_ecdsa")):
+        return True
+    base = p.rstrip("/").rsplit("/", 1)[-1]
+    if base.startswith(".") and len(base) > 1:
+        return True          # dotfile: .npmrc, .s3cfg, .flowconfig, .remote-sync.json
+    return base.endswith(_RAWFILE_EXT)
+
+
 def _rawfile_validated(path, content):
     """For raw-file paths, require file-specific markers so a 200 error/HTML
     page is not mistaken for real exposure. Returns True if it looks genuine."""
     p = path.lower()
-    raw_hint = any(tok in p for tok in (
-        "/.git", "/.svn", "/.hg", ".htpasswd", ".env", "wp-config", ".ds_store",
-        "backup", "dump", ".sql", ".bak", "database", "db.sqlite", "/.aws", "config.php.bak"))
+    raw_hint = _is_rawfile_path(path)
     if not raw_hint:
         return True   # not a raw-file path — no special validation needed
     body = content if isinstance(content, (bytes, bytearray)) else content.encode("utf-8", "ignore")
@@ -4356,7 +4556,6 @@ def scan_endpoints(domain):
         ("/database_credentials.inc", "Database Credentials File Exposure", "low"),
         ("/go.mod", "Go.mod Disclosure", "low"),
         ("/google-services.json", "Google Service Json", "low"),
-        ("/hopfully404", "Google API Key", "low"),
         ("/jsapi_ticket.json", "JsAPI Ticket Json", "low"),
         ("/log/system.log", "ICEFlow VPN Disclosure", "low"),
         ("/pantheon.upstream.yml", "Pantheon upstream.yml Disclosure", "low"),
@@ -4372,6 +4571,19 @@ def scan_endpoints(domain):
     # Fingerprint catch-all / WAF behaviour first so we don't report the same
     # generic 403/404/homepage for every path.
     base_sigs = _catchall_baseline(domain)
+    # The site's own brand, so a CMS search page answering /phpinfo.php with
+    # "phpinfo php · BrandMart" is recognised as the target's own routing rather
+    # than an exposed product.
+    brand = None
+    for _scheme in ("https", "http"):
+        try:
+            _home = requests.get(f"{_scheme}://{domain}/", timeout=6, verify=False,
+                                 allow_redirects=True,
+                                 headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"})
+            brand = _site_brand(domain, _home)
+            break
+        except Exception:
+            continue
 
     def probe(item):
         path, name, severity = item
@@ -4384,7 +4596,10 @@ def scan_endpoints(domain):
                     verify=False,
                 )
                 # Suppress catch-all responses (same as a random non-existent path)
-                if _is_catchall(r, base_sigs) or _looks_soft_404(r):
+                if _is_catchall(r, base_sigs, path) or _looks_soft_404(r):
+                    return None
+                # The target's own templated page is not a third-party exposure.
+                if _is_site_own_page(r, brand):
                     return None
                 if r.status_code not in (404, 410, 400, 501):
                     content_len = len(r.content)
@@ -4408,7 +4623,9 @@ def scan_endpoints(domain):
                         }
                 break
             except Exception:
-                break
+                # HTTPS may simply not be served here — fall through to HTTP
+                # instead of abandoning the probe entirely.
+                continue
         return None
 
     try:

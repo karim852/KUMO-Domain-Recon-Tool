@@ -1,5 +1,40 @@
 # Kumo — themed build
 
+## Precision pass — false positives
+
+Kumo now ships with a **false-positive lab** (`fplab.py`) alongside the
+vulnerable lab, and a harness (`test_fp.py`) that scans seven shapes of
+ordinary web host where the correct answer is always "nothing found": an SPA
+catch-all, a soft-404 site, a WAF that 403s everything, a CMS search page that
+echoes the requested path, a JSON API gateway, a redirect-everything host, and
+a correctly hardened site.
+
+Five of those seven produced phantom findings. They now produce none.
+
+| | before | after |
+|---|---|---|
+| Ported rules firing on benign responses | 13 | **0** |
+| Trap hosts with phantom findings | 5 of 7 | **0 of 7** |
+| Planted exposures still detected | 20 | **20** |
+| Playbook hits on the vulnerable lab | 50 | **50** |
+
+The root cause was in the porting pipeline: `mine_templates.py` merged every
+`words:` block of a nuclei template into one flat list and `gen_rules.py` joined
+it with `condition: or`, so a template written to require several indicators
+fired on any one of them. A **critical** Langflow rule fired on any JSON
+containing `"timestamp":`. A separate bug meant query-only probes such as
+`/?query=SHOW%20DATABASES` were compared against a random-path 404 baseline
+rather than the homepage they actually return, so a **high**-severity ClickHouse
+finding appeared on hosts running no ClickHouse at all.
+
+Both are fixed at the source, and an evidence floor in `_eval_rule` retro-fits
+the 335 rules already shipped. `test_rules.py` now covers the whole playbook —
+**all 365 rules against 11 decoy responses** — not just the 30 hand-written
+ones. Full write-up in [`docs/FALSE-POSITIVES.md`](docs/FALSE-POSITIVES.md).
+
+Detection is unchanged: every planted exposure is still found.
+
+
 Default theme is now **Void** everywhere (terminal and web).
 
 ## Run

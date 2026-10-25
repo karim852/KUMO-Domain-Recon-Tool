@@ -36,6 +36,16 @@ PRIORITY = re.compile(
 
 SKIP_PATH = re.compile(r'\{\{|\$|\.\.|%2e|\*|\?.*=.*&.*=', re.I)
 
+# Paths whose last segment is nothing but percent-escapes or punctuation are
+# encoding probes, not resources (nuclei's "/%c0"). Ported as a rule they claim
+# a finding from whatever the server happens to return for a junk URL.
+JUNK_BASENAME = re.compile(r'^(?:(?:%[0-9a-f]{2})+|[^a-z0-9]+)$', re.I)
+
+
+def _norm(w):
+    """Compare words without their JSON quoting, so '"title":' == 'title'."""
+    return (w or "").strip().strip('"\'`:,;=<>[](){} \t').lower()
+
 
 def clean_words(words):
     out = []
@@ -43,7 +53,9 @@ def clean_words(words):
         w = w.strip()
         if not w or len(w) < 4 or len(w) > 80:
             continue
-        if w.lower() in GENERIC:
+        # Quoting used to smuggle generic tokens past this filter: '"title"'
+        # is not in GENERIC, but 'title' is — and that is the same evidence.
+        if _norm(w) in GENERIC:
             continue
         if w.startswith(("{{", "$")) or "{{" in w:
             continue
@@ -51,7 +63,7 @@ def clean_words(words):
     # de-dup, keep order
     seen, uniq = set(), []
     for w in out:
-        k = w.lower()
+        k = _norm(w)
         if k not in seen:
             seen.add(k)
             uniq.append(w)
@@ -61,6 +73,9 @@ def clean_words(words):
 def to_rule(t):
     path = t["paths"][0]
     if not path.startswith("/") or SKIP_PATH.search(path) or len(path) > 90:
+        return None
+    base = path.split("?")[0].rstrip("/").rsplit("/", 1)[-1]
+    if base and JUNK_BASENAME.match(base):
         return None
 
     # Only word matchers are ported. Regexes extracted by a lightweight YAML
@@ -87,10 +102,34 @@ def to_rule(t):
         statuses = sorted(set(statuses + [200]))
     matchers.append({"type": "status", "status": statuses[:4]})
 
-    if words:
-        # Product/vulnerability evidence — OR across the template's own words
+    # Product/vulnerability evidence. Each of the template's word blocks becomes
+    # its own matcher, keeping the block's own condition, because nuclei ANDs
+    # separate blocks together. Merging them into one OR list (the old behaviour)
+    # let a single generic token satisfy a rule that was written to require
+    # several — by far the biggest source of false positives in the playbook.
+    blocks = []
+    for blk in (t.get("word_blocks") or []):
+        bw = clean_words(blk.get("words") or [])
+        if bw:
+            blocks.append({"type": "word", "part": "all", "words": bw[:8],
+                           "condition": blk.get("condition", "or")})
+    if blocks:
+        matchers += blocks[:3]
+    elif words:
         matchers.append({"type": "word", "part": "all", "words": words[:8],
                          "condition": "or"})
+
+    # A rule must rest on at least one specific word; a block of pure web
+    # vocabulary proves nothing. (engine._is_strong_evidence enforces the same
+    # floor at scan time for rules already shipped.)
+    if not any(any(_norm(w) not in GENERIC and len(_norm(w)) >= 4 for w in m["words"])
+               for m in matchers if m["type"] == "word"):
+        return None
+
+    # A raw-file exposure must not be satisfiable by a rendered HTML page.
+    if re.search(r'/\.[^/]+$|\.(env|ya?ml|json|ini|conf|cfg|properties|sql|bak|log|pem|key|npmrc|s3cfg|toml)$',
+                 path, re.I):
+        matchers.append({"type": "dsl", "dsl": ["not_html"]})
 
     return {
         "id": t["id"][:60],

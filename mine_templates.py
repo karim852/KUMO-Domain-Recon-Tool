@@ -50,8 +50,15 @@ def parse(path):
                            r'case-insensitive|negative|internal|group)\s*:', re.I)
     CT_NOISE = {"application/json", "application/html", "text/html", "text/plain",
                 "application/xml", "application/octet-stream", "text/xml"}
+    # Each `words:` block is ONE matcher and carries its own condition. Nuclei
+    # ANDs separate matcher blocks together, so flattening every block into a
+    # single OR list — as this miner originally did — turns a template that
+    # demanded three indicators into one that fires on any of them. Blocks are
+    # kept separate, with the condition that follows each one.
+    word_blocks = []
     words = []
     for blk in re.finditer(r'words:\s*\n((?:[ \t]*-[ \t]*.+\n)+)', txt):
+        block = []
         for line in blk.group(1).splitlines():
             m = re.match(r'[ \t]*-[ \t]*(?:"([^"]*)"|\'([^\']*)\'|(.+))', line)
             if not m:
@@ -63,7 +70,16 @@ def parse(path):
                 break          # next matcher started — stop this words list
             if val.lower() in CT_NOISE:
                 continue       # content-type strings match almost anything
-            words.append(val)
+            block.append(val)
+        if not block:
+            continue
+        # The matcher's own `condition:` is the first one after its word list.
+        tail = txt[blk.end():blk.end() + 400]
+        cm = re.search(r'^\s*condition:\s*(and|or)\s*$', tail, re.M | re.I)
+        # nuclei's documented default for a word matcher is "or"
+        block_cond = (cm.group(1).lower() if cm else "or")
+        word_blocks.append({"words": block, "condition": block_cond})
+        words += block
 
     statuses = []
     for blk in re.finditer(r'status:\s*\n((?:\s*-\s*\d+\n)+)', txt):
@@ -81,7 +97,8 @@ def parse(path):
     return {
         "id": tid, "name": name, "severity": sev, "tags": tags,
         "paths": paths[:6], "methods": sorted(methods),
-        "words": words[:14], "statuses": sorted(set(statuses))[:6],
+        "words": words[:14], "word_blocks": word_blocks[:4],
+        "statuses": sorted(set(statuses))[:6],
         "regexes": regexes[:4], "matchers_condition": cond,
         "file": os.path.relpath(path, ROOT),
     }
