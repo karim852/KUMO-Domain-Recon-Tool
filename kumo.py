@@ -172,6 +172,7 @@ SHORT_NAMES = {
     "http_inspect":  "HTTP Inspector",
     "api_fuzzer":    "API Endpoint Fuzzer",
     "cms":           "CMS Deep Scan",
+    "panels":        "Control Panels",
 }
 
 CATEGORY_LAYOUT = [
@@ -1560,6 +1561,36 @@ def render_cms(data):
     dimprint(f"{data.get('paths_probed', 0)} {data['cms']} path(s) probed", 4)
 
 
+
+def render_panels(data):
+    section("HOSTING CONTROL PANELS", "🎛️")
+    if data.get("error"):
+        fail(data["error"]); return
+    if data.get("cdn_note"):
+        warn(data["cdn_note"], 4)
+    panels = data.get("panels") or []
+    if not panels:
+        ok("No control panel identified")
+        if data.get("unexplained_ports"):
+            dimprint("open on panel ports with nothing identifying them: "
+                     + ", ".join(str(p) for p in data["unexplained_ports"]), 6)
+        return
+    for p in panels:
+        where = f"port {p['port']}" if p.get("port") else f"path {p.get('path')}"
+        sev = (p.get("severity") or "").upper()
+        col = {"CRITICAL": C.R, "HIGH": C.Y, "MEDIUM": C.Y}.get(sev, C.W)
+        name = p["panel"] + (f" {p['version']}" if p.get("version") else "")
+        print(f"      {col}{sev:<9}{C.RS} {name}  {C.DM}({where}){C.RS}")
+        if p.get("signals"):
+            dimprint("matched: " + ", ".join(p["signals"]), 8)
+    print()
+    for f in data.get("findings", []):
+        dimprint(f["detail"], 6)
+    if data.get("unexplained_ports"):
+        dimprint("also open, unidentified: "
+                 + ", ".join(str(p) for p in data["unexplained_ports"]), 6)
+
+
 RENDERERS = {
     "dns": render_dns, "whois": render_whois, "ssl": render_ssl,
     "crtsh": render_crtsh, "headers": render_headers, "ports": render_ports,
@@ -1575,6 +1606,7 @@ RENDERERS = {
     "js_secrets": render_js_secrets,
     "api_fuzzer": render_api_fuzzer,
     "cms": render_cms,
+    "panels": render_panels,
     "shodan": render_shodan,
     "censys": render_censys,
     "wafw00f": render_wafw00f,

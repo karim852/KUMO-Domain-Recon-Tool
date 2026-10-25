@@ -595,6 +595,43 @@ file, and is rejected.
 Version findings are marked `version-inference`, as everywhere else: the CMS
 states its version, and a backported patch may not change it.
 
+## Module 29 — control panels, and two ways to get it wrong
+
+### The vendor's own customers
+
+A hosting company's website says "cPanel Login", "WHM Login", "Login to
+Webmin" and "Plesk Obsidian" on its sales pages, because that is the product it
+sells. Matching the product name would report four control panels on every
+hosting provider on the internet.
+
+Detection matches the login interface instead: `<title>cPanel Login</title>`,
+the `cprelogin` and `PLESKSESSID` cookies, the `session_login.cgi` form action.
+One signature needed tightening during testing — "Plesk Obsidian" as a bare
+body string matched the decoy's sales copy, so it now has to appear within a
+couple of thousand characters of an actual login form.
+
+`panellab.py` carries that decoy, and the panels live on a different loopback
+address from the decoys. That detail matters: when everything shared 127.0.0.1
+the decoy hosts saw the panel ports too, and the test passed for the wrong
+reason.
+
+### A CDN's ports are not the origin's ports
+
+Cloudflare proxies 2082, 2083, 2086, 2087, 2095, 2096 and 8443 for every domain
+it fronts. A port scan of any Cloudflare-fronted site finds them open. Reporting
+"cPanel exposed on 2083" from that is wrong twice over: the port belongs to the
+edge, and the origin's actual panel is invisible behind it.
+
+On a CDN-fronted target those ports are skipped and the result says so.
+Non-proxied panel ports — 2222, 10000, 8090 — are still checked, because the
+CDN does not proxy those.
+
+### Something listening is not something identified
+
+An open panel port with no recognisable login interface is reported as an open
+port, under its own heading, not as a panel. The honest statement is that
+something answers there and nothing proves what it is.
+
 ## Rules of thumb for new checks
 
 1. **Never let a status code alone be evidence.** Pair it with a word matcher.
@@ -632,6 +669,10 @@ states its version, and a backported patch may not change it.
    state by an exception, a display bug becomes a silent hang.
 17. **Identify before you probe.** Technology-specific checks need confident
    detection first, from structure rather than from a product name in prose.
-18. **Don't claim absence you cannot establish.** DKIM selectors can't be
+18. **Watch for the vendor's own customers.** Any product-name detection will
+   fire on the companies that sell that product. Match the interface, not the name.
+19. **Separate decoys from positives at the network level.** A decoy sharing an
+   address with the real thing tests nothing.
+20. **Don't claim absence you cannot establish.** DKIM selectors can't be
    enumerated, so a miss is "not found at the names we tried". Where absence is
    unprovable, the finding earns credit when present but costs nothing when not.

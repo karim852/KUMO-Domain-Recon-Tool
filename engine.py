@@ -11489,6 +11489,351 @@ def scan_cms(domain):
     result["cms_name"] = _cms_name(cms)
     return result
 
+
+# ═══════════════════════════════════════════════════════════════
+# MODULE: HOSTING CONTROL PANELS
+# ═══════════════════════════════════════════════════════════════
+# A control panel is not a CMS. A CMS runs the website; a control panel runs
+# the server — mail accounts, databases, FTP users, DNS, backups. So finding
+# one is a different kind of finding: it is an administrative interface for the
+# whole hosting account, and the usual expectation is that it is restricted by
+# IP or sits behind a VPN rather than being open to the internet.
+#
+# Panels mostly listen on their own ports, so detection probes those ports as
+# well as a handful of paths on 80/443.
+#
+# Two things make this prone to false positives, and both are guarded below:
+#
+#   1. A hosting company's own website mentions cPanel and Plesk constantly.
+#      Detection therefore matches a panel's login interface — its title, its
+#      cookies, its specific markup — never the product name in page text.
+#   2. Cloudflare proxies 2082, 2083, 2086, 2087, 2095, 2096 and 8443 for every
+#      domain it fronts. An open 2083 on a Cloudflare-fronted site is the edge,
+#      not the customer's cPanel, so a port alone is never a detection.
+
+_PANEL_UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                           "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+             "Accept": "*/*"}
+
+# name -> (ports, paths, signatures, severity)
+# A signature is (where, regex, label). Matching the login interface, not the
+# product name: "cPanel" in prose is marketing, "<title>cPanel Login</title>"
+# is a login page.
+_PANELS = {
+    "cPanel": {
+        "ports": [2082, 2083],
+        "paths": ["/cpanel", "/cpanel/"],
+        "sig": [("body", r'<title>\s*cPanel\s*(?:Login)?\s*</title>', "cPanel login title"),
+                ("body", r'cpanel-?(?:login|logo)|/cpsess\d+/', "cPanel session markup"),
+                ("header", r'set-cookie:[^\n]*cprelogin', "cPanel prelogin cookie")],
+        "severity": "high",
+    },
+    "WHM": {
+        "ports": [2086, 2087],
+        "paths": ["/whm", "/whm-server-status"],
+        "sig": [("body", r'<title>\s*WHM\s*(?:Login)?\s*</title>', "WHM login title"),
+                ("body", r'whostmgr', "WHM markup")],
+        "severity": "high",
+    },
+    "cPanel Webmail": {
+        "ports": [2095, 2096],
+        "paths": ["/webmail"],
+        "sig": [("body", r'<title>\s*Webmail\s*</title>', "Webmail login title"),
+                ("body", r'webmaild|roundcube.*cpanel', "cPanel webmail markup")],
+        "severity": "medium",
+    },
+    "Plesk": {
+        "ports": [8443, 8880],
+        "paths": ["/login_up.php", "/login_up.php3"],
+        # "Plesk Obsidian" appears in every hosting company's sales copy, so
+        # the product string alone is not evidence; it has to accompany the
+        # login form.
+        "sig": [("body", r'(?is)Plesk\s+(?:Obsidian|Onyx).{0,2000}?(?:login_up\.php|name=["\']passwd["\']|id=["\']loginForm)',
+                 "Plesk build beside a login form"),
+                ("body", r'<title>[^<]*Plesk[^<]*</title>', "Plesk login title"),
+                ("header", r'set-cookie:[^\n]*PLESKSESSID', "Plesk session cookie")],
+        "severity": "high",
+    },
+    "DirectAdmin": {
+        "ports": [2222],
+        "paths": [],
+        "sig": [("body", r'<title>\s*DirectAdmin\s*(?:Login)?\s*</title>', "DirectAdmin login title"),
+                ("body", r'DirectAdmin\s+Web\s+Control\s+Panel', "DirectAdmin markup")],
+        "severity": "high",
+    },
+    "Webmin": {
+        "ports": [10000],
+        "paths": ["/webmin/"],
+        "sig": [("body", r'<title>\s*Login to Webmin\s*</title>', "Webmin login title"),
+                ("body", r'webmin.*session_login\.cgi', "Webmin login form")],
+        "severity": "high",
+    },
+    "Usermin": {
+        "ports": [20000],
+        "paths": [],
+        "sig": [("body", r'<title>\s*Login to Usermin\s*</title>', "Usermin login title")],
+        "severity": "medium",
+    },
+    "Virtualmin": {
+        "ports": [10000],
+        "paths": [],
+        "sig": [("body", r'<title>\s*Login to Virtualmin\s*</title>', "Virtualmin login title")],
+        "severity": "high",
+    },
+    "CyberPanel": {
+        "ports": [8090],
+        "paths": [],
+        "sig": [("body", r'<title>[^<]*CyberPanel[^<]*</title>', "CyberPanel login title")],
+        "severity": "high",
+    },
+    "aaPanel": {
+        "ports": [8888, 7800],
+        "paths": ["/bt", "/login"],
+        "sig": [("body", r'aaPanel\s+Linux\s+panel|Login with aaPanel', "aaPanel login markup"),
+                ("body", r'宝塔(?:面板|Linux面板)', "BT panel markup")],
+        "severity": "high",
+    },
+    "Hestia": {
+        "ports": [8083],
+        "paths": ["/login/"],
+        "sig": [("body", r'Hestia Control Panel|Welcome to Hestia', "Hestia login markup")],
+        "severity": "high",
+    },
+    "VestaCP": {
+        "ports": [8083],
+        "paths": ["/login/"],
+        "sig": [("body", r'Vesta Control Panel', "Vesta login markup")],
+        "severity": "high",
+    },
+    "CentOS Web Panel": {
+        "ports": [2030, 2031],
+        "paths": [],
+        "sig": [("body", r'CentOS\s*-?\s*WebPanel|CWP\s+Login', "CWP login markup")],
+        "severity": "high",
+    },
+    "ISPConfig": {
+        "ports": [8080],
+        "paths": [],
+        "sig": [("body", r'<title>\s*ISPConfig[^<]*</title>', "ISPConfig login title")],
+        "severity": "high",
+    },
+    "Froxlor": {
+        "ports": [],
+        "paths": ["/", "/froxlor/"],
+        "sig": [("body", r'<title>\s*Froxlor Server Management Panel\s*</title>', "Froxlor login title")],
+        "severity": "high",
+    },
+    "Cockpit": {
+        "ports": [9090],
+        "paths": [],
+        "sig": [("body", r'is_cockpit_client|cockpit/static/login', "Cockpit login markup"),
+                ("body", r'<title>\s*Cockpit\s*</title>', "Cockpit title")],
+        "severity": "high",
+    },
+    "Ajenti": {
+        "ports": [8000],
+        "paths": [],
+        "sig": [("body", r'<title>\s*Ajenti\s*</title>|ajenti\.core', "Ajenti login markup")],
+        "severity": "high",
+    },
+}
+
+# Ports Cloudflare proxies for any domain it fronts. On a CDN-fronted target an
+# open port here says nothing about the origin.
+_CDN_PROXIED_PANEL_PORTS = {2082, 2083, 2086, 2087, 2095, 2096, 8443, 8880}
+
+
+def _panel_http(domain, port, path="/", timeout=6):
+    """Fetch a path on a specific port, https first then http."""
+    if not HAS_REQUESTS:
+        return None
+    schemes = ("https", "http") if port not in (2082, 2086, 2095, 8880, 10000, 20000) \
+        else ("http", "https")
+    for scheme in schemes:
+        try:
+            return requests.get(f"{scheme}://{domain}:{port}{path}",
+                                headers=_PANEL_UA, timeout=timeout,
+                                verify=False, allow_redirects=True)
+        except Exception:
+            continue
+    return None
+
+
+def _panel_match(resp, panel):
+    """Which of a panel's signatures this response satisfies."""
+    import re as _re
+    if resp is None:
+        return []
+    try:
+        body = resp.text or ""
+    except Exception:
+        body = ""
+    headers = "\n".join(f"{k}: {v}" for k, v in resp.headers.items()).lower()
+    hits = []
+    for where, pattern, label in panel["sig"]:
+        hay = headers if where == "header" else body
+        if _re.search(pattern, hay, _re.I):
+            hits.append(label)
+    return hits
+
+
+def _panel_version(resp):
+    """Panel version, when the login page states one."""
+    import re as _re
+    if resp is None:
+        return None
+    try:
+        body = (resp.text or "")[:200_000]
+    except Exception:
+        return None
+    for pat in (r'Plesk\s+(?:Obsidian|Onyx)\s+v?([\d.]+)',
+                r'cPanel[^\d]{0,12}(\d+\.\d+[\d.]*)',
+                r'DirectAdmin\s+v?([\d.]+)',
+                r'Webmin\s+v?([\d.]+)',
+                r'CyberPanel\s+v?([\d.]+)',
+                r'ISPConfig\s+v?([\d.]+)'):
+        m = _re.search(pat, body, _re.I)
+        if m:
+            return m.group(1)
+    return None
+
+
+def scan_control_panels(domain):
+    """
+    Find hosting control panels exposed on the target.
+
+    A control panel administers the whole server, so one reachable from the
+    internet is worth reporting even when it is only a login page: it is the
+    broadest administrative surface a host has, and the usual expectation is
+    that it is restricted by IP or sits behind a VPN.
+
+    Detection matches a panel's login interface, never the product name in page
+    text, because a hosting provider's own site mentions cPanel and Plesk on
+    every page. Ports are checked for reachability first, and on a CDN-fronted
+    target the ports Cloudflare proxies are excluded, since an open 2083 there
+    belongs to the edge rather than the origin.
+    """
+    if not HAS_REQUESTS:
+        return {"error": "requests required"}
+
+    result = {"domain": domain, "panels": [], "ports_open": [], "ports_checked": 0,
+              "cdn": None, "cdn_note": "", "findings": [], "notes": []}
+
+    ips = resolve(domain) or {}
+    target_ip = (ips.get("v4") or [None])[0]
+    if not target_ip:
+        result["error"] = "cannot resolve domain"
+        return result
+
+    cdn = _cdn_identity(target_ip, domain)
+    result["cdn"] = cdn
+
+    all_ports = sorted({p for v in _PANELS.values() for p in v["ports"]})
+    skip = set()
+    if cdn:
+        skip = _CDN_PROXIED_PANEL_PORTS
+        result["cdn_note"] = (
+            f"{domain} resolves to the {cdn} edge. Ports "
+            f"{', '.join(str(p) for p in sorted(skip))} are proxied by {cdn} for "
+            f"every domain it fronts, so they are excluded: an open port there "
+            f"is the edge, not this origin's control panel.")
+        result["notes"].append(result["cdn_note"])
+    probe_ports = [p for p in all_ports if p not in skip]
+    result["ports_checked"] = len(probe_ports)
+
+    def _open(port):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(2.5)
+            ok = s.connect_ex((target_ip, port)) == 0
+            s.close()
+            return port if ok else None
+        except Exception:
+            return None
+
+    if probe_ports:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(probe_ports))) as ex:
+            result["ports_open"] = sorted(p for p in ex.map(_open, probe_ports) if p)
+
+    # Build the probe list: open panel ports, plus panel paths on 80/443.
+    # Path probes on 80/443 go through the same suppression as the rest of
+    # Kumo: a host that answers every path with its homepage would otherwise
+    # match a panel on whatever that homepage happens to contain.
+    base_sigs = _catchall_baseline(domain)
+
+    jobs = []
+    for name, panel in _PANELS.items():
+        for port in panel["ports"]:
+            if port in result["ports_open"]:
+                jobs.append((name, port, "/"))
+        for path in panel["paths"]:
+            jobs.append((name, None, path))
+
+    seen = {}
+
+    def probe(job):
+        name, port, path = job
+        panel = _PANELS[name]
+        if port:
+            r = _panel_http(domain, port, "/")
+        else:
+            r = _cms_get(domain, path, timeout=6)
+            if r is not None and path not in ("/",):
+                # the homepage returned for a panel path proves nothing
+                if _is_catchall(r, base_sigs, path) or _looks_soft_404(r):
+                    return None
+        hits = _panel_match(r, panel)
+        if not hits:
+            return None
+        return {"panel": name, "port": port, "path": path if not port else "/",
+                "url": getattr(r, "url", ""), "status": r.status_code,
+                "signals": hits, "version": _panel_version(r),
+                "severity": panel["severity"]}
+
+    if jobs:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
+            for res in ex.map(probe, jobs):
+                if not res:
+                    continue
+                prev = seen.get(res["panel"])
+                # keep the strongest evidence per panel
+                if not prev or len(res["signals"]) > len(prev["signals"]):
+                    seen[res["panel"]] = res
+
+    result["panels"] = sorted(seen.values(), key=lambda x: x["panel"])
+    for p in result["panels"]:
+        where = f"port {p['port']}" if p["port"] else f"path {p['path']}"
+        result["findings"].append({
+            "name": f"{p['panel']} control panel exposed",
+            "severity": p["severity"],
+            "detail": (f"{p['panel']}"
+                       + (f" {p['version']}" if p["version"] else "")
+                       + f" reachable on {where}. A control panel administers the "
+                         f"whole hosting account; restrict it by IP or put it "
+                         f"behind a VPN rather than exposing it publicly."),
+            "url": p["url"], "port": p["port"], "path": p["path"],
+            "evidence": ", ".join(p["signals"]),
+            "confidence": "confirmed",
+        })
+
+    # An open panel port with no matching login interface is reported as a port,
+    # not as a panel: something answers there, but nothing proves what.
+    matched_ports = {p["port"] for p in result["panels"] if p["port"]}
+    unexplained = [p for p in result["ports_open"] if p not in matched_ports]
+    if unexplained:
+        result["notes"].append(
+            "Open on a known panel port with no panel interface recognised: "
+            + ", ".join(str(p) for p in unexplained)
+            + ". Something is listening; nothing identifies it as a control panel.")
+    result["unexplained_ports"] = unexplained
+
+    counts = {}
+    for f in result["findings"]:
+        counts[f["severity"]] = counts.get(f["severity"], 0) + 1
+    result["severity_counts"] = counts
+    result["total_found"] = len(result["panels"])
+    return result
+
 ALL_MODULES = {
     "screenshot":      ("Website Screenshot",                    scan_screenshot),
     "dns":             ("DNS Records + Email Security",          scan_dns),
@@ -11518,6 +11863,7 @@ ALL_MODULES = {
     "http_inspect":    ("HTTP Inspector (request/response headers)", scan_http_inspect),
     "api_fuzzer":      ("API Endpoint Fuzzer",                  scan_api_fuzzer),
     "cms":             ("CMS Deep Scan (WP/Joomla/Drupal)",     scan_cms),
+    "panels":          ("Hosting Control Panels",              scan_control_panels),
 }
 
 FAST_SKIP = {"wayback", "brute", "subdomains", "screenshot", "email_harvest",

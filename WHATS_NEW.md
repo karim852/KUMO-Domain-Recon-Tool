@@ -1,5 +1,36 @@
 # Kumo — themed build
 
+## Module 29 — hosting control panels
+
+A control panel is not a CMS. A CMS runs the website; a control panel runs the
+server — mail accounts, databases, FTP users, DNS, backups. One reachable from
+the internet is the broadest administrative surface a host has, which is why
+it is worth reporting even as just a login page.
+
+**17 panels**, by their own ports and paths: cPanel, WHM, cPanel Webmail,
+Plesk, DirectAdmin, Webmin, Usermin, Virtualmin, CyberPanel, aaPanel, Hestia,
+VestaCP, CentOS Web Panel, ISPConfig, Froxlor, Cockpit, Ajenti.
+
+Two guards, because this module is unusually prone to false positives:
+
+**A hosting company's own website sells these products.** Its pages say
+"cPanel Login", "WHM Login", "Login to Webmin" and "Plesk Obsidian" in plain
+prose. Detection matches a panel's *login interface* — its title, its session
+cookie, its form markup — never the product name in text. `panellab.py`
+includes a hosting provider's marketing site as a decoy, and it reports none.
+
+**Cloudflare proxies 2082, 2083, 2086, 2087, 2095, 2096 and 8443** for every
+domain it fronts. On a CDN-fronted target those ports are excluded entirely and
+the output says why: an open 2083 there is the edge, not the customer's cPanel.
+Non-proxied panel ports are still checked.
+
+A port that answers without a recognisable panel is reported as an open port,
+not a panel: something is listening, nothing proves what.
+
+New `test_panels.py` covers 21 cases. The module is in the false-positive
+harness, which stays clean across all 9 trap hosts.
+
+
 ## Module 28 — CMS deep scan
 
 Identifies **WordPress, Joomla or Drupal**, then runs only that CMS's checks:

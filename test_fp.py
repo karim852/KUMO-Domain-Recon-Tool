@@ -32,6 +32,7 @@ G = "\033[92m"; Y = "\033[93m"; R = "\033[91m"; D = "\033[90m"; B = "\033[1m"; X
 # geo, ports...) need outbound internet and are covered by test_live.py.
 EXPOSURE_MODULES = [
     "cms",
+    "panels",
     "endpoints",
     "nuclei",
     "robots",
@@ -111,6 +112,11 @@ def findings_of(mod, data):
         for f in (data.get("findings") or []):
             out.append((f"{f.get('severity','?'):8} {f.get('name','?')}",
                         str(f.get("path") or f.get("detail"))[:60]))
+
+    elif mod == "panels":
+        for p in (data.get("panels") or []):
+            out.append((f"panel {p.get('panel')}",
+                        f"port={p.get('port')} path={p.get('path')}"))
 
     elif mod == "favicon":
         for m in (data.get("matches") or []):

@@ -180,6 +180,39 @@ def payloads():
             "plugins": [], "themes": [], "paths_probed": 0,
             "severity_counts": {}, "note": "No CMS identified.",
         },
+        "panels": {
+            "domain": "example.com", "cdn": None, "cdn_note": "",
+            "ports_checked": 20, "ports_open": [2083, 8443, 2031],
+            "unexplained_ports": [2031], "total_found": 2,
+            "severity_counts": {"high": 2},
+            "panels": [
+                {"panel": "cPanel", "port": 2083, "path": "/",
+                 "url": "https://example.com:2083/", "status": 200,
+                 "signals": ["cPanel login title", "cPanel prelogin cookie"],
+                 "version": None, "severity": "high"},
+                {"panel": "Plesk", "port": 8443, "path": "/",
+                 "url": "https://example.com:8443/", "status": 200,
+                 "signals": ["Plesk login title"], "version": "18.0.58",
+                 "severity": "high"},
+            ],
+            "findings": [
+                {"name": "cPanel control panel exposed", "severity": "high",
+                 "detail": "cPanel reachable on port 2083. A control panel "
+                           "administers the whole hosting account; restrict it "
+                           "by IP or put it behind a VPN.",
+                 "url": "https://example.com:2083/", "port": 2083, "path": "/",
+                 "evidence": "cPanel login title", "confidence": "confirmed"},
+            ],
+            "notes": [],
+        },
+        "panels_none": {
+            "domain": "example.com", "cdn": "cloudflare",
+            "cdn_note": "example.com resolves to the cloudflare edge. Ports "
+                        "2082, 2083 are proxied for every domain it fronts.",
+            "ports_checked": 13, "ports_open": [], "unexplained_ports": [],
+            "panels": [], "findings": [], "notes": [], "total_found": 0,
+            "severity_counts": {},
+        },
         "subdomains": {
             "total": 2, "alive_count": 1,
             "subdomains": ["www.example.com", "api.example.com"],

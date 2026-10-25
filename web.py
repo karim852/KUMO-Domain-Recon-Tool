@@ -777,6 +777,11 @@ function getBadges(id, data) {
   const b = [];
   if (id==='headers'&&data.grade){const gc={A:'b-pass',B:'b-info',C:'b-warn',D:'b-warn',F:'b-fail'}[data.grade]||'b-fail';b.push(`<span class="badge ${gc}">${data.grade} · ${Math.round(data.score||0)}%</span>`);}
   if (id==='ports'&&data.open?.length) b.push(`<span class="badge b-info">${data.open.length} open</span>`);
+  if (id==='panels'){
+    const n=(data.panels||[]).length;
+    if(n) b.push(`<span class="badge b-fail">${n} panel${n>1?'s':''}</span>`);
+    else b.push('<span class="badge b-info">none</span>');
+  }
   if (id==='cms'){
     if(data.cms){
       b.push(`<span class="badge b-purple">${escH(data.cms_name||data.cms)}${data.version?' '+escH(data.version):''}</span>`);
@@ -1648,6 +1653,32 @@ function renderContent(id, data) {
       if(items.length>40) h+=`<div class="c-dim" style="font-size:9px;padding:2px 4px">+ ${items.length-40} more…</div>`;
       h+='</div>';
     });
+    return h;
+  }
+
+  case 'panels':{
+    const ps=data.panels||[];
+    let h='';
+    if(data.cdn&&data.cdn_note) h+=`<div class="alert a-yellow" style="font-size:10px;padding:5px 8px;margin-bottom:6px">${escH(data.cdn_note)}</div>`;
+    if(!ps.length){
+      h+='<div class="c-dim">No control panel identified</div>';
+      if(data.unexplained_ports?.length) h+=`<div class="c-dim" style="font-size:10px;margin-top:5px">Open on panel ports with nothing identifying them: ${escH(data.unexplained_ports.join(', '))}</div>`;
+      return h;
+    }
+    const sc={critical:'var(--red)',high:'var(--orange)',medium:'var(--yellow)',low:'var(--green)'};
+    h+='<table class="tbl"><thead><tr><th>Panel</th><th>Where</th><th>Severity</th></tr></thead><tbody>';
+    ps.forEach(p=>{
+      const where=p.port?('port '+p.port):escH(p.path||'/');
+      h+=`<tr><td style="font-weight:700;font-size:11px">${escH(p.panel)}${p.version?` <span class="c-yellow mono" style="font-size:10px">${escH(p.version)}</span>`:''}</td>`
+       + `<td class="mono c-cyan" style="font-size:10px">${where}</td>`
+       + `<td style="color:${sc[p.severity]||'var(--text)'};font-weight:700;font-size:10px">${escH((p.severity||'').toUpperCase())}</td></tr>`;
+      if(p.signals?.length) h+=`<tr><td colspan="3" class="c-dim" style="font-size:9px;padding-top:0">matched: ${escH(p.signals.join(' · '))}</td></tr>`;
+    });
+    h+='</tbody></table>';
+    (data.findings||[]).forEach(f=>{
+      h+=`<div class="alert a-red" style="font-size:10px;padding:6px 8px;margin:4px 0"><b>${escH(f.name)}</b><div style="margin-top:3px;color:var(--text2)">${escH(f.detail)}</div></div>`;
+    });
+    if(data.unexplained_ports?.length) h+=`<div class="c-dim" style="font-size:10px;margin-top:6px">Also open with nothing identifying them: ${escH(data.unexplained_ports.join(', '))}</div>`;
     return h;
   }
 
