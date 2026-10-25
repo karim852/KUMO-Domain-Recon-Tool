@@ -444,6 +444,35 @@ determined", carrying the reason. The UI counts and lists those separately and
 never colours them as clean. This is the same rule as the DNS module's failed
 lookups: **absence of an answer is not an answer.**
 
+### 22. Employees only, and the boundary is now explicit
+
+The per-email stealer check must only ever look up the target company's own
+addresses. A client address — a customer of the target, at gmail.com or at
+their own employer's domain — is a different person. Looking them up against an
+infostealer database is out of scope for a domain assessment and a privacy
+problem in its own right.
+
+The filters were `email.endswith("@" + domain)`, which held, but it was the
+same substring style that produced the DMARC bug, and it had two edges:
+
+* **Subdomain scans collected nothing.** Scanning `www.acme-corp.com` meant
+  nothing ended with `@www.acme-corp.com`, so **zero** addresses were checked —
+  the same shape as the DMARC organisational-domain bug.
+* **The harvester could invent an address.** Its regex ended in `\b`, so
+  `someone@acme-corp.com.evil.com` matched and yielded the substring
+  `someone@acme-corp.com`, an address that does not exist. That fabricated
+  address then passed the `endswith` filter.
+
+`_is_company_email` now splits on the last `@` and compares the domain exactly,
+against `_company_domains` (the target plus its organisational domain, stopping
+before a public suffix). The harvester's regex ends in a negative lookahead
+instead of `\b`, so it will not stop mid-domain.
+
+Verified: `evil-acme-corp.com`, `acme-corp.com.evil.com`, `sub.acme-corp.com`,
+`a@b@acme-corp.com` and bare `@acme-corp.com` are all rejected, while
+subdomain scans now find the organisation's addresses. `chia["client_logins"]`
+is read for the summary count and never for the lookup.
+
 ## Rules of thumb for new checks
 
 1. **Never let a status code alone be evidence.** Pair it with a word matcher.
@@ -467,6 +496,8 @@ lookups: **absence of an answer is not an answer.**
    missing, be sure the query actually succeeded first.
 11. **Never cap a result set silently.** If a limit applies, report what was
    collected, what was checked and what was skipped.
-12. **Don't claim absence you cannot establish.** DKIM selectors can't be
+12. **Match a domain by parsing, not by suffix.** `endswith("@" + domain)`
+   admits `x@evil-domain.com` shapes and misses subdomain scans entirely.
+13. **Don't claim absence you cannot establish.** DKIM selectors can't be
    enumerated, so a miss is "not found at the names we tried". Where absence is
    unprovable, the finding earns credit when present but costs nothing when not.

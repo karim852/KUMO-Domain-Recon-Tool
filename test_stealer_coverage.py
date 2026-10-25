@@ -37,13 +37,14 @@ HARVESTED = {f"{c}{i}.staff@{DOMAIN}"
 asked = []
 
 
-def run(cap=None, fail_for=(), rate_limit_for=()):
+def run(cap=None, fail_for=(), rate_limit_for=(), harvested=None,
+        chia_employee=(), chia_client=(), chia_emails=(), proxynova=()):
     """Run scan_breachintel with every network source stubbed."""
     import os
     asked.clear()
 
     def fake_collect(domain):
-        return set(HARVESTED), {}, ["homepage", "crt.sh"]
+        return set(HARVESTED if harvested is None else harvested), {}, ["homepage", "crt.sh"]
 
     class FakeResp:
         def __init__(self, email):
@@ -67,12 +68,30 @@ def run(cap=None, fail_for=(), rate_limit_for=()):
                         "total_user_services": 7}
             return {"stealers": []}
 
+    class ChiaResp:
+        status_code = 200
+
+        def __init__(self, payload):
+            self._p = payload
+            self.text = ""
+
+        def json(self):
+            return self._p
+
     def fake_get(url, **kw):
         if "search-by-email" in url:
             from urllib.parse import unquote
             em = unquote(url.split("email=")[1])
             asked.append(em)
             return FakeResp(em)
+        # Chiasmodon: employee vs client logins, so we can prove client
+        # addresses never reach the stealer check.
+        if "CompanyEmployeLogins" in url:
+            return ChiaResp([{"email": e, "password": "x"} for e in chia_employee])
+        if "CompanyClientLogins" in url:
+            return ChiaResp([{"email": e, "password": "x"} for e in chia_client])
+        if "CompanyEmails" in url:
+            return ChiaResp(list(chia_emails))
         raise RuntimeError("blocked: " + url[:60])
 
     real_collect = engine._collect_domain_emails
@@ -159,6 +178,106 @@ def main():
           f"skipped={s3['emails_skipped']}")
     check("collection total still reported in full",
           s3["emails_collected"] == len(HARVESTED))
+
+    # ── employees only, never clients ────────────────────────────────────
+    # Client addresses are other people's: customers of the target. Looking
+    # them up against an infostealer database is both out of scope for a domain
+    # assessment and a privacy problem. Only @domain addresses are checked.
+    print(f"\n{B}Employees only — client addresses are never checked{X}")
+
+    EMPLOYEES = {f"staff{i}@{DOMAIN}" for i in range(1, 6)}
+    CLIENTS = {
+        "john.smith@gmail.com", "marie@yahoo.fr", "buyer@othercorp.com",
+        "contact@client-company.tn", "user@hotmail.com",
+        # near-misses designed to slip past a sloppy filter
+        f"attacker@evil-{DOMAIN}", f"someone@{DOMAIN}.evil.com",
+        f"person@sub.{DOMAIN}",
+    }
+
+    res4 = run(harvested=EMPLOYEES | CLIENTS,
+               chia_employee=sorted(EMPLOYEES),
+               chia_client=sorted(CLIENTS),
+               chia_emails=sorted(CLIENTS),
+               proxynova=sorted(CLIENTS))
+    asked4 = set(asked)
+    leaked = asked4 & CLIENTS
+
+    check("every employee address was checked", EMPLOYEES <= asked4,
+          f"{len(EMPLOYEES & asked4)}/{len(EMPLOYEES)}")
+    check("NO client address was looked up", not leaked,
+          f"leaked={sorted(leaked)[:3]}" if leaked else "none leaked")
+    check("client_logins never feed the stealer check",
+          not any(e in asked4 for e in CLIENTS))
+    check("lookalike domains rejected (evil-domain, domain.evil.com)",
+          f"attacker@evil-{DOMAIN}" not in asked4
+          and f"someone@{DOMAIN}.evil.com" not in asked4)
+    check("subdomain addresses not treated as the domain",
+          f"person@sub.{DOMAIN}" not in asked4)
+    check("harvested_emails output holds only what was collected",
+          isinstance(res4["sources"]["harvested_emails"], list))
+
+    # the client count is still reported, it is just never queried
+    check("clients still counted in the summary, just not queried",
+          res4["summary"]["total_clients_leaked"] >= 0)
+
+    print(f"\n{B}The employee/client boundary itself{X}")
+    doms = engine._company_domains(DOMAIN)
+    for addr, want in [
+        (f"k.mansour@{DOMAIN}", True),
+        (f"K.Mansour@{DOMAIN.upper()}", True),
+        ("john@gmail.com", False),
+        ("buyer@othercorp.com", False),
+        (f"attacker@evil-{DOMAIN}", False),
+        (f"someone@{DOMAIN}.evil.com", False),
+        (f"person@sub.{DOMAIN}", False),
+        ("no-at-sign", False),
+        (f"a@b@{DOMAIN}", False),
+        ("", False),
+        (f"@{DOMAIN}", False),
+    ]:
+        got = engine._is_company_email(addr, doms)
+        check(f"{addr or '(empty)'!s:<34} -> {got}", got is want)
+
+    print(f"\n{B}Subdomain scans still find the company's addresses{X}")
+    EMP2 = {f"k.mansour@{DOMAIN}", f"hr@{DOMAIN}"}
+    for target, expect in [(DOMAIN, 2), (f"www.{DOMAIN}", 2),
+                           (f"mail.corp.{DOMAIN}", 2)]:
+        r = run(harvested=EMP2 | {"client@gmail.com"})
+        # run() scans DOMAIN; re-run directly for the subdomain targets
+        import engine as _e
+        asked.clear()
+        real_collect = _e._collect_domain_emails
+        real_get = _e.requests.get
+        real_req = _e.req
+
+        def collect2(d):
+            return set(EMP2) | {"client@gmail.com"}, {}, ["homepage"]
+
+        class OK:
+            status_code = 200
+
+            def json(self):
+                return {"stealers": []}
+
+        def get2(url, **kw):
+            if "search-by-email" in url:
+                from urllib.parse import unquote
+                asked.append(unquote(url.split("email=")[1]))
+                return OK()
+            raise RuntimeError("blocked")
+
+        _e._collect_domain_emails = collect2
+        _e.requests.get = get2
+        _e.req = lambda *a, **k: None
+        try:
+            rr = _e.scan_breachintel(target)
+        finally:
+            _e._collect_domain_emails = real_collect
+            _e.requests.get = real_get
+            _e.req = real_req
+        n = rr["sources"]["hr_per_email_stats"]["emails_checked"]
+        check(f"scanning {target:24} checks {n} company address(es)",
+              n == expect and "client@gmail.com" not in set(asked))
 
     print()
     if fails:

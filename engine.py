@@ -8983,23 +8983,31 @@ def scan_breachintel(domain):
     all_stealer_emails = set()
     _dom_lo = domain.lower()
 
-    # ONLY check @domain employee emails — never external/client emails
-    # Chiasmodon employee logins — filter to @domain only
+    # EMPLOYEES ONLY. Every address below is filtered through
+    # _is_company_email, which admits only addresses at the company's own
+    # domains (the target plus its organisational domain). Client addresses —
+    # the target's customers, at gmail.com or their own employer's domain —
+    # are never looked up: they are other people, out of scope for a domain
+    # assessment, and querying them would be its own privacy problem.
+    # chia["client_logins"] is deliberately not read here.
+    _company_doms = _company_domains(domain)
+
+    # Chiasmodon employee logins
     for _login in chia.get("employee_logins", []):
         _em = (_login.get("email") or _login.get("username") or "").lower().strip()
-        if _em and _em.endswith("@" + _dom_lo):
+        if _is_company_email(_em, _company_doms):
             all_stealer_emails.add(_em)
 
-    # Chiasmodon email list — filter to @domain only
+    # Chiasmodon email list
     for _e in chia.get("emails", []):
         _em = (_e if isinstance(_e, str) else (_e.get("email") or _e.get("value") or "")).lower().strip()
-        if _em and _em.endswith("@" + _dom_lo):
+        if _is_company_email(_em, _company_doms):
             all_stealer_emails.add(_em)
 
-    # ProxyNova — already filtered to @domain by the COMB query
+    # ProxyNova — already narrowed by the COMB query, re-checked anyway
     for _em in pn.get("unique_emails", []):
-        _em = _em.lower().strip()
-        if _em and _em.endswith("@" + _dom_lo):
+        _em = str(_em).lower().strip()
+        if _is_company_email(_em, _company_doms):
             all_stealer_emails.add(_em)
 
     # Every address the email harvester found. This is the main source: the
@@ -9014,14 +9022,18 @@ def scan_breachintel(domain):
         _harvested, _hdetails, _hsources = set(), {}, []
     for _em in _harvested:
         _em = (_em or "").lower().strip()
-        if _em.endswith("@" + _dom_lo):
+        if _is_company_email(_em, _company_doms):
             all_stealer_emails.add(_em)
-    results["sources"]["harvested_emails"] = sorted(_harvested)
+    results["sources"]["harvested_emails"] = sorted(
+        e for e in _harvested if _is_company_email(e, _company_doms))
 
-    # Final safety guard — strip any non-@domain email that slipped through
-    all_stealer_emails = {e for e in all_stealer_emails if e.endswith("@" + _dom_lo)}
+    # Final safety guard — one last pass so nothing that is not the company's
+    # own address can reach the lookup, whatever a source returned.
+    all_stealer_emails = {e for e in all_stealer_emails
+                          if _is_company_email(e, _company_doms)}
+    results["sources"]["company_domains"] = _company_doms
 
-    # Run HR check on collected emails (up to 20, in parallel)
+    # Run the Hudson Rock check on every collected address, in parallel
     hr_per_email = {}
     _skipped = 0
     if all_stealer_emails:
@@ -9143,6 +9155,48 @@ def scan_breachintel(domain):
 
 import threading as _threading
 
+
+def _company_domains(domain):
+    """
+    The domains whose addresses count as the target company's own.
+
+    The target plus its organisational domain, so scanning www.acme-corp.com
+    still treats k.mansour@acme-corp.com as an employee. Without this, a
+    subdomain scan collected zero addresses: nothing ends with
+    "@www.acme-corp.com". _parent_domains stops before a public suffix, so this
+    can never widen to "@co.uk" and sweep in unrelated people.
+
+    Deliberately does NOT include subdomains of the target: an address at
+    sub.acme-corp.com is not matched when scanning acme-corp.com. Under-
+    collecting is the safe direction here.
+    """
+    out, seen = [], set()
+    for d in [(domain or "").lower().strip(".")] + _parent_domains(domain):
+        if d and d not in seen:
+            seen.add(d)
+            out.append(d)
+    return out
+
+
+def _is_company_email(email, company_domains):
+    """
+    True only for an address at one of the company's own domains.
+
+    This is the employee/client boundary. Client addresses — customers of the
+    target, at gmail.com or their own employer's domain — are never looked up
+    against an infostealer database: they are other people, out of scope for a
+    domain assessment, and querying them would be a privacy problem of its own.
+
+    Matching is on the full domain after the last "@", so neither
+    evil-acme-corp.com nor acme-corp.com.evil.com can pass as acme-corp.com.
+    """
+    em = (email or "").lower().strip()
+    if em.count("@") != 1:
+        return False
+    local, _, dom = em.partition("@")
+    return bool(local) and dom in set(company_domains)
+
+
 _EMAIL_HARVEST_CACHE = {}
 _EMAIL_HARVEST_LOCK = _threading.Lock()
 
@@ -9177,8 +9231,18 @@ def _collect_domain_emails(domain):
     sources_used = []
     email_details = {}  # email -> {sources: [...]}
 
+    # Match addresses at the target AND its organisational domain, so a scan of
+    # www.acme-corp.com still harvests @acme-corp.com staff addresses.
+    #
+    # The trailing guard is a negative lookahead rather than \b: with \b,
+    # "someone@acme-corp.com.evil.com" matched and yielded the substring
+    # "someone@acme-corp.com", inventing an address that does not exist. The
+    # lookahead refuses to stop mid-domain.
+    _company = _company_domains(domain)
     EMAIL_RE = _re.compile(
-        r'\b[A-Za-z0-9._%+\-]+@' + _re.escape(domain) + r'\b',
+        r'\b[A-Za-z0-9._%+\-]+@(?:' +
+        "|".join(_re.escape(d) for d in _company) +
+        r')(?![A-Za-z0-9.\-])',
         _re.IGNORECASE
     )
 

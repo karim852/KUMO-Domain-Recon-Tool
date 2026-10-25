@@ -28,9 +28,21 @@ collected / checked / clean / not-determined / skipped with a per-source
 breakdown. `compromised` is tri-state, so "could not check" is displayed and
 counted separately from "clean" and never looks green.
 
+**Employees only.** The check looks up addresses at the company's own domains
+and nothing else. Client addresses — the target's customers, at gmail.com or
+their own employer's domain — are never queried: they are other people, out of
+scope, and looking them up would be a privacy problem. `client_logins` is
+counted in the summary and never fed to the lookup.
+
+That boundary is now parsed rather than suffix-matched, which fixed two edges:
+scanning a subdomain used to collect **zero** addresses (nothing ends with
+`@www.acme-corp.com`), and the harvester's regex could extract a fabricated
+`someone@acme-corp.com` out of `someone@acme-corp.com.evil.com`. Lookalike
+domains, subdomains and malformed addresses are all rejected.
+
 New `test_stealer_coverage.py` proves all 60 of 60 collected addresses get
-checked, that nothing is dropped silently, and that a failed lookup is never
-reported as clean.
+checked, that no client address is ever looked up, that nothing is dropped
+silently, and that a failed lookup is never reported as clean.
 
 
 ## Email security module rewritten
