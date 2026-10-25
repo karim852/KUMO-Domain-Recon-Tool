@@ -281,6 +281,79 @@ them need an operator-supplied LFI path and session save path. That is
 exploitation, not reconnaissance. None of it is implemented, and the miner
 excludes it structurally by taking GET templates only.
 
+## Fourth pass — the email security module
+
+`scan_dns` read SPF, DMARC and DKIM records with substring searches. These are
+tag-value records, and substring matching on them inverts findings.
+
+### 12. `p=none` is a substring of `sp=none`
+
+The worst of them. A domain publishing `v=DMARC1; p=reject; sp=none` was
+reported as **"none (not enforcing)"** — the checks ran in the order
+`p=none`, `p=quarantine`, `p=reject`, and `sp=none` satisfied the first one. A
+domain with the strictest possible policy was reported as unprotected.
+
+Records are now parsed into tags (`_parse_tags`) and the `p` tag is read
+directly. `sp=none` is reported separately, as what it is: the organisational
+domain is protected but subdomains are not.
+
+### 13. Anything at `_dmarc` counted as a policy
+
+The test was `if "dmarc" in record.lower()`. A DMARC record must begin with
+`v=DMARC1` (RFC 7489 §6.3), and other TXT records legitimately live at that
+name — verification tokens, notes. Those were parsed as policies.
+
+### 14. Multiple records are a broken config, not a working one
+
+Two SPF records is a permerror (RFC 7208 §4.5) and receivers reject the lot.
+Two DMARC records means receivers apply **no** policy (RFC 7489 §6.6.3). Kumo
+read the first and reported it as the active policy, so a domain whose email
+authentication was broken looked correctly configured. Both are now flagged as
+invalid.
+
+### 15. A revoked DKIM key read as a healthy one
+
+The test was `if "p=" in record`. An empty `p=` tag means the key has been
+**revoked** (RFC 6376 §3.6.1). Kumo reported it as DKIM present and working.
+Key material is now required, and a revoked selector is reported as revoked.
+
+### 16. A failed lookup was reported as a missing record
+
+`dns_query` returned `[]` both when a record did not exist and when the lookup
+failed. So a DoH hiccup produced "DMARC Missing — spoofing risk" on domains
+that publish DMARC. `dns_query_ex` now distinguishes `ok` / `nxdomain` /
+`error`, and a failed lookup is reported as *not determined*. Absence is only
+claimed when the resolver actually answered.
+
+### 17. Nine DKIM selectors was not enough
+
+A DKIM selector cannot be enumerated — it is only found by guessing the name.
+So "DKIM not found" only ever meant "none of the names we tried existed", and
+with nine names it missed most hosted mail providers, reporting a weakness that
+was not there.
+
+The list is now **89 selectors**, covering the published defaults of Google
+Workspace, Microsoft 365, Zoho, SendGrid, Mailchimp/Mandrill, Postmark,
+Mailgun, SparkPost, Fastmail, Proton Mail, HubSpot, Constant Contact, Campaign
+Monitor, Klaviyo, Amazon SES, Mimecast, Proofpoint, Barracuda and others.
+
+Even so, a custom selector still cannot be found, so the result says
+"no key at 89 known selectors" rather than "DKIM absent", and DKIM is excluded
+from the grade's penalty side: it can earn credit, never cost it. Claiming a
+weakness that rests on a guessing game is the kind of finding this whole
+document exists to remove.
+
+### Long TXT records were being corrupted
+
+A TXT record over 255 bytes arrives as several quoted chunks that must be
+joined with no separator (RFC 7208 §3.3). Long SPF and DKIM records were read
+with the quotes still in them. `_txt_values` joins them the way a resolver
+does.
+
+`test_email.py` covers all of this: the record shapes, and `scan_dns` end to
+end through a stubbed resolver, including the case where absence must NOT be
+claimed.
+
 ## Rules of thumb for new checks
 
 1. **Never let a status code alone be evidence.** Pair it with a word matcher.
@@ -298,3 +371,10 @@ excludes it structurally by taking GET templates only.
 8. **Detection, not exploitation.** A rule is a GET and a signature. If a check
    needs a payload, writes state on the target, or wants the operator to supply
    an exploit path, it does not belong in Kumo.
+9. **Never substring-match a tag-value record.** SPF, DMARC, DKIM, MTA-STS and
+   BIMI records are parsed, not searched: `p=none` is a substring of `sp=none`.
+10. **A failed lookup is not an absent record.** If a check reports something
+   missing, be sure the query actually succeeded first.
+11. **Don't claim absence you cannot establish.** DKIM selectors can't be
+   enumerated, so a miss is "not found at the names we tried". Where absence is
+   unprovable, the finding earns credit when present but costs nothing when not.

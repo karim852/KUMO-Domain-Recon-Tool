@@ -1,5 +1,42 @@
 # Kumo — themed build
 
+## Email security module rewritten
+
+`scan_dns` read SPF, DMARC and DKIM with substring searches. On tag-value
+records that inverts findings. The worst case: **`p=none` is a substring of
+`sp=none`**, so a domain publishing `v=DMARC1; p=reject; sp=none` — the
+strictest policy there is — was reported as *"none (not enforcing)"*.
+
+Six false positives fixed:
+
+| was | now |
+|---|---|
+| `p=reject; sp=none` read as "not enforcing" | records parsed into tags; `sp=none` reported separately |
+| any TXT at `_dmarc` read as a policy | must begin with `v=DMARC1` (RFC 7489) |
+| two SPF or DMARC records read as working | flagged invalid — receivers reject both (RFC 7208/7489) |
+| revoked DKIM key (`p=`) read as healthy | key material required; revocation reported (RFC 6376) |
+| failed DNS lookup read as "record missing" | lookups report ok/nxdomain/error; a failure is *not determined* |
+| long TXT records read with quotes embedded | chunks joined the way a resolver does (RFC 7208 §3.3) |
+
+**DKIM selectors: 9 → 89.** A selector cannot be enumerated, so "DKIM not
+found" only ever meant "none of the names we tried existed" — and nine names
+missed most hosted providers, reporting a weakness that wasn't there. The list
+now covers the published defaults of Google Workspace, Microsoft 365, Zoho,
+SendGrid, Mailchimp, Postmark, Mailgun, SparkPost, Fastmail, Proton Mail,
+HubSpot, Klaviyo, Amazon SES, Mimecast, Proofpoint, Barracuda and more.
+
+Even then, a custom selector can't be found, so the result reads "no key at 89
+known selectors" rather than "DKIM absent", and DKIM is excluded from the
+grade's penalty side: present earns credit, absent costs nothing.
+
+Also added: **MTA-STS, TLS-RPT and BIMI** detection, a `pct<100` warning (a
+sampled DMARC policy is commonly mistaken for full enforcement), and an email
+security **grade** the web UI already had a slot for.
+
+New `test_email.py`: every record shape, plus `scan_dns` end to end through a
+stubbed resolver — including the case where absence must *not* be claimed.
+
+
 ## php2shell (CVE-2026-109618 / 109619) and a version matcher
 
 Two unauthenticated RCE bugs in the **PHP runtime**, both CVSS 9.2, fixed

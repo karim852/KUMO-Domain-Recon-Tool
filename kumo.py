@@ -658,13 +658,43 @@ def render_dns(data):
         for v in vals:
             dimprint(v[:85], 6)
     es = data.get("email_security", {})
-    print(f"\n    {C.M}Email Security:{C.RS}")
+    grade = es.get("grade")
+    print(f"\n    {C.M}Email Security:{C.RS}" + (f"  {C.D}grade {grade}{C.RS}" if grade else ""))
+
     spf = es.get("spf", {})
-    (ok if spf.get("found") else fail)(f"SPF: {'Found '+spf.get('policy','') if spf.get('found') else 'Not found'}", 6)
+    if spf.get("found"):
+        (ok if spf.get("valid") else fail)(f"SPF: {spf.get('policy','')}", 6)
+    elif spf.get("lookup_failed"):
+        warn("SPF: lookup failed — not determined", 6)
+    else:
+        fail("SPF: Not found", 6)
+
     dmarc = es.get("dmarc", {})
-    (ok if dmarc.get("found") else fail)(f"DMARC: {'Found '+dmarc.get('policy','') if dmarc.get('found') else 'Not found'}", 6)
+    if dmarc.get("found"):
+        (ok if dmarc.get("valid") else fail)(f"DMARC: {dmarc.get('policy','')}", 6)
+    elif dmarc.get("lookup_failed"):
+        # Absence was never established, so this is not reported as missing.
+        warn("DMARC: lookup failed — not determined", 6)
+    else:
+        fail("DMARC: Not found", 6)
+
     dkim = es.get("dkim", {})
-    (ok if dkim.get("found") else warn)(f"DKIM: {'Found sel='+dkim.get('selector','') if dkim.get('found') else 'Not found'}", 6)
+    if dkim.get("found"):
+        sels = ", ".join(dkim.get("selectors_found", [])[:4])
+        ok(f"DKIM: selector={sels}", 6)
+    else:
+        # Selectors cannot be enumerated, so this is "not found", never "absent".
+        warn(f"DKIM: no key at {dkim.get('selectors_tried', 0)} known selectors "
+             f"(a custom selector would not be found)", 6)
+
+    for extra, label in (("mta_sts", "MTA-STS"), ("tls_rpt", "TLS-RPT"), ("bimi", "BIMI")):
+        d = es.get(extra, {})
+        if d.get("found"):
+            ok(f"{label}: present", 6)
+
+    for key in ("spf", "dmarc", "dkim"):
+        for note in (es.get(key, {}).get("notes") or []):
+            dimprint(f"{key.upper()}: {note}", 8)
 
 
 def render_whois(data):

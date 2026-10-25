@@ -48,14 +48,80 @@ def req(url, timeout=10, headers=None):
 
 
 def dns_query(domain, qtype):
+    answers, _ = dns_query_ex(domain, qtype)
+    return answers
+
+
+def dns_query_ex(domain, qtype):
+    """
+    DNS over HTTPS, reporting whether the lookup itself succeeded.
+
+    Returns (answers, status) where status is:
+      "ok"       the resolver answered; [] then means the record does not exist
+      "nxdomain" the name does not exist
+      "error"    the lookup FAILED — absence proves nothing
+
+    The distinction matters: scan_dns used to treat a failed lookup and a
+    genuinely missing record identically, so a DoH hiccup was reported as
+    "DMARC missing — spoofing risk" on a domain that publishes DMARC.
+    """
     r = req(f"https://cloudflare-dns.com/dns-query?name={domain}&type={qtype}",
             headers={"Accept": "application/dns-json"})
-    if r:
-        try:
-            return r.json().get("Answer", [])
-        except Exception:
-            pass
-    return []
+    if not r:
+        return [], "error"
+    try:
+        j = r.json()
+    except Exception:
+        return [], "error"
+    rcode = j.get("Status", -1)
+    if rcode == 0:
+        return j.get("Answer", []) or [], "ok"
+    if rcode == 3:
+        return [], "nxdomain"
+    return [], "error"
+
+
+def _txt_values(answers):
+    """
+    TXT record strings from a DoH answer set.
+
+    A long TXT record arrives as several quoted chunks that must be joined with
+    no separator (RFC 7208 §3.3); splitting on the quotes and concatenating is
+    what a resolver does, and getting it wrong corrupts long SPF and DKIM
+    records.
+    """
+    out = []
+    for a in answers:
+        if a.get("type") != 16:
+            continue
+        data = (a.get("data") or "").strip()
+        if '"' in data:
+            parts = re.findall(r'"((?:[^"\\]|\\.)*)"', data)
+            joined = "".join(p.replace('\\"', '"') for p in parts)
+            out.append(joined if joined else data.strip('"'))
+        else:
+            out.append(data)
+    return [t for t in out if t]
+
+
+def _parse_tags(record):
+    """
+    Parse a tag-value record ('v=DMARC1; p=reject; sp=none') into a dict.
+
+    Substring matching on these records is a false-positive generator: 'p=none'
+    is a substring of 'sp=none', so a domain publishing 'p=reject; sp=none' was
+    reported as not enforcing. Tags are parsed, not searched.
+    """
+    tags = {}
+    for part in (record or "").split(";"):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        k, _, v = part.partition("=")
+        k = k.strip().lower()
+        if k and k not in tags:          # first occurrence wins, per RFC
+            tags[k] = v.strip()
+    return tags
 
 
 def resolve(domain):
@@ -79,6 +145,60 @@ def resolve(domain):
 # MODULE: DNS
 # ═══════════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════════
+# DKIM SELECTORS
+# ═══════════════════════════════════════════════════════════════
+# DKIM keys live at <selector>._domainkey.<domain>, and a selector cannot be
+# enumerated — it is only found by guessing the name. So "DKIM not found" really
+# means "none of the selectors we tried existed", and reporting that as a
+# weakness on a domain that signs its mail under a selector we never asked for
+# is a false positive. The old list had nine entries, which missed most hosted
+# mail providers.
+#
+# These are the published defaults of the common senders. Each one is one extra
+# DoH query, all fired in parallel.
+DKIM_SELECTORS = [
+    # generic / self-hosted defaults
+    "default", "dkim", "mail", "email", "smtp", "selector", "key1", "key2",
+    "s1", "s2", "s3", "k1", "k2", "k3", "dkim1", "dkim2",
+    "selector1", "selector2", "selector3", "mx", "mailer",
+    # Google Workspace
+    "google", "google1", "googleapps",
+    # Microsoft 365 uses selector1/selector2 (above)
+    # Zoho
+    "zoho", "zmail", "zohomail",
+    # SendGrid / Twilio
+    "sendgrid", "smtpapi",
+    # Mailchimp / Mandrill
+    "mandrill", "mailchimp", "mc1", "mc2",
+    # Postmark
+    "pm", "postmark",
+    # Mailgun
+    "mailo", "mg",
+    # SparkPost
+    "sparkpost", "scph",
+    # Fastmail
+    "fm1", "fm2", "fm3",
+    # Proton Mail
+    "protonmail", "protonmail1", "protonmail2", "protonmail3",
+    # HubSpot
+    "hs1", "hs2",
+    # Constant Contact / Campaign Monitor / Klaviyo
+    "ctct1", "ctct2", "cm", "kl", "kl2",
+    # Amazon SES (token selectors cannot be guessed; these are the aliases)
+    "amazonses", "ses",
+    # security gateways
+    "mimecast", "pps", "ppsdkim", "barracuda", "sophos",
+    # other platforms
+    "mailjet", "sib", "brevo", "omnisend", "moosend", "benchmark",
+    "elasticemail", "pepipost", "netcore", "turbo-smtp", "mxvault",
+    "everlytickey1", "everlytickey2", "zendesk1", "zendesk2",
+    "freshdesk", "intercom", "braze", "drip", "ac", "ml",
+    "shopify", "squarespace", "wix", "godaddy", "dreamhost",
+    "yandex", "mailru", "qq",
+]
+
+
 def scan_dns(domain):
     """
     Fully parallelized DNS scan.
@@ -86,9 +206,6 @@ def scan_dns(domain):
     Typical time: ~0.4s instead of 3-5s.
     """
     results = {"ips": {}, "records": {}, "email_security": {}}
-
-    DKIM_SELECTORS = ["default", "google", "selector1", "selector2",
-                      "k1", "dkim", "mail", "s1", "s2"]
     TYPE_MAP = {"MX": 15, "NS": 2, "TXT": 16, "SOA": 6, "CNAME": 5, "CAA": 257}
 
     # Build all tasks to run in parallel:
@@ -100,7 +217,8 @@ def scan_dns(domain):
 
     def fetch_record(args):
         qname, qtype, label = args
-        return label, dns_query(qname, qtype)
+        answers, st = dns_query_ex(qname, qtype)
+        return label, answers, st
 
     tasks = []
     # DNS record types
@@ -108,20 +226,26 @@ def scan_dns(domain):
         tasks.append((domain, qtype, f"rec_{qtype}"))
     # DMARC
     tasks.append((f"_dmarc.{domain}", "TXT", "dmarc"))
+    # Transport security: MTA-STS and SMTP TLS reporting
+    tasks.append((f"_mta-sts.{domain}", "TXT", "mta_sts"))
+    tasks.append((f"_smtp._tls.{domain}", "TXT", "tls_rpt"))
+    # BIMI
+    tasks.append((f"default._bimi.{domain}", "TXT", "bimi"))
     # DKIM selectors — all at once
     for sel in DKIM_SELECTORS:
         tasks.append((f"{sel}._domainkey.{domain}", "TXT", f"dkim_{sel}"))
 
     # Fire everything in parallel + resolve IPs simultaneously
-    raw = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as ex:
+    raw, status = {}, {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=32) as ex:
         ip_future = ex.submit(resolve, domain)
         dns_futures = {ex.submit(fetch_record, t): t for t in tasks}
 
         results["ips"] = ip_future.result()
         for future in concurrent.futures.as_completed(dns_futures):
-            label, answers = future.result()
+            label, answers, st = future.result()
             raw[label] = answers
+            status[label] = st
 
     # Parse DNS records
     for qtype, expected in TYPE_MAP.items():
@@ -131,42 +255,171 @@ def scan_dns(domain):
         if filtered:
             results["records"][qtype] = filtered
 
-    # SPF (from TXT)
-    txt = results["records"].get("TXT", [])
-    has_spf = any("v=spf1" in t for t in txt)
-    spf_policy = ""
-    if has_spf:
-        spf_rec = next(t for t in txt if "v=spf1" in t)
-        if "+all" in spf_rec:      spf_policy = "+all (DANGEROUS)"
-        elif "~all" in spf_rec:    spf_policy = "~all (softfail)"
-        elif "-all" in spf_rec:    spf_policy = "-all (strict)"
-        elif "?all" in spf_rec:    spf_policy = "?all (neutral)"
-    results["email_security"]["spf"] = {"found": has_spf, "policy": spf_policy}
+    # ── SPF ───────────────────────────────────────────────────────────────
+    # Mechanisms are tokenised rather than searched, so "+all" cannot be matched
+    # inside a macro or an include's hostname, and the qualifier on the final
+    # `all` is read from the token itself.
+    txt = _txt_values(raw.get("rec_TXT", []))
+    spf_records = [t for t in txt if t.lower().replace(" ", "").startswith("v=spf1")]
+    spf = {"found": bool(spf_records), "policy": "", "record": None,
+           "record_count": len(spf_records), "valid": True,
+           "lookup_failed": status.get("rec_TXT") == "error" and not spf_records,
+           "notes": []}
+    if spf["lookup_failed"]:
+        spf["notes"].append("TXT lookup failed — this is not evidence that SPF is absent")
+    if len(spf_records) > 1:
+        # RFC 7208 §4.5: more than one SPF record is a permerror. Receivers
+        # reject the lot, so the domain is unprotected despite "having SPF".
+        spf["valid"] = False
+        spf["policy"] = "invalid (multiple SPF records — permerror)"
+        spf["notes"].append(f"{len(spf_records)} SPF records published; RFC 7208 "
+                            f"requires exactly one, so receivers treat SPF as broken")
+    if spf_records:
+        rec = spf_records[0]
+        spf["record"] = rec
+        tokens = rec.split()
+        allq = next((t for t in reversed(tokens) if t.lower().lstrip("+-~?") == "all"), None)
+        redirect = next((t.split("=", 1)[1] for t in tokens
+                         if t.lower().startswith("redirect=")), None)
+        if spf["valid"]:
+            if allq:
+                q = allq[0] if allq[0] in "+-~?" else "+"
+                spf["policy"] = {"+": "+all (DANGEROUS — authorises any sender)",
+                                 "~": "~all (softfail)",
+                                 "-": "-all (strict)",
+                                 "?": "?all (neutral — no protection)"}[q]
+            elif redirect:
+                # The effective policy lives in the redirect target. Saying
+                # "no policy" here would be wrong.
+                spf["policy"] = f"redirect={redirect} (policy defined by that domain)"
+                spf["notes"].append("SPF delegates to a redirect target; the "
+                                    "effective policy is that domain's")
+            else:
+                spf["policy"] = "no all mechanism (defaults to neutral)"
+    results["email_security"]["spf"] = spf
 
-    # DMARC
-    dmarc_rec, dmarc_policy = None, ""
-    for a in raw.get("dmarc", []):
-        d = a.get("data", "")
-        if "dmarc" in d.lower():
-            dmarc_rec = d.strip('"')
-            if "p=none" in d.lower():        dmarc_policy = "none (not enforcing)"
-            elif "p=quarantine" in d.lower(): dmarc_policy = "quarantine"
-            elif "p=reject" in d.lower():     dmarc_policy = "reject (strict)"
-            break
-    results["email_security"]["dmarc"] = {
-        "found": dmarc_rec is not None, "record": dmarc_rec, "policy": dmarc_policy
-    }
+    # ── DMARC ─────────────────────────────────────────────────────────────
+    # A DMARC record must begin with v=DMARC1 (RFC 7489 §6.3). Other TXT records
+    # do live at _dmarc (verification tokens, comments), and treating those as a
+    # policy was a false positive in both directions.
+    dmarc_txt = _txt_values(raw.get("dmarc", []))
+    dmarc_records = [t for t in dmarc_txt
+                     if t.lower().replace(" ", "").startswith("v=dmarc1")]
+    lookup_failed = status.get("dmarc") == "error"
+    dmarc = {"found": bool(dmarc_records), "record": None, "policy": "",
+             "subdomain_policy": "", "pct": None, "rua": None,
+             "record_count": len(dmarc_records), "valid": True,
+             "lookup_failed": lookup_failed and not dmarc_records, "notes": []}
+    if len(dmarc_records) > 1:
+        # RFC 7489 §6.6.3: multiple records means DMARC is not applied at all.
+        dmarc["valid"] = False
+        dmarc["policy"] = "invalid (multiple DMARC records — treated as none)"
+        dmarc["notes"].append(f"{len(dmarc_records)} DMARC records published; "
+                              f"receivers apply no policy when more than one exists")
+    if dmarc_records:
+        rec = dmarc_records[0]
+        tags = _parse_tags(rec)
+        dmarc["record"] = rec
+        dmarc["rua"] = tags.get("rua")
+        p = (tags.get("p") or "").lower()
+        sp = (tags.get("sp") or "").lower()
+        dmarc["subdomain_policy"] = sp
+        if dmarc["valid"]:
+            dmarc["policy"] = {"none": "none (not enforcing)",
+                               "quarantine": "quarantine",
+                               "reject": "reject (strict)"}.get(p, p or "missing p tag")
+            if not p:
+                dmarc["valid"] = False
+                dmarc["notes"].append("no p= tag, so the record is ignored by receivers")
+        # pct<100 means the policy is only sampled — commonly mistaken for
+        # full enforcement.
+        if tags.get("pct"):
+            try:
+                dmarc["pct"] = int(tags["pct"])
+                if dmarc["pct"] < 100:
+                    dmarc["notes"].append(f"pct={dmarc['pct']}: the policy is applied "
+                                          f"to only {dmarc['pct']}% of failing mail")
+            except ValueError:
+                pass
+        if sp and sp == "none" and p in ("quarantine", "reject"):
+            dmarc["notes"].append("sp=none: subdomains are NOT protected even though "
+                                  "the organisational domain is")
+    elif lookup_failed:
+        dmarc["notes"].append("DMARC lookup failed — this is not evidence of absence")
+    results["email_security"]["dmarc"] = dmarc
 
-    # DKIM — pick the first selector that returned a key (all were queried in parallel)
-    dkim_found, dkim_selector = False, ""
+    # ── DKIM ──────────────────────────────────────────────────────────────
+    # A key is only real if it carries key material. An empty p= tag means the
+    # key has been REVOKED (RFC 6376 §3.6.1), which the old "p= appears in the
+    # string" test reported as a healthy key.
+    dkim = {"found": False, "selector": "", "selectors_found": [],
+            "revoked_selectors": [], "selectors_tried": len(DKIM_SELECTORS),
+            "notes": []}
     for sel in DKIM_SELECTORS:
-        for a in raw.get(f"dkim_{sel}", []):
-            if "p=" in a.get("data", ""):
-                dkim_found, dkim_selector = True, sel
-                break
-        if dkim_found:
+        for val in _txt_values(raw.get(f"dkim_{sel}", [])):
+            tags = _parse_tags(val)
+            if "p" not in tags and "v" not in tags:
+                continue
+            key = (tags.get("p") or "").strip()
+            if key:
+                dkim["selectors_found"].append(sel)
+            elif "p" in tags:
+                dkim["revoked_selectors"].append(sel)
             break
-    results["email_security"]["dkim"] = {"found": dkim_found, "selector": dkim_selector}
+    if dkim["selectors_found"]:
+        dkim["found"] = True
+        dkim["selector"] = dkim["selectors_found"][0]
+    if dkim["revoked_selectors"]:
+        dkim["notes"].append("revoked key (empty p=) at: "
+                             + ", ".join(dkim["revoked_selectors"]))
+    if not dkim["found"]:
+        # Selectors cannot be enumerated, so absence is not proof.
+        dkim["notes"].append(f"none of {len(DKIM_SELECTORS)} known selectors resolved; "
+                             f"a custom selector would not be found this way, so this "
+                             f"is not proof that the domain does not sign its mail")
+    results["email_security"]["dkim"] = dkim
+
+    # ── Transport security and BIMI ───────────────────────────────────────
+    mta_sts = [t for t in _txt_values(raw.get("mta_sts", []))
+               if t.lower().replace(" ", "").startswith("v=stsv1")]
+    tls_rpt = [t for t in _txt_values(raw.get("tls_rpt", []))
+               if t.lower().replace(" ", "").startswith("v=tlsrptv1")]
+    bimi = [t for t in _txt_values(raw.get("bimi", []))
+            if t.lower().replace(" ", "").startswith("v=bimi1")]
+    results["email_security"]["mta_sts"] = {"found": bool(mta_sts),
+                                            "record": mta_sts[0] if mta_sts else None}
+    results["email_security"]["tls_rpt"] = {"found": bool(tls_rpt),
+                                            "record": tls_rpt[0] if tls_rpt else None}
+    results["email_security"]["bimi"] = {"found": bool(bimi),
+                                         "record": bimi[0] if bimi else None}
+
+    # ── Grade ─────────────────────────────────────────────────────────────
+    # Scored on what is actually enforced. DKIM is deliberately excluded from
+    # the penalty side: its absence cannot be proven by selector guessing, so it
+    # can only earn credit, never cost it.
+    score = 0
+    if spf["found"] and spf["valid"]:
+        score += 2
+        if spf["policy"].startswith("-all"):
+            score += 1
+        elif spf["policy"].startswith("+all"):
+            score -= 2
+    if dmarc["found"] and dmarc["valid"]:
+        score += 2
+        if dmarc["policy"].startswith("reject"):
+            score += 2
+        elif dmarc["policy"].startswith("quarantine"):
+            score += 1
+        if (dmarc["pct"] or 100) < 100:
+            score -= 1
+    if dkim["found"]:
+        score += 1
+    if mta_sts:
+        score += 1
+    results["email_security"]["score"] = score
+    results["email_security"]["grade"] = (
+        "A" if score >= 8 else "B" if score >= 6 else "C" if score >= 4
+        else "D" if score >= 2 else "F")
 
     return results
 

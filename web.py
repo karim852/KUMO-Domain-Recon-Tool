@@ -853,9 +853,31 @@ function renderContent(id, data) {
     if(data.records) Object.entries(data.records).forEach(([t,vals])=>{h+=kv(t,`<span class="c-dim mono" style="font-size:10px">${escH(vals.map(v=>v.length>70?v.slice(0,67)+'…':v).join(' · '))}</span>`);});
     const es=data.email_security||{};
     h+='<div class="sec">Email Security</div>';
-    const spf=es.spf||{};h+=kv('SPF',spf.found?`<span class="c-green">✓ ${escH(spf.policy)}</span>`:`<span class="c-red">✗ Not found</span>`);
-    const dm=es.dmarc||{};h+=kv('DMARC',dm.found?`<span class="c-green">✓ ${escH(dm.policy)}</span>`:`<span class="c-red">✗ Missing — spoofing risk</span>`);
-    const dk=es.dkim||{};h+=kv('DKIM',dk.found?`<span class="c-green">✓ selector=${escH(dk.selector)}</span>`:`<span class="c-yellow">⚠ Not found</span>`);
+    if(es.grade) h+=kv('Grade',`<span class="c-cyan mono">${escH(es.grade)}</span>`);
+    const spf=es.spf||{};
+    h+=kv('SPF',spf.found?(spf.valid?`<span class="c-green">✓ ${escH(spf.policy)}</span>`
+                                    :`<span class="c-red">✗ ${escH(spf.policy)}</span>`)
+                 : spf.lookup_failed?`<span class="c-yellow">⚠ Lookup failed — not determined</span>`
+                                    :`<span class="c-red">✗ Not found</span>`);
+    const dm=es.dmarc||{};
+    h+=kv('DMARC',dm.found?(dm.valid?`<span class="c-green">✓ ${escH(dm.policy)}</span>`
+                                    :`<span class="c-red">✗ ${escH(dm.policy)}</span>`)
+                 : dm.lookup_failed?`<span class="c-yellow">⚠ Lookup failed — not determined</span>`
+                                   :`<span class="c-red">✗ Missing — spoofing risk</span>`);
+    const dk=es.dkim||{};
+    // Selectors cannot be enumerated, so a miss is "not found at known
+    // selectors", never proof the domain does not sign its mail.
+    h+=kv('DKIM',dk.found?`<span class="c-green">✓ selector=${escH((dk.selectors_found||[dk.selector]).slice(0,4).join(', '))}</span>`
+                         :`<span class="c-yellow">⚠ No key at ${dk.selectors_tried||0} known selectors</span>`);
+    ['mta_sts','tls_rpt','bimi'].forEach(k=>{
+      const d=es[k]||{};
+      if(d.found) h+=kv(k==='mta_sts'?'MTA-STS':k==='tls_rpt'?'TLS-RPT':'BIMI',`<span class="c-green">✓ present</span>`);
+    });
+    ['spf','dmarc','dkim'].forEach(k=>{
+      ((es[k]||{}).notes||[]).forEach(n=>{
+        h+=`<div class="alert a-yellow" style="font-size:10px;padding:4px 7px;margin:3px 0">${k.toUpperCase()}: ${escH(n)}</div>`;
+      });
+    });
     return h;
   }
   case 'geo':{
