@@ -376,7 +376,7 @@ joined with no separator (RFC 7208 §3.3). Long SPF and DKIM records were read
 with the quotes still in them. `_txt_values` joins them the way a resolver
 does.
 
-`test_email.py` covers all of this: the record shapes, and `scan_dns` end to
+`test_email_security.py` covers all of this: the record shapes, and `scan_dns` end to
 end through a stubbed resolver, including the case where absence must NOT be
 claimed.
 

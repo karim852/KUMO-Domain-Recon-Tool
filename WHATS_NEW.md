@@ -44,7 +44,7 @@ Also added: **MTA-STS, TLS-RPT and BIMI** detection, a `pct<100` warning (a
 sampled DMARC policy is commonly mistaken for full enforcement), and an email
 security **grade** the web UI already had a slot for.
 
-New `test_email.py`: every record shape, plus `scan_dns` end to end through a
+New `test_email_security.py`: every record shape, plus `scan_dns` end to end through a
 stubbed resolver — including the case where absence must *not* be claimed.
 
 

@@ -1,5 +1,10 @@
 """
-Email-security parsing tests: SPF, DMARC, DKIM, MTA-STS.
+Tests for the EMAIL SECURITY section of the DNS module (engine.scan_dns).
+
+This covers the SPF / DMARC / DKIM / MTA-STS records that scan_dns reads and
+returns under result["email_security"]. It has nothing to do with the
+email_harvest module (which scrapes addresses off the site) or breachintel —
+those are separate modules and are not exercised here.
 
 These records are tag-value strings, and the tempting way to read them is a
 substring search. That is wrong in ways that invert the finding — 'p=none' is a
@@ -7,7 +12,7 @@ substring of 'sp=none', so a domain publishing 'p=reject; sp=none' was reported
 as not enforcing DMARC. Every case below is a shape that broke, or must keep
 working.
 
-    python3 test_email.py
+    python3 test_email_security.py
 """
 import warnings
 
