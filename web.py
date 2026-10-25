@@ -643,6 +643,21 @@ body{background:
 
   <!-- RIGHT: sticky dorks + osint panel -->
   <div class="right-panel" id="rightPanel">
+
+    <div style="padding-bottom:12px;margin-bottom:4px;border-bottom:1px solid var(--border)">
+      <div class="right-section-title">🧰 <span>More tools</span></div>
+      <a href="https://github.com/karim852/kumo-recon-browser-extension" target="_blank" rel="noopener"
+         style="display:block;text-decoration:none;border:1px solid var(--border2);border-left:3px solid var(--accent, var(--cyan));border-radius:6px;padding:9px 10px;margin-bottom:7px">
+        <div style="font-weight:700;font-size:11.5px;color:var(--text)">🕸 Kumo Recon <span style="color:var(--text3);font-weight:400">· browser extension</span></div>
+        <div style="font-size:10.5px;color:var(--text2);margin-top:3px">Recon any site you are on. One click, no install, nothing touches the target.</div>
+      </a>
+      <a href="https://github.com/karim852/Kage-DFIR-toolkit" target="_blank" rel="noopener"
+         style="display:block;text-decoration:none;border:1px solid rgba(227,179,65,.35);border-left:3px solid var(--yellow);border-radius:6px;padding:9px 10px;background:rgba(227,179,65,.05)">
+        <div style="font-weight:700;font-size:11.5px;color:var(--yellow)">🌑 Kage 影 <span style="color:var(--text3);font-weight:400">· DFIR toolkit</span></div>
+        <div style="font-size:10.5px;color:var(--text2);margin-top:3px">Is your machine actually clean? Triage a Windows host and find out.</div>
+      </a>
+    </div>
+
     <div>
       <div class="right-section-title">🔍 <span>Google Dorks</span> <span class="badge b-info" style="margin-left:auto">61 queries</span></div>
       <div style="color:var(--text3);font-size:10px;margin-bottom:10px;font-family:'JetBrains Mono',monospace">Click any query to search ·</div>
@@ -653,19 +668,6 @@ body{background:
       <div id="osintPanel"><div style="color:var(--text3);font-size:11px;text-align:center;padding:20px 0">Run a scan to generate links</div></div>
     </div>
 
-    <div style="border-top:1px solid var(--border);padding-top:12px;margin-top:4px">
-      <div class="right-section-title">🧰 <span>More tools</span></div>
-      <a href="https://github.com/karim852/kumo-recon-browser-extension" target="_blank" rel="noopener"
-         style="display:block;text-decoration:none;border:1px solid var(--border2);border-radius:6px;padding:8px 9px;margin-bottom:6px">
-        <div style="font-weight:700;font-size:11px;color:var(--text)">🕸 Kumo Recon — browser extension</div>
-        <div style="font-size:10px;color:var(--text3);margin-top:2px">the passive modules, straight from the browser</div>
-      </a>
-      <a href="https://github.com/karim852/Kage-DFIR-toolkit" target="_blank" rel="noopener"
-         style="display:block;text-decoration:none;border:1px solid var(--border2);border-radius:6px;padding:8px 9px">
-        <div style="font-weight:700;font-size:11px;color:var(--text)">🌑 Kage 影 — DFIR toolkit</div>
-        <div style="font-size:10px;color:var(--text3);margin-top:2px">Windows host triage, same author</div>
-      </a>
-    </div>
   </div>
 
 </div>

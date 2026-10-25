@@ -320,12 +320,15 @@ def home_screen():
 
 
 def ecosystem():
-    """Two sibling tools, one line each. Kept to the bottom of the home screen
-    so it is findable without competing with the module menu."""
-    print(f"  {C.DM}🕸 browser extension{C.RS}  {C.GR}"
-          f"github.com/karim852/kumo-recon-browser-extension{C.RS}")
-    print(f"  {C.DM}🌑 Kage 影 · DFIR{C.RS}     {C.GR}"
-          f"github.com/karim852/Kage-DFIR-toolkit{C.RS}\n")
+    """The two sibling tools. Kage keeps its own yellow so it reads as a
+    separate thing rather than part of Kumo."""
+    print(f"  {C.ACC}🕸 Kumo Recon{C.RS} {C.DM}· browser extension{C.RS}")
+    print(f"    {C.DM}Recon any site you are on. One click, no install.{C.RS}")
+    print(f"    {C.GR}github.com/karim852/kumo-recon-browser-extension{C.RS}")
+    print(f"  {C.Y}🌑 Kage 影{C.RS} {C.DM}· DFIR toolkit{C.RS}")
+    print(f"    {C.DM}Is your machine actually clean? Triage a Windows host "
+          f"and find out.{C.RS}")
+    print(f"    {C.GR}github.com/karim852/Kage-DFIR-toolkit{C.RS}\n")
 
 
 # ═══════════════════════════════════════════════════════════════
