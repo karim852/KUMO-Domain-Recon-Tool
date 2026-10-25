@@ -90,14 +90,45 @@ VERSION_CASES = [
     ("php2shell-unpatched-php", {"X-Powered-By": "PHP/8.3.36"}, False, "IS the 8.3 fix"),
     ("php2shell-unpatched-php", {"X-Powered-By": "PHP/8.5.11"}, True,  "below 8.5.12 fix"),
     ("php2shell-unpatched-php", {"X-Powered-By": "PHP/8.5.12"}, False, "IS the 8.5 fix"),
-    ("php2shell-unpatched-php", {"X-Powered-By": "PHP/8.1.33"}, True,  "8.1 EOL, no fix"),
-    ("php2shell-unpatched-php", {"X-Powered-By": "PHP/7.4.33"}, True,  "7.4 EOL"),
-    ("php2shell-unpatched-php", {"X-Powered-By": "PHP/5.3.29"}, False, "below min_affected"),
+    # end-of-life branches: affected, and no upstream release will ever fix them
+    ("php2shell-unpatched-php", {"X-Powered-By": "PHP/8.1.33"}, True,  "8.1 EOL"),
+    ("php2shell-unpatched-php", {"X-Powered-By": "PHP/8.1.0"},  True,  "8.1.0 EOL"),
+    ("php2shell-unpatched-php", {"X-Powered-By": "PHP/8.0.30"}, True,  "8.0 EOL"),
+    # PHP 7.x — every branch, oldest to newest
+    ("php2shell-unpatched-php", {"X-Powered-By": "PHP/7.4.33"}, True,  "7.4 (backport issued)"),
+    ("php2shell-unpatched-php", {"X-Powered-By": "PHP/7.3.33"}, True,  "7.3 (distro patched)"),
+    ("php2shell-unpatched-php", {"X-Powered-By": "PHP/7.2.24"}, True,  "7.2 (distro patched)"),
+    ("php2shell-unpatched-php", {"X-Powered-By": "PHP/7.1.33"}, True,  "7.1"),
+    ("php2shell-unpatched-php", {"X-Powered-By": "PHP/7.0.33"}, True,  "7.0"),
+    ("php2shell-unpatched-php", {"X-Powered-By": "PHP/7.0.0"},  True,  "7.0.0"),
+    # PHP 5.x — including below the 5.4 bound some write-ups quote
+    ("php2shell-unpatched-php", {"X-Powered-By": "PHP/5.6.40"}, True,  "5.6"),
+    ("php2shell-unpatched-php", {"X-Powered-By": "PHP/5.5.38"}, True,  "5.5"),
+    ("php2shell-unpatched-php", {"X-Powered-By": "PHP/5.4.45"}, True,  "5.4"),
+    ("php2shell-unpatched-php", {"X-Powered-By": "PHP/5.4.0"},  True,  "5.4.0"),
+    ("php2shell-unpatched-php", {"X-Powered-By": "PHP/5.3.29"}, True,  "5.3 (NVD has no lower bound)"),
+    ("php2shell-unpatched-php", {"X-Powered-By": "PHP/5.2.17"}, True,  "5.2"),
+    ("php2shell-unpatched-php", {"X-Powered-By": "PHP/5.0.0"},  True,  "5.0.0 lower bound"),
+    ("php2shell-unpatched-php", {"X-Powered-By": "PHP/4.4.9"},  False, "PHP 4 predates the code"),
+    # parsing and evidence discipline
     ("php2shell-unpatched-php", {"Server": "Apache/2.4.41 (Ubuntu) PHP/8.3.10"}, True, "via Server header"),
     ("php2shell-unpatched-php", {"X-Powered-By": "PHP/8.3.7-1ubuntu2"}, True, "distro suffix"),
+    ("php2shell-unpatched-php", {"X-Powered-By": "PHP/7.4"},    True,  "two-component version"),
     ("php2shell-unpatched-php", {"X-Powered-By": "PHP"}, False, "no version -> no guess"),
     ("php2shell-unpatched-php", {"X-Powered-By": "ASP.NET"}, False, "not PHP"),
     ("php2shell-unpatched-php", {"Server": "nginx"}, False, "nothing advertised"),
+
+    # ── end-of-life rule: fires only on unsupported branches ──
+    ("php-eol-runtime", {"X-Powered-By": "PHP/5.6.40"}, True,  "5.6 is EOL"),
+    ("php-eol-runtime", {"X-Powered-By": "PHP/7.4.33"}, True,  "7.4 is EOL"),
+    ("php-eol-runtime", {"X-Powered-By": "PHP/8.0.30"}, True,  "8.0 is EOL"),
+    ("php-eol-runtime", {"X-Powered-By": "PHP/8.1.33"}, True,  "8.1 is EOL"),
+    ("php-eol-runtime", {"X-Powered-By": "PHP/8.2.34"}, False, "8.2 supported, just unpatched"),
+    ("php-eol-runtime", {"X-Powered-By": "PHP/8.2.35"}, False, "8.2 supported and patched"),
+    ("php-eol-runtime", {"X-Powered-By": "PHP/8.4.27"}, False, "8.4 supported"),
+    ("php-eol-runtime", {"X-Powered-By": "PHP/8.5.12"}, False, "8.5 supported"),
+    ("php-eol-runtime", {"X-Powered-By": "PHP"},        False, "no version -> no guess"),
+    ("php-eol-runtime", {"Server": "nginx"},            False, "nothing advertised"),
 ]
 
 # ── responses that must NEVER trigger any rule ──

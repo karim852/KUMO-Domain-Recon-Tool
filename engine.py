@@ -1558,30 +1558,70 @@ VULN_RULES = [
     # state on the target; that is exploitation, not reconnaissance, so none of
     # it is implemented here.
     #
-    # 8.1 and below are end-of-life with no upstream fix, so any version at or
-    # above 5.4.0 in those branches is affected. A version at or above its
-    # branch's fix is NOT reported.
+    # Scope. PHP's own advisories enumerate only 8.2-8.5, because those are the
+    # branches it still supports. NVD records no lower bound at all — every
+    # version below 8.2.35 — and the older branches are affected in practice:
+    # PHP issued source backports for 7.4, 8.0 and 8.1, and distributions
+    # patched as far back as 7.2. So every branch without an entry in fixed_in
+    # is treated as affected, which covers 8.1, 8.0, all of 7.x and all of 5.x.
+    # min_affected only guards against a nonsense parse; PHP 4 predates the
+    # affected request-handling code and is far outside any advisory.
+    #
+    # A version at or above its branch's fix is never reported.
     {
         "id": "php2shell-unpatched-php",
         "name": "PHP Runtime Unpatched for php2shell RCE (CVE-2026-109618/109619)",
         "severity": "high", "path": "/", "matchers_condition": "and",
-        "origin": "kumo-version",
+        "origin": "kumo-version", "confidence": "version-inference",
         "description": (
             "The PHP version advertised by this host predates the php2shell fixes "
             "(8.2.35 / 8.3.36 / 8.4.27 / 8.5.12, released 2026-10-21). CVE-2026-109618 "
             "and CVE-2026-109619 are unauthenticated remote code execution bugs in the "
-            "PHP runtime, both CVSS 9.2; application code cannot mitigate them. "
-            "Branches 8.1 and earlier are end-of-life and have no upstream fix. "
-            "This is a version-boundary check against the server's own header, not an "
-            "exploit attempt: confirm before acting, because a distribution that "
-            "backports security fixes can still advertise an older upstream version. "
-            "Remediation: upgrade PHP and restart every PHP worker."),
+            "PHP runtime, both CVSS 9.2; application code cannot mitigate them. PHP's "
+            "advisories list only 8.2-8.5 because older branches are out of support, "
+            "but NVD records no lower bound and backports were issued down to 7.4, so "
+            "7.x and 5.x are affected and will never receive an upstream release. "
+            "CONFIRM BEFORE REPORTING: this is a version comparison against the "
+            "server's own header, not an exploit attempt, and Ubuntu and RHEL backport "
+            "the patch WITHOUT changing the version number — a fixed Ubuntu 24.04 "
+            "php8.3 still reports 8.3.6. On those distributions check the package "
+            "version (dpkg/rpm -q), not the PHP version. Debian ships the new upstream "
+            "release, so there the version does change. "
+            "Remediation: upgrade PHP and restart every PHP worker, including "
+            "php-fpm, mod_php and any container still mapping the old binary."),
         "matchers": [
             {"type": "version", "part": "header",
              "regex": r'(?:X-Powered-By|Server):[^\r\n]*?PHP/(\d+\.\d+(?:\.\d+)?)',
-             "min_affected": "5.4.0",
+             "min_affected": "5.0.0",
              "fixed_in": {"8.2": "8.2.35", "8.3": "8.3.36",
                           "8.4": "8.4.27", "8.5": "8.5.12"},
+             "unfixed_branches_affected": True},
+        ],
+    },
+
+    # A separate, independently true fact about the same hosts: branches up to
+    # 8.1 receive no security updates from PHP at all. That is a different
+    # finding from "unpatched for one CVE" and carries a different remedy
+    # (migrate, not patch), so it is reported on its own rather than folded into
+    # the rule above. A supported-but-unpatched host (8.2.34, say) gets only the
+    # php2shell finding; an end-of-life host gets both.
+    {
+        "id": "php-eol-runtime",
+        "name": "End-of-Life PHP Runtime (no security updates)",
+        "severity": "medium", "path": "/", "matchers_condition": "and",
+        "origin": "kumo-version", "confidence": "version-inference",
+        "description": (
+            "This host advertises a PHP branch that has reached end of life. PHP 8.1 "
+            "and earlier receive no security releases, so vulnerabilities found from "
+            "now on will never be fixed upstream for this runtime; php2shell "
+            "(CVE-2026-109618/109619) is one current example. Some distributions "
+            "backport selected fixes to end-of-life branches, which keeps the version "
+            "number unchanged, so verify the package version before reporting this as "
+            "unmaintained. Remediation: migrate to a supported branch (8.2 or later)."),
+        "matchers": [
+            {"type": "version", "part": "header",
+             "regex": r'(?:X-Powered-By|Server):[^\r\n]*?PHP/(\d+\.\d+(?:\.\d+)?)',
+             "min_affected": "5.0.0", "max_affected": "8.1.999",
              "unfixed_branches_affected": True},
         ],
     },
@@ -4410,6 +4450,11 @@ def _run_vuln_rules(domain, base_sigs=None, timeout=7, brand=None):
                         "description": rule.get("description", ""),
                         "rule_id": rule["id"],
                         "source": "rule_playbook",
+                        # "confirmed" means the response itself carried the
+                        # evidence. A version rule only compared a number the
+                        # server advertised, which a backported distro patch can
+                        # leave stale, so it says so rather than implying proof.
+                        "confidence": rule.get("confidence", "confirmed"),
                     })
             return
 

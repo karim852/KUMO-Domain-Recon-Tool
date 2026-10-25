@@ -1,17 +1,19 @@
 # Kumo vulnerability playbook
 
-**419 rules.** Every one is a GET plus a response signature: Kumo probes a path and matches evidence in the reply. No rule sends a payload, executes anything, or interacts with what it finds.
+**420 rules.** Every one is a GET plus a response signature: Kumo probes a path and matches evidence in the reply. No rule sends a payload, executes anything, or interacts with what it finds.
 
-Each is validated by `test_rules.py` against 11 decoy responses, the dead-rule check proves its evidence survives its own path scrub, and version-boundary rules are checked against both their vulnerable and their patched releases.
+Validation: `test_rules.py` runs every rule against 11 decoy responses, proves each rule's evidence survives its own path scrub, and checks version rules against both vulnerable and patched releases. `test_versions.py` repeats the version checks over real HTTP. `test_fp.py` scans nine benign host shapes. `test_live.py` scans the vulnerable lab.
+
+Findings carry a `confidence` field. `confirmed` means the response itself held the evidence; `version-inference` means only an advertised version number was compared, which a backported distro patch can leave stale — verify those before reporting.
 
 | severity | count |
 |---|---|
 | critical | 58 |
 | high | 162 |
-| medium | 136 |
+| medium | 137 |
 | low | 63 |
 
-**Origin:** nuclei 338, handwritten 31, kumo-webshell 27, nuclei-unauth 23
+**Origin:** nuclei 338, handwritten 32, kumo-webshell 27, nuclei-unauth 23
 
 | # | severity | id | path | name |
 |---|---|---|---|---|
@@ -334,103 +336,104 @@ Each is validated by `test_rules.py` against 11 decoy responses, the dead-rule c
 | 317 | medium | `perfsonar-toolkit` | `/toolkit/` | perfSONAR Toolkit - Exposure |
 | 318 | medium | `pghero-dashboard-exposure` | `/connections` | PgHero Dashboard Exposure Panel - Detect |
 | 319 | medium | `phinx-config` | `/phinx.yml` | Phinx Configuration Exposure |
-| 320 | medium | `php-user-ini-disclosure` | `/user.ini` | Php User.ini Disclosure |
-| 321 | medium | `plesk-stat` | `/plesk-stat/` | Webalizer Log Analyzer Configuration - Detect |
-| 322 | medium | `prisma-schema-exposure` | `/schema.prisma` | Exposed Prisma Database Schema - Exposure |
-| 323 | medium | `prometheus-metrics` | `/metrics` | Prometheus Metrics Exposed |
-| 324 | medium | `prometheus-metrics` | `/metrics` | Prometheus Metrics - Detect |
-| 325 | medium | `prometheus-promtail` | `/service-discovery` | Prometheus Promtail - Exposure |
-| 326 | medium | `putty-private-key-disclosure` | `/my.ppk` | Putty Private Key Disclosure |
-| 327 | medium | `pyramid-debug-toolbar` | `/_debug_toolbar/` | Pyramid Debug Toolbar |
-| 328 | medium | `rails-secret-token-disclosure` | `/config/initializers/secret_token.rb` | Ruby on Rails Secret Token Disclosure |
-| 329 | medium | `redis-config` | `/redis.conf` | Redis Configuration File - Detect |
-| 330 | medium | `redmine-issues-exposure` | `/issues.json` | Redmine Issues - Exposure |
-| 331 | medium | `redpanda-console` | `/overview` | Redpanda Console - Exposure |
-| 332 | medium | `secret-token-rb` | `/secret_token.rb` | Secret Token Ruby - File Disclosure |
-| 333 | medium | `sensitive-storage-data-expose` | `/storage/` | Sensitive Storage Data - Detect |
-| 334 | medium | `service-account-credentials` | `/assets/other/service-account-credentials.json` | Service Account Credentials File Disclosure |
-| 335 | medium | `slurm-hpc-dashboard` | `/slurm/` | Slurm HPC Dashboard - Detect |
-| 336 | medium | `sonarqube` | `/api/system/status` | SonarQube Exposed |
-| 337 | medium | `sonarqube-projects-disclosure` | `/api/components/search_projects` | SonarQube - Information Disclosure |
-| 338 | medium | `sound4-directory-listing` | `/log/` | SOUND4 Impact/Pulse/First/Eco <=2.x - Information Disclosure |
-| 339 | medium | `springboot-gateway` | `/gateway/routes` | Detect Spring Gateway Actuator |
-| 340 | medium | `ssh-authorized-keys` | `/.ssh/authorized_keys` | SSH Authorized Keys File - Detect |
-| 341 | medium | `svn-wc-db` | `/.svn/wc.db` | SVN wc.db File Exposure |
-| 342 | medium | `swagger-spec` | `/swagger.json` | Swagger/OpenAPI Spec Exposed |
-| 343 | medium | `tcpconfig` | `/tcpconfig.html` | Rockwell Automation TCP/IP Configuration Information - Detect |
-| 344 | medium | `teampass-ldap` | `/files/ldap.debug.txt` | Teampass LDAP Debug Config - Detect |
-| 345 | medium | `teslamate-unauth-access` | `/settings` | TeslaMate - Unauthenticated Access |
-| 346 | medium | `transmission-dashboard` | `/transmission/web/` | Transmission Dashboard - Detect |
-| 347 | medium | `unauth-fastvue-dashboard` | `/dashboard.aspx` | Fastvue Dashboard Panel - Unauthenticated Detect |
-| 348 | medium | `unauthenticated-duplicator-disclosure` | `/wp-content/backups-dup-lite/tmp/` | WordPress Duplicator Plugin - Information disclosure |
-| 349 | medium | `untangle-admin-setup` | `/setup/setup.do` | Untangle Exposed Admin Signup |
-| 350 | medium | `vercel-source-exposure` | `/_src` | Vercel Source Code Exposure |
-| 351 | medium | `wordfence-config-disclosure` | `/wp-content/wflogs/config.php` | WordPress Wordfence - Configuration File Disclosure |
-| 352 | medium | `wordfence-rules-disclosure` | `/wp-content/wflogs/rules.php` | WordPress Wordfence - Rules File Disclosure |
-| 353 | medium | `wp-user-enum` | `/wp-json/wp/v2/users` | WordPress User Enumeration |
-| 354 | medium | `xprober-service` | `/xprober.php` | X Prober Server - Information Disclosure |
-| 355 | medium | `zabbix-dashboards-access` | `/zabbix/zabbix.php?action=dashboard.list` | zabbix-dashboards-access |
-| 356 | medium | `zen-cart-log-exposure` | `/logs/` | Zen Cart Log File Exposure |
-| 357 | low | `3cx-config` | `/SetupConfig.xml` | 3CX Config - File Disclosure |
-| 358 | low | `aem-osgi-bundles` | `/bin.tidy.infinity.json` | Adobe AEM Installed OSGI Bundles |
-| 359 | low | `airflow-debug` | `/admin/airflow/login` | Airflow Debug Trace |
-| 360 | low | `codeception-config` | `/codeception.yml` | Codeception YAML Configuration File - Detect |
-| 361 | low | `database-credentials` | `/database_credentials.inc` | Database Credentials File Exposure |
-| 362 | low | `debug-vars` | `/debug/vars` | Golang Expvar - Detect |
-| 363 | low | `dlink-unauth-cgi-script` | `/cgi-bin/info.cgi` | D-Link DNS Series  CGI Script - Unauthenticated |
-| 364 | low | `domcfg-page` | `/domcfg.nsf` | Lotus Domino Configuration Page |
-| 365 | low | `drupal-directory-listing` | `/sites/` | Drupal Directory Listing |
-| 366 | low | `editor-exposure` | `/.editorconfig` | Editor Configuration File - Detect |
-| 367 | low | `elasticsearch` | `/_cluster/health?pretty` | ElasticSearch Information Disclosure |
-| 368 | low | `exposed-bitkeeper` | `/BitKeeper/etc/config` | BitKeeper Configuration - Detect |
-| 369 | low | `firebase-debug-log` | `/firebase-debug.log` | Firebase Debug Log File Exposure |
-| 370 | low | `firebase-detect` | `/.settings/rules.json?auth=FIREBASE_SECRET` | firebase detect |
-| 371 | low | `go-pprof-debug` | `/debug/pprof/heap?debug=1` | Go pprof Debug Page |
-| 372 | low | `imageresizer-debug-exposure` | `/resizer.debug.ashx` | ImageResizer Debug - Information Exposure |
-| 373 | low | `intelbras-dvr-unauth` | `/cap.js` | Intelbras DVR - Unrestricted Access |
-| 374 | low | `javascript-env` | `/env.js` | JavaScript Environment Configuration - Detect |
-| 375 | low | `jfrog-artifactory-exposure` | `/artifactory/api/repositories` | JFrog Artifactory Artifacts Exposure |
-| 376 | low | `joomla-config-dist-file` | `/configuration.php-dist` | Joomla! Configuration File - Detect |
-| 377 | low | `joomla-fpd` | `/administrator/manifests/files/joomla.xml` | Joomla! - Full Path Disclosure |
-| 378 | low | `keycloak-admin-console-config` | `/admin/master/console/config` | Keycloak Admin Console Configuration Disclosure |
-| 379 | low | `librechat-config-exposure` | `/api/config` | librechat - Config Exposure |
-| 380 | low | `ms-front-page-misconfig` | `/_vti_inf.html` | Microsoft FrontPage Configuration - Exposure |
-| 381 | low | `npm-debug-log` | `/npm-debug.log` | NPM Debug Log Disclosure |
-| 382 | low | `oauth-credentials-json` | `/oauth-credentials.json` | Oauth Credentials Json |
-| 383 | low | `openstack-config` | `/info` | Openstack - Infomation Disclosure |
-| 384 | low | `platformio-ini` | `/platformio.ini` | Platformio Config File Disclosure |
-| 385 | low | `prometheus-log` | `/prometheus` | Exposed Prometheus |
-| 386 | low | `protractor-config` | `/protractor.conf.js` | Protractor Configuration Exposure |
-| 387 | low | `psalm-config` | `/psalm.xml` | Psalm Configuration Exposure - Detect |
-| 388 | low | `python-setup-config` | `/setup.py` | Python Setup Configuration - Exposure |
-| 389 | low | `ruijie-phpinfo` | `/tool/view/phpinfo.view.php` | Ruijie Phpinfo Configuration - Detect |
-| 390 | low | `shell-history` | `/.bash_history` | Shell History |
-| 391 | low | `sitecore-debug-page` | `/sitecore/'` | SiteCore Debug Page |
-| 392 | low | `sonarqube-public-projects` | `/api/components/suggestions?recentlyBrowsed=` | Sonarqube with public projects |
-| 393 | low | `springboot-autoconfig` | `/autoconfig` | Detect Springboot autoconfig Actuator |
-| 394 | low | `springboot-beans` | `/beans` | Detect Springboot Beans Actuator |
-| 395 | low | `springboot-caches` | `/caches` | Springboot Actuator Caches |
-| 396 | low | `springboot-conditions` | `/conditions` | Detect Springboot Conditions Actuator |
-| 397 | low | `springboot-configprops` | `/configprops` | Detect Springboot Configprops Actuator |
-| 398 | low | `springboot-dump` | `/dump` | Detect Springboot Dump Actuator |
-| 399 | low | `springboot-env` | `/env` | Springboot Env Actuator - Detect |
-| 400 | low | `springboot-features` | `/features` | Detects Springboot Features Actuator |
-| 401 | low | `springboot-flyway` | `/flyway` | Springboot Flyway API |
-| 402 | low | `springboot-httpexchanges` | `/httpexchanges` | Detects Springboot HTTP Exchanges Actuator |
-| 403 | low | `springboot-httptrace` | `/httptrace` | Detect Springboot httptrace |
-| 404 | low | `springboot-integrationgraph` | `/integrationgraph` | Springboot Actuator integrationgraph |
-| 405 | low | `springboot-jolokia` | `/jolokia` | Detects Springboot Jolokia Actuator |
-| 406 | low | `springboot-liquidbase` | `/liquibase` | Springboot Liquidbase API |
-| 407 | low | `springboot-logfile` | `/logfile` | Detects Springboot Logfile Actuator |
-| 408 | low | `springboot-loggers` | `/loggers` | Springboot Loggers - Exposure |
-| 409 | low | `springboot-sbom` | `/sbom` | Spring Boot Actuator SBOM - Exposure |
-| 410 | low | `springboot-startup` | `/startup` | Springboot Actuator startup |
-| 411 | low | `springboot-threaddump` | `/threaddump` | Detect Springboot Thread Dump page |
-| 412 | low | `token-json` | `/token.json` | Token Json File Disclosure |
-| 413 | low | `tomcat-cookie-exposed` | `/examples/servlets/servlet/CookieExample` | Tomcat Cookie Exposed |
-| 414 | low | `umbraco-miniprofiler-exposure` | `/mini-profiler-resources/results` | Umbraco Mini Profiler - Exposure |
-| 415 | low | `unauthenticated-nginx-dashboard` | `/dashboard.html` | Nginx Dashboard |
-| 416 | low | `victoriametrics-vmagent-api-exposure` | `/api/v1/targets` | VictoriaMetrics vmagent - Unauthenticated Targets Exposure |
-| 417 | low | `vscode-mcp-json` | `/mcp.json` | Visual Studio Code MCP Configuration ("mcp.json") Exposure |
-| 418 | low | `wordpress-wp-env-exposure` | `/.wp-env.json` | WordPress Configuration wp-env - Exposure |
-| 419 | low | `yii-debugger` | `/debug/default/view.html` | View Yii Debugger Information |
+| 320 | medium | `php-eol-runtime` | `/` | End-of-Life PHP Runtime (no security updates) |
+| 321 | medium | `php-user-ini-disclosure` | `/user.ini` | Php User.ini Disclosure |
+| 322 | medium | `plesk-stat` | `/plesk-stat/` | Webalizer Log Analyzer Configuration - Detect |
+| 323 | medium | `prisma-schema-exposure` | `/schema.prisma` | Exposed Prisma Database Schema - Exposure |
+| 324 | medium | `prometheus-metrics` | `/metrics` | Prometheus Metrics Exposed |
+| 325 | medium | `prometheus-metrics` | `/metrics` | Prometheus Metrics - Detect |
+| 326 | medium | `prometheus-promtail` | `/service-discovery` | Prometheus Promtail - Exposure |
+| 327 | medium | `putty-private-key-disclosure` | `/my.ppk` | Putty Private Key Disclosure |
+| 328 | medium | `pyramid-debug-toolbar` | `/_debug_toolbar/` | Pyramid Debug Toolbar |
+| 329 | medium | `rails-secret-token-disclosure` | `/config/initializers/secret_token.rb` | Ruby on Rails Secret Token Disclosure |
+| 330 | medium | `redis-config` | `/redis.conf` | Redis Configuration File - Detect |
+| 331 | medium | `redmine-issues-exposure` | `/issues.json` | Redmine Issues - Exposure |
+| 332 | medium | `redpanda-console` | `/overview` | Redpanda Console - Exposure |
+| 333 | medium | `secret-token-rb` | `/secret_token.rb` | Secret Token Ruby - File Disclosure |
+| 334 | medium | `sensitive-storage-data-expose` | `/storage/` | Sensitive Storage Data - Detect |
+| 335 | medium | `service-account-credentials` | `/assets/other/service-account-credentials.json` | Service Account Credentials File Disclosure |
+| 336 | medium | `slurm-hpc-dashboard` | `/slurm/` | Slurm HPC Dashboard - Detect |
+| 337 | medium | `sonarqube` | `/api/system/status` | SonarQube Exposed |
+| 338 | medium | `sonarqube-projects-disclosure` | `/api/components/search_projects` | SonarQube - Information Disclosure |
+| 339 | medium | `sound4-directory-listing` | `/log/` | SOUND4 Impact/Pulse/First/Eco <=2.x - Information Disclosure |
+| 340 | medium | `springboot-gateway` | `/gateway/routes` | Detect Spring Gateway Actuator |
+| 341 | medium | `ssh-authorized-keys` | `/.ssh/authorized_keys` | SSH Authorized Keys File - Detect |
+| 342 | medium | `svn-wc-db` | `/.svn/wc.db` | SVN wc.db File Exposure |
+| 343 | medium | `swagger-spec` | `/swagger.json` | Swagger/OpenAPI Spec Exposed |
+| 344 | medium | `tcpconfig` | `/tcpconfig.html` | Rockwell Automation TCP/IP Configuration Information - Detect |
+| 345 | medium | `teampass-ldap` | `/files/ldap.debug.txt` | Teampass LDAP Debug Config - Detect |
+| 346 | medium | `teslamate-unauth-access` | `/settings` | TeslaMate - Unauthenticated Access |
+| 347 | medium | `transmission-dashboard` | `/transmission/web/` | Transmission Dashboard - Detect |
+| 348 | medium | `unauth-fastvue-dashboard` | `/dashboard.aspx` | Fastvue Dashboard Panel - Unauthenticated Detect |
+| 349 | medium | `unauthenticated-duplicator-disclosure` | `/wp-content/backups-dup-lite/tmp/` | WordPress Duplicator Plugin - Information disclosure |
+| 350 | medium | `untangle-admin-setup` | `/setup/setup.do` | Untangle Exposed Admin Signup |
+| 351 | medium | `vercel-source-exposure` | `/_src` | Vercel Source Code Exposure |
+| 352 | medium | `wordfence-config-disclosure` | `/wp-content/wflogs/config.php` | WordPress Wordfence - Configuration File Disclosure |
+| 353 | medium | `wordfence-rules-disclosure` | `/wp-content/wflogs/rules.php` | WordPress Wordfence - Rules File Disclosure |
+| 354 | medium | `wp-user-enum` | `/wp-json/wp/v2/users` | WordPress User Enumeration |
+| 355 | medium | `xprober-service` | `/xprober.php` | X Prober Server - Information Disclosure |
+| 356 | medium | `zabbix-dashboards-access` | `/zabbix/zabbix.php?action=dashboard.list` | zabbix-dashboards-access |
+| 357 | medium | `zen-cart-log-exposure` | `/logs/` | Zen Cart Log File Exposure |
+| 358 | low | `3cx-config` | `/SetupConfig.xml` | 3CX Config - File Disclosure |
+| 359 | low | `aem-osgi-bundles` | `/bin.tidy.infinity.json` | Adobe AEM Installed OSGI Bundles |
+| 360 | low | `airflow-debug` | `/admin/airflow/login` | Airflow Debug Trace |
+| 361 | low | `codeception-config` | `/codeception.yml` | Codeception YAML Configuration File - Detect |
+| 362 | low | `database-credentials` | `/database_credentials.inc` | Database Credentials File Exposure |
+| 363 | low | `debug-vars` | `/debug/vars` | Golang Expvar - Detect |
+| 364 | low | `dlink-unauth-cgi-script` | `/cgi-bin/info.cgi` | D-Link DNS Series  CGI Script - Unauthenticated |
+| 365 | low | `domcfg-page` | `/domcfg.nsf` | Lotus Domino Configuration Page |
+| 366 | low | `drupal-directory-listing` | `/sites/` | Drupal Directory Listing |
+| 367 | low | `editor-exposure` | `/.editorconfig` | Editor Configuration File - Detect |
+| 368 | low | `elasticsearch` | `/_cluster/health?pretty` | ElasticSearch Information Disclosure |
+| 369 | low | `exposed-bitkeeper` | `/BitKeeper/etc/config` | BitKeeper Configuration - Detect |
+| 370 | low | `firebase-debug-log` | `/firebase-debug.log` | Firebase Debug Log File Exposure |
+| 371 | low | `firebase-detect` | `/.settings/rules.json?auth=FIREBASE_SECRET` | firebase detect |
+| 372 | low | `go-pprof-debug` | `/debug/pprof/heap?debug=1` | Go pprof Debug Page |
+| 373 | low | `imageresizer-debug-exposure` | `/resizer.debug.ashx` | ImageResizer Debug - Information Exposure |
+| 374 | low | `intelbras-dvr-unauth` | `/cap.js` | Intelbras DVR - Unrestricted Access |
+| 375 | low | `javascript-env` | `/env.js` | JavaScript Environment Configuration - Detect |
+| 376 | low | `jfrog-artifactory-exposure` | `/artifactory/api/repositories` | JFrog Artifactory Artifacts Exposure |
+| 377 | low | `joomla-config-dist-file` | `/configuration.php-dist` | Joomla! Configuration File - Detect |
+| 378 | low | `joomla-fpd` | `/administrator/manifests/files/joomla.xml` | Joomla! - Full Path Disclosure |
+| 379 | low | `keycloak-admin-console-config` | `/admin/master/console/config` | Keycloak Admin Console Configuration Disclosure |
+| 380 | low | `librechat-config-exposure` | `/api/config` | librechat - Config Exposure |
+| 381 | low | `ms-front-page-misconfig` | `/_vti_inf.html` | Microsoft FrontPage Configuration - Exposure |
+| 382 | low | `npm-debug-log` | `/npm-debug.log` | NPM Debug Log Disclosure |
+| 383 | low | `oauth-credentials-json` | `/oauth-credentials.json` | Oauth Credentials Json |
+| 384 | low | `openstack-config` | `/info` | Openstack - Infomation Disclosure |
+| 385 | low | `platformio-ini` | `/platformio.ini` | Platformio Config File Disclosure |
+| 386 | low | `prometheus-log` | `/prometheus` | Exposed Prometheus |
+| 387 | low | `protractor-config` | `/protractor.conf.js` | Protractor Configuration Exposure |
+| 388 | low | `psalm-config` | `/psalm.xml` | Psalm Configuration Exposure - Detect |
+| 389 | low | `python-setup-config` | `/setup.py` | Python Setup Configuration - Exposure |
+| 390 | low | `ruijie-phpinfo` | `/tool/view/phpinfo.view.php` | Ruijie Phpinfo Configuration - Detect |
+| 391 | low | `shell-history` | `/.bash_history` | Shell History |
+| 392 | low | `sitecore-debug-page` | `/sitecore/'` | SiteCore Debug Page |
+| 393 | low | `sonarqube-public-projects` | `/api/components/suggestions?recentlyBrowsed=` | Sonarqube with public projects |
+| 394 | low | `springboot-autoconfig` | `/autoconfig` | Detect Springboot autoconfig Actuator |
+| 395 | low | `springboot-beans` | `/beans` | Detect Springboot Beans Actuator |
+| 396 | low | `springboot-caches` | `/caches` | Springboot Actuator Caches |
+| 397 | low | `springboot-conditions` | `/conditions` | Detect Springboot Conditions Actuator |
+| 398 | low | `springboot-configprops` | `/configprops` | Detect Springboot Configprops Actuator |
+| 399 | low | `springboot-dump` | `/dump` | Detect Springboot Dump Actuator |
+| 400 | low | `springboot-env` | `/env` | Springboot Env Actuator - Detect |
+| 401 | low | `springboot-features` | `/features` | Detects Springboot Features Actuator |
+| 402 | low | `springboot-flyway` | `/flyway` | Springboot Flyway API |
+| 403 | low | `springboot-httpexchanges` | `/httpexchanges` | Detects Springboot HTTP Exchanges Actuator |
+| 404 | low | `springboot-httptrace` | `/httptrace` | Detect Springboot httptrace |
+| 405 | low | `springboot-integrationgraph` | `/integrationgraph` | Springboot Actuator integrationgraph |
+| 406 | low | `springboot-jolokia` | `/jolokia` | Detects Springboot Jolokia Actuator |
+| 407 | low | `springboot-liquidbase` | `/liquibase` | Springboot Liquidbase API |
+| 408 | low | `springboot-logfile` | `/logfile` | Detects Springboot Logfile Actuator |
+| 409 | low | `springboot-loggers` | `/loggers` | Springboot Loggers - Exposure |
+| 410 | low | `springboot-sbom` | `/sbom` | Spring Boot Actuator SBOM - Exposure |
+| 411 | low | `springboot-startup` | `/startup` | Springboot Actuator startup |
+| 412 | low | `springboot-threaddump` | `/threaddump` | Detect Springboot Thread Dump page |
+| 413 | low | `token-json` | `/token.json` | Token Json File Disclosure |
+| 414 | low | `tomcat-cookie-exposed` | `/examples/servlets/servlet/CookieExample` | Tomcat Cookie Exposed |
+| 415 | low | `umbraco-miniprofiler-exposure` | `/mini-profiler-resources/results` | Umbraco Mini Profiler - Exposure |
+| 416 | low | `unauthenticated-nginx-dashboard` | `/dashboard.html` | Nginx Dashboard |
+| 417 | low | `victoriametrics-vmagent-api-exposure` | `/api/v1/targets` | VictoriaMetrics vmagent - Unauthenticated Targets Exposure |
+| 418 | low | `vscode-mcp-json` | `/mcp.json` | Visual Studio Code MCP Configuration ("mcp.json") Exposure |
+| 419 | low | `wordpress-wp-env-exposure` | `/.wp-env.json` | WordPress Configuration wp-env - Exposure |
+| 420 | low | `yii-debugger` | `/debug/default/view.html` | View Yii Debugger Information |

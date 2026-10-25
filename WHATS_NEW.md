@@ -5,14 +5,29 @@
 Two unauthenticated RCE bugs in the **PHP runtime**, both CVSS 9.2, fixed
 2026-10-21 in 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12. They sit in the runtime rather
 than in application code, so every PHP serving web requests is affected and
-sound application code does not protect a vulnerable install. 8.1 and earlier
-are end-of-life with no upstream fix.
+sound application code does not protect a vulnerable install.
 
-Kumo now flags an unpatched PHP runtime read from the server's own headers. It
+Kumo detects an unpatched runtime from the version the server advertises. It
 does **not** attempt the chain: the public PoC templates POST a crafted
 multipart body and write session files on the target, and two of them need an
 operator-supplied LFI path and session save path. That is exploitation, not
 reconnaissance.
+
+**Coverage includes the old branches.** PHP's advisories list only 8.2-8.5,
+because that is what it still supports, but NVD records no lower bound, PHP
+backported to 7.4/8.0/8.1, and AlmaLinux patched 7.2/7.3/7.4. So every branch
+with no fix of its own is treated as affected: 8.1, 8.0, all of 7.x, all of 5.x.
+`test_versions.py` checks 31 versions from 5.0.0 to 8.5.20 over real HTTP,
+through both the `X-Powered-By` and `Server` header forms.
+
+Two rules, because they are two different facts with different remedies:
+
+| rule | severity | says | remedy |
+|---|---|---|---|
+| `php2shell-unpatched-php` | high | runtime predates the fix | patch |
+| `php-eol-runtime` | medium | branch gets no security releases | migrate |
+
+A host on 8.2.34 gets the first only. A host on 7.4 gets both.
 
 This needed a new **`version` matcher type**, since a word matcher cannot do
 arithmetic on a version. It is strict by design: the version must be read from
@@ -20,10 +35,17 @@ the response (no version advertised means no finding, never a guess), a release
 at or above its branch's fix never matches, and end-of-life branches are opt-in.
 Reusable for any version-boundary CVE.
 
-Two new negative-control hosts back it: `phpfixed.fptest` runs the patched
-release and `phphidden.fptest` hides its version. Both must stay silent —
-a version rule that fires on a patched host trains operators to ignore it.
-`test_rules.py` checks 17 boundary cases.
+**Read the confidence field.** Findings now carry `confidence`. `confirmed`
+means the response held the evidence; `version-inference` means only a version
+number was compared. That matters here: Ubuntu and RHEL backport the patch
+*without* changing the version, so a fixed Ubuntu 24.04 php8.3 still reports
+8.3.6 and will be flagged. On those distributions check the package version
+(`dpkg -l`, `rpm -q`), not the PHP version. Debian ships the new upstream
+release, so there the number does change.
+
+Negative controls: `phpfixed.fptest` runs the patched release and
+`phphidden.fptest` hides its version. Both must stay silent — a version rule
+that fires on a patched host trains operators to ignore it.
 
 ## One more dead-rule bug
 

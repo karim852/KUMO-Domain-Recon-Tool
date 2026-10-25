@@ -216,6 +216,53 @@ Two new `fplab.py` hosts are the negative controls: `phpfixed.fptest` runs the
 must stay silent. A version rule that fires on a patched host is worse than no
 rule, because it teaches the operator to ignore it.
 
+### php2shell scope: what PHP published vs. what is affected
+
+PHP's own advisories (GHSA-w8hw-w9fx-j79w, GHSA-6wmf-4rv5-p3rp) enumerate only
+**8.2 through 8.5**, because those are the branches it still supports. That is
+not the affected range:
+
+* **NVD records no lower bound** — every version below 8.2.35.
+* PHP issued source backports for **7.4, 8.0 and 8.1**.
+* Distributions patched further still: AlmaLinux shipped fixes for **7.2, 7.3
+  and 7.4**.
+
+So Kumo treats every branch without an entry in `fixed_in` as affected, which
+covers 8.1, 8.0, all of 7.x and all of 5.x. `min_affected` sits at 5.0.0 purely
+to reject a nonsense parse; PHP 4 predates the affected request-handling code
+and appears in no advisory.
+
+`test_versions.py` exercises all of this over real HTTP: 31 versions from 5.0.0
+to 8.5.20, each through both the `X-Powered-By` and `Server` header forms.
+
+### The backport caveat is the real limit here
+
+Remote version detection cannot tell a patched Ubuntu or RHEL host from a
+vulnerable one. **Both report the same version number** — a fixed Ubuntu 24.04
+`php8.3` still reports 8.3.6, because those distributions backport the patch
+onto the version they already ship. Debian is different: it ships the new
+upstream release, so there the number does change.
+
+This is not something a scanner can resolve from the network, so Kumo does two
+things instead of pretending otherwise:
+
+* every finding carries a **`confidence`** field. `confirmed` means the response
+  itself held the evidence; `version-inference` means only a version number was
+  compared.
+* the rule description says plainly that on Ubuntu and RHEL the package version
+  (`dpkg -l`, `rpm -q`) is the thing to check, not the PHP version.
+
+A finding that cannot be confirmed remotely should say so, rather than being
+dressed up as proof.
+
+### Two rules, because they are two different facts
+
+`php2shell-unpatched-php` (high) says the runtime predates the fix — remedy:
+patch. `php-eol-runtime` (medium) says the branch gets no security releases at
+all — remedy: migrate. A host on 8.2.34 gets only the first; a host on 7.4 gets
+both, which is correct, because both statements are true of it and the actions
+differ.
+
 ### php2shell (CVE-2026-109618 / CVE-2026-109619)
 
 Two unauthenticated RCE bugs in the PHP runtime, both CVSS 9.2, fixed
