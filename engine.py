@@ -1067,6 +1067,81 @@ def _matcher_has_strong_hit(resp, m, scrub=None):
     return any(_is_strong_evidence(w) for w in matched)
 
 
+def _vparse(v):
+    """'8.3.7-1ubuntu2' -> (8, 3, 7). Trailing build/distro cruft is ignored."""
+    import re as _r
+    m = _r.match(r'\s*v?(\d+)(?:\.(\d+))?(?:\.(\d+))?', str(v or ""))
+    if not m:
+        return None
+    return tuple(int(g) if g else 0 for g in m.groups())
+
+
+def _vcmp(a, b):
+    """Compare two version strings. -1, 0 or 1; None if either is unparseable."""
+    pa, pb = _vparse(a), _vparse(b)
+    if pa is None or pb is None:
+        return None
+    return (pa > pb) - (pa < pb)
+
+
+def _match_version(resp, m):
+    """
+    Evaluate a `version` matcher: is the advertised software version in a
+    known-vulnerable range?
+
+    This exists because a word matcher cannot do arithmetic on a version, so
+    version-boundary CVEs could not be expressed as rules at all. The matcher is
+    deliberately strict about evidence:
+
+      * the version must be READ from the response, via `regex` against the
+        chosen part. No version found means no match — never a guess, and never
+        a finding inferred from the product merely being present.
+      * `fixed_in` maps a branch prefix to the release that fixed it. A version
+        in a listed branch is affected only below that release.
+      * a branch with no entry in `fixed_in` is affected only if
+        `unfixed_branches_affected` is set, which is how an end-of-life branch
+        that will never receive a fix is expressed.
+      * `min_affected` bounds the bottom, so ancient unrelated versions and
+        garbage parses do not match.
+
+    Shape:
+        {"type": "version", "part": "header",
+         "regex": r'X-Powered-By:\\s*PHP/([\\d.]+)',
+         "min_affected": "5.4.0",
+         "fixed_in": {"8.2": "8.2.35", "8.3": "8.3.36"},
+         "unfixed_branches_affected": true}
+    """
+    import re as _r
+    hay = _resp_part(resp, m.get("part", "header"))
+    if not hay:
+        return False
+    found = None
+    for pat in (m.get("regex") or []) if isinstance(m.get("regex"), list) else [m.get("regex")]:
+        if not pat:
+            continue
+        mm = _r.search(pat, hay, 0 if m.get("case_sensitive") else _r.I)
+        if mm:
+            found = (mm.group(1) if mm.groups() else mm.group(0)).strip()
+            break
+    if not found or _vparse(found) is None:
+        return False          # no version advertised → nothing proven
+
+    if m.get("min_affected") and (_vcmp(found, m["min_affected"]) or 0) < 0:
+        return False
+    if m.get("max_affected") and (_vcmp(found, m["max_affected"]) or 0) > 0:
+        return False
+
+    parts = _vparse(found)
+    fixed = m.get("fixed_in") or {}
+    # Match the most specific branch prefix this version belongs to ("8.3"
+    # before "8"), so a per-branch fix table behaves the way its author wrote it.
+    for depth in (2, 1):
+        branch = ".".join(str(x) for x in parts[:depth])
+        if branch in fixed:
+            return (_vcmp(found, fixed[branch]) or 0) < 0
+    return bool(m.get("unfixed_branches_affected"))
+
+
 def _match_one(resp, m, scrub=None):
     """Evaluate a single matcher against a response. Returns True/False."""
     mtype = m.get("type", "word")
@@ -1094,6 +1169,9 @@ def _match_one(resp, m, scrub=None):
             cond = m.get("condition", "or")
             hits = [w in hay for w in words]
             result = all(hits) if cond == "and" else any(hits)
+
+        elif mtype == "version":
+            result = _match_version(resp, m)
 
         elif mtype == "regex":
             import re as _r
@@ -1156,6 +1234,10 @@ def _eval_rule(resp, rule, scrub=None):
     # least one word matcher satisfied by a specific token. Supporting matchers
     # built from generic vocabulary ("<form", "login") are fine alongside a
     # strong one, but they cannot carry a finding on their own.
+    # A satisfied version matcher is strong evidence on its own: it read a real
+    # version out of the response and compared it against a fix boundary.
+    if any(ok and m.get("type") == "version" for m, ok in zip(matchers, results)):
+        return True
     word_matchers = [m for m, ok in zip(matchers, results)
                      if ok and m.get("type", "word") == "word" and not m.get("negative")]
     if word_matchers and not any(_matcher_has_strong_hit(resp, m, scrub) for m in word_matchers):
@@ -1460,6 +1542,47 @@ VULN_RULES = [
             {"type": "status", "status": [200]},
             {"type": "word", "part": "body", "words": ["\"slug\"", "\"id\""], "condition": "and"},
             {"type": "word", "part": "header", "words": ["json"]},
+        ],
+    },
+
+    # ── php2shell (CVE-2026-109618 / CVE-2026-109619) ────────────────────
+    # Two unauthenticated RCE bugs in the PHP runtime itself, fixed 2026-10-21
+    # in 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12. Unlike an application bug, sound
+    # application code does not protect a vulnerable runtime: every PHP that
+    # serves web requests is affected (php-fpm, mod_php, php-cgi, FrankenPHP,
+    # LiteSpeed).
+    #
+    # Kumo reports this as what it is — an unpatched runtime version read from
+    # the server's own headers — and goes no further. The public proof-of-concept
+    # templates for this chain POST a crafted multipart body and write session
+    # state on the target; that is exploitation, not reconnaissance, so none of
+    # it is implemented here.
+    #
+    # 8.1 and below are end-of-life with no upstream fix, so any version at or
+    # above 5.4.0 in those branches is affected. A version at or above its
+    # branch's fix is NOT reported.
+    {
+        "id": "php2shell-unpatched-php",
+        "name": "PHP Runtime Unpatched for php2shell RCE (CVE-2026-109618/109619)",
+        "severity": "high", "path": "/", "matchers_condition": "and",
+        "origin": "kumo-version",
+        "description": (
+            "The PHP version advertised by this host predates the php2shell fixes "
+            "(8.2.35 / 8.3.36 / 8.4.27 / 8.5.12, released 2026-10-21). CVE-2026-109618 "
+            "and CVE-2026-109619 are unauthenticated remote code execution bugs in the "
+            "PHP runtime, both CVSS 9.2; application code cannot mitigate them. "
+            "Branches 8.1 and earlier are end-of-life and have no upstream fix. "
+            "This is a version-boundary check against the server's own header, not an "
+            "exploit attempt: confirm before acting, because a distribution that "
+            "backports security fixes can still advertise an older upstream version. "
+            "Remediation: upgrade PHP and restart every PHP worker."),
+        "matchers": [
+            {"type": "version", "part": "header",
+             "regex": r'(?:X-Powered-By|Server):[^\r\n]*?PHP/(\d+\.\d+(?:\.\d+)?)',
+             "min_affected": "5.4.0",
+             "fixed_in": {"8.2": "8.2.35", "8.3": "8.3.36",
+                          "8.4": "8.4.27", "8.5": "8.5.12"},
+             "unfixed_branches_affected": True},
         ],
     },
 ]
@@ -4259,7 +4382,16 @@ def _run_vuln_rules(domain, base_sigs=None, timeout=7, brand=None):
             # /phpmyadmin/). We test for the *site brand* rather than a bare path
             # echo, because for real products the path and the product name are
             # legitimately the same (phpinfo.php → "phpinfo()").
-            if _is_site_own_page(r, brand):
+            #
+            # Not for the root path. The brand is derived FROM the homepage, so
+            # testing the homepage against it always matched: every rule with
+            # path "/" was suppressed before its matchers ran, on every real
+            # site. That silently killed jenkins-panel and the router
+            # default-login rule, and would kill any rule that reads the
+            # homepage (a server-header version check, for instance). The
+            # homepage legitimately IS the site's own page; there is nothing to
+            # suppress.
+            if rule["path"].split("?")[0].strip("/") and _is_site_own_page(r, brand):
                 return
             # Scrub the requested path so product matchers can't match the URL
             # echoed back. Only whole-path forms and long segments are removed —

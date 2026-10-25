@@ -22,6 +22,8 @@ serves them all. Add the names to /etc/hosts pointing at 127.0.0.1:
   jsonapi.fptest   API gateway: 200 JSON with generic keys on every path
   clean.fptest     a correctly built, hardened site with honest 404s
   redirect.fptest  every unknown path 302-redirects to the homepage
+  phpfixed.fptest  PHP that IS patched (8.4.27) — a version rule must not fire
+  phphidden.fptest PHP with the version suppressed — nothing to conclude
 
 Padding lengths are derived from a hash of the path, so a given path always
 answers with the same size (deterministic runs) while different paths differ —
@@ -40,7 +42,8 @@ import time
 HOST = "0.0.0.0"
 
 VHOSTS = ["spa.fptest", "soft404.fptest", "waf.fptest", "echo.fptest",
-          "jsonapi.fptest", "clean.fptest", "redirect.fptest"]
+          "jsonapi.fptest", "clean.fptest", "redirect.fptest",
+          "phpfixed.fptest", "phphidden.fptest"]
 
 
 def _jitter(path, lo, hi):
@@ -198,6 +201,36 @@ def profile_redirect(path, qs):
     return 302, "text/html", ""
 
 
+# ─────────────────────────────────────────────────────────────────
+# PROFILE: PHP that is already patched, and PHP with the version hidden
+# ─────────────────────────────────────────────────────────────────
+# Negative controls for version-boundary rules. A rule that reports an
+# unpatched runtime must stay silent on a host running the FIXED release, and
+# must not infer a version it was never told — "PHP is present" is not a
+# version. These two hosts are how that stays true.
+PHP_HOME = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<title>Riverside Dental</title></head><body>
+<h1>Riverside Dental</h1><p>Book an appointment.</p>
+</body></html>"""
+
+
+def profile_phpfixed(path, qs):
+    if path in ("/", "/index.php", "/index.html"):
+        return 200, "text/html", PHP_HOME
+    return 404, "text/html", "<html><head><title>Not Found</title></head><body><h1>404</h1></body></html>"
+
+
+profile_phphidden = profile_phpfixed
+
+# Headers per host: the patched host advertises the fixed release, the hidden
+# host advertises PHP without any version at all.
+EXTRA_HEADERS = {
+    "phpfixed.fptest":  {"X-Powered-By": "PHP/8.4.27",
+                         "Server": "Apache/2.4.62 (Debian)"},
+    "phphidden.fptest": {"X-Powered-By": "PHP", "Server": "Apache"},
+}
+
 PROFILES = {
     "spa.fptest":      profile_spa,
     "soft404.fptest":  profile_soft404,
@@ -206,6 +239,8 @@ PROFILES = {
     "jsonapi.fptest":  profile_jsonapi,
     "clean.fptest":    profile_clean,
     "redirect.fptest": profile_redirect,
+    "phpfixed.fptest":  profile_phpfixed,
+    "phphidden.fptest": profile_phphidden,
 }
 
 # Ground truth: none of these hosts has a single genuine exposure.
@@ -242,6 +277,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if host == "clean.fptest":
             for k, v in CLEAN_HEADERS.items():
                 self.send_header(k, v)
+        for k, v in EXTRA_HEADERS.get(host, {}).items():
+            self.send_header(k, v)
         if code == 302:
             self.send_header("Location", "/")
         self.end_headers()

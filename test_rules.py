@@ -74,7 +74,31 @@ POSITIVE = {
     "graphql-introspection": R(200, '{"data":{"__schema":{"queryType":{"name":"Query"}}}}', JSON),
     "sonarqube": R(200, '{"id":"AXb","version":"9.9.1","status":"UP"}', JSON),
     "wp-user-enum": R(200, '[{"id":1,"name":"admin","slug":"admin"},{"id":2,"slug":"editor"}]', JSON),
+    "php2shell-unpatched-php": R(200, "<html><head><title>Site</title></head><body>hi</body></html>",
+                                 {"X-Powered-By": "PHP/8.4.26", "Content-Type": "text/html"}),
 }
+
+# Version-boundary rules need their own table: a decoy cannot express "the
+# patched release must not match". Each entry is (rule id, headers, expected).
+VERSION_CASES = [
+    ("php2shell-unpatched-php", {"X-Powered-By": "PHP/8.4.26"}, True,  "below 8.4.27 fix"),
+    ("php2shell-unpatched-php", {"X-Powered-By": "PHP/8.4.27"}, False, "IS the 8.4 fix"),
+    ("php2shell-unpatched-php", {"X-Powered-By": "PHP/8.4.28"}, False, "newer than fix"),
+    ("php2shell-unpatched-php", {"X-Powered-By": "PHP/8.2.34"}, True,  "below 8.2.35 fix"),
+    ("php2shell-unpatched-php", {"X-Powered-By": "PHP/8.2.35"}, False, "IS the 8.2 fix"),
+    ("php2shell-unpatched-php", {"X-Powered-By": "PHP/8.3.35"}, True,  "below 8.3.36 fix"),
+    ("php2shell-unpatched-php", {"X-Powered-By": "PHP/8.3.36"}, False, "IS the 8.3 fix"),
+    ("php2shell-unpatched-php", {"X-Powered-By": "PHP/8.5.11"}, True,  "below 8.5.12 fix"),
+    ("php2shell-unpatched-php", {"X-Powered-By": "PHP/8.5.12"}, False, "IS the 8.5 fix"),
+    ("php2shell-unpatched-php", {"X-Powered-By": "PHP/8.1.33"}, True,  "8.1 EOL, no fix"),
+    ("php2shell-unpatched-php", {"X-Powered-By": "PHP/7.4.33"}, True,  "7.4 EOL"),
+    ("php2shell-unpatched-php", {"X-Powered-By": "PHP/5.3.29"}, False, "below min_affected"),
+    ("php2shell-unpatched-php", {"Server": "Apache/2.4.41 (Ubuntu) PHP/8.3.10"}, True, "via Server header"),
+    ("php2shell-unpatched-php", {"X-Powered-By": "PHP/8.3.7-1ubuntu2"}, True, "distro suffix"),
+    ("php2shell-unpatched-php", {"X-Powered-By": "PHP"}, False, "no version -> no guess"),
+    ("php2shell-unpatched-php", {"X-Powered-By": "ASP.NET"}, False, "not PHP"),
+    ("php2shell-unpatched-php", {"Server": "nginx"}, False, "nothing advertised"),
+]
 
 # ── responses that must NEVER trigger any rule ──
 NEGATIVE = {
@@ -156,6 +180,27 @@ def main():
             except Exception as e:
                 ext_fails.append((rule["id"], rule["severity"], f"CRASH: {e}"[:46], nname))
 
+    # ── version-boundary checks ──────────────────────────────────────
+    # The case that matters most is the negative one: a host running the FIXED
+    # release must produce nothing. A version rule that fires on a patched host
+    # is worse than no rule, because it trains the operator to ignore it.
+    allr = {r["id"]: r for r in engine.VULN_RULES + ext}
+    ver_fails = []
+    for rid, hdrs, want, why in VERSION_CASES:
+        rule = allr.get(rid)
+        if rule is None:
+            ver_fails.append((rid, "rule missing", why))
+            continue
+        got = engine._eval_rule(R(200, "<html><body>x</body></html>", hdrs), rule,
+                                engine._rule_scrub(rule, "example.com"))
+        if got is not want:
+            ver_fails.append((rid, f"expected {want}, got {got}", why))
+    print(f"\n  Version boundaries: {len(VERSION_CASES)} cases")
+    for rid, what, why in ver_fails:
+        print(f"    \033[91mFAIL\033[0m {rid:<30} {what}  ({why})")
+    if not ver_fails:
+        print("    \033[92mevery boundary correct, patched releases silent\033[0m")
+
     # ── dead-rule check ──────────────────────────────────────────────
     # A rule whose evidence never survives its own scrub can never fire. These
     # are invisible in a scan: no error, no finding, just silence.
@@ -187,6 +232,8 @@ def main():
         print(f"    … and {len(ext_fails)-30} more")
     if not ext_fails:
         print("    \033[92mno ported rule fires on any decoy\033[0m")
+
+    ext_fails += [(rid, "version", what, why) for rid, what, why in ver_fails]
 
     print()
     if fails or ext_fails:

@@ -1,5 +1,39 @@
 # Kumo — themed build
 
+## php2shell (CVE-2026-109618 / 109619) and a version matcher
+
+Two unauthenticated RCE bugs in the **PHP runtime**, both CVSS 9.2, fixed
+2026-10-21 in 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12. They sit in the runtime rather
+than in application code, so every PHP serving web requests is affected and
+sound application code does not protect a vulnerable install. 8.1 and earlier
+are end-of-life with no upstream fix.
+
+Kumo now flags an unpatched PHP runtime read from the server's own headers. It
+does **not** attempt the chain: the public PoC templates POST a crafted
+multipart body and write session files on the target, and two of them need an
+operator-supplied LFI path and session save path. That is exploitation, not
+reconnaissance.
+
+This needed a new **`version` matcher type**, since a word matcher cannot do
+arithmetic on a version. It is strict by design: the version must be read from
+the response (no version advertised means no finding, never a guess), a release
+at or above its branch's fix never matches, and end-of-life branches are opt-in.
+Reusable for any version-boundary CVE.
+
+Two new negative-control hosts back it: `phpfixed.fptest` runs the patched
+release and `phphidden.fptest` hides its version. Both must stay silent —
+a version rule that fires on a patched host trains operators to ignore it.
+`test_rules.py` checks 17 boundary cases.
+
+## One more dead-rule bug
+
+**Every rule with `path: "/"` was suppressed on every real site.** The
+site-brand check is derived *from* the homepage and then matched against the
+homepage, so it always fired. That silently killed `jenkins-panel` and the
+router default-login rule. The lab hid it because the brand of `127.0.0.1`
+parses to `127`. The brand check is now skipped for the root path.
+
+
 ## Rule playbook: 365 → 418 checks
 
 53 new rules, every one decoy-screened before it was allowed in and verified

@@ -177,6 +177,63 @@ knowing a site is proxied matters, but they are labelled `via <cdn> edge`,
 forced to `info`, and excluded from alerts in both UIs. The result carries
 `origin_open` for the ports that are actually the target's.
 
+## Third pass — version rules and the root-path bug
+
+### 11. Every rule with `path: "/"` was dead
+
+Same class as the scrub bug, different mechanism. `_is_site_own_page` rejects a
+response whose title carries the site's brand, to stop a CMS search page
+answering for `/phpmyadmin/` from counting as product evidence. But the brand is
+derived **from the homepage**, so testing the homepage against it always
+matched: `jenkins-panel` and the router default-login rule were suppressed
+before their matchers ran, on every real target. The lab only hid it because the
+brand of `127.0.0.1` parses to `127`, which does not appear in the page.
+
+The brand check is now skipped for the root path. The homepage legitimately *is*
+the site's own page; there is nothing to suppress.
+
+### A `version` matcher type
+
+Some vulnerabilities have no response signature at all — the evidence is the
+software's version against a fix boundary. A word matcher cannot do arithmetic,
+so those could not be expressed as rules.
+
+`{"type": "version", ...}` reads a version out of the response with a regex and
+compares it against a per-branch `fixed_in` table. It is deliberately strict:
+
+* the version must be **read** from the response. No version advertised means no
+  match — never a guess, and never a finding inferred from the product merely
+  being present. `X-Powered-By: PHP` with no number produces nothing.
+* a version at or above its branch's fix does **not** match.
+* a branch absent from `fixed_in` matches only when
+  `unfixed_branches_affected` is set, which is how an end-of-life branch that
+  will never get a fix is expressed.
+* `min_affected` bounds the bottom, so ancient versions and garbage parses are
+  excluded.
+
+Two new `fplab.py` hosts are the negative controls: `phpfixed.fptest` runs the
+**patched** release, `phphidden.fptest` advertises PHP with no version. Both
+must stay silent. A version rule that fires on a patched host is worse than no
+rule, because it teaches the operator to ignore it.
+
+### php2shell (CVE-2026-109618 / CVE-2026-109619)
+
+Two unauthenticated RCE bugs in the PHP runtime, both CVSS 9.2, fixed
+2026-10-21 in **8.2.35 / 8.3.36 / 8.4.27 / 8.5.12**. These sit in the runtime,
+not in application code, so every PHP serving web requests is affected and
+sound application code does not protect a vulnerable install. Branches 8.1 and
+earlier are end-of-life with no upstream fix.
+
+Kumo reports exactly what it can see: an unpatched runtime version read from the
+server's own headers, with the caveat that a distribution backporting fixes can
+still advertise an older upstream version.
+
+What Kumo does **not** do: the public proof-of-concept templates for this chain
+POST a crafted multipart body and write session files on the target, and two of
+them need an operator-supplied LFI path and session save path. That is
+exploitation, not reconnaissance. None of it is implemented, and the miner
+excludes it structurally by taking GET templates only.
+
 ## Rules of thumb for new checks
 
 1. **Never let a status code alone be evidence.** Pair it with a word matcher.
@@ -188,3 +245,9 @@ forced to `info`, and excluded from alerts in both UIs. The result carries
 5. **Every new rule gets a positive fixture in `test_rules.py`** and must
    survive all 11 decoys.
 6. **Then run `test_fp.py`.** Synthetic decoys miss things a real socket finds.
+7. **A version rule needs a patched-host control.** Add the fixed release to
+   `VERSION_CASES` and assert it does *not* fire. Boundaries are off-by-one
+   magnets, and the patched case is the one that matters.
+8. **Detection, not exploitation.** A rule is a GET and a signature. If a check
+   needs a payload, writes state on the target, or wants the operator to supply
+   an exploit path, it does not belong in Kumo.
