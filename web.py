@@ -957,7 +957,7 @@ function renderContent(id, data) {
       </tr>`;
     });
     h+='</tbody></table>';
-    if(d.cdn&&d.cdn_note){h+=`<div class="alert a-yellow" style="font-size:11px;padding:6px 8px;margin:6px 0">${escH(d.cdn_note)}</div>`;}
+    if(data.cdn&&data.cdn_note){h+=`<div class="alert a-yellow" style="font-size:11px;padding:6px 8px;margin:6px 0">${escH(data.cdn_note)}</div>`;}
     // CDN edge ports are open on every proxied domain and are not the origin's
     // surface, so they never raise an alert.
     const crit=open.filter(p=>(p.risk==='critical'||p.risk==='high')&&!p.edge);
@@ -1778,8 +1778,22 @@ function toggleCard(id) {
 function fillCard(id, data) {
   const body = document.getElementById('body-'+id);
   const badges = document.getElementById('badges-'+id);
-  if (body) body.innerHTML = renderContent(id, data);
-  if (badges) badges.innerHTML = getBadges(id, data);
+  // A throwing renderer used to leave the card showing its loading skeleton
+  // forever: the pill was already marked done, innerHTML was never assigned,
+  // and applyCardSeverity (which clears 'running') never ran. The scan looked
+  // finished while one card span permanently. A render failure is now visible
+  // in the card itself, and the card always leaves the running state.
+  try {
+    if (body) body.innerHTML = renderContent(id, data);
+    if (badges) badges.innerHTML = getBadges(id, data);
+  } catch (e) {
+    console.error('render failed for module', id, e);
+    if (body) body.innerHTML = '<div class="alert a-red" style="font-size:11px;padding:6px 8px">'
+      + 'Could not render this module\'s result: ' + escH(String(e && e.message || e))
+      + '<div class="c-dim" style="margin-top:4px;font-size:10px">The scan data was received; '
+      + 'this is a display error. See the browser console.</div></div>';
+    if (badges) badges.innerHTML = '<span class="badge b-warn">render error</span>';
+  }
   applyCardSeverity(id, badges);
 }
 

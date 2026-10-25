@@ -497,6 +497,58 @@ Each subdomain also records which source produced it, and the per-source counts
 are shown in both UIs. When a name looks wrong, the operator can see where it
 came from instead of guessing.
 
+## Seventh pass — a card that never stopped loading
+
+Reported from a real scan of a Cloudflare-fronted host: the ports pill showed
+**done** while the ports card sat on its loading skeleton forever.
+
+Two defects, one mine.
+
+### 23. An undefined variable in the ports renderer
+
+The CDN work added this line to the ports renderer:
+
+```js
+if(d.cdn&&d.cdn_note){ ... }
+```
+
+The payload in that scope is `data`, not `d`. `d` is undefined, so the renderer
+threw a `ReferenceError` the moment a host had any open port — which is every
+real scan.
+
+**`node --check` passed it.** It is valid JavaScript; it only fails when it
+runs. Syntax checking cannot catch this class of bug, and that is exactly how it
+reached a release.
+
+### 24. A throwing renderer left the card loading forever
+
+The failure was invisible in the worst way. In the SSE handler the pill is set
+before the card is filled:
+
+```js
+setPill(msg.module, isErr ? 'err' : 'done');   // pill goes green
+fillCard(msg.module, msg.data);                 // throws here
+```
+
+`fillCard` assigned `innerHTML` and then called `applyCardSeverity`, which is
+what removes the `running` class. Throwing on the first meant the second never
+ran, so the skeleton stayed. The outer `try/catch` swallowed the error, and an
+end-of-scan sweep marked every lingering *pill* done without touching the
+*cards* — so the scan looked complete with one card spinning.
+
+`fillCard` now catches, shows the failure in the card, and always clears the
+running state. A renderer bug is now visible instead of silent.
+
+### The test that would have caught it
+
+`test_renderers.py` executes every renderer in Node against real engine output,
+plus an error dict and an empty object, and requires a string back. Re-introduce
+the `d`/`data` typo and `node --check` still passes while this test fails with
+`normal: d is not defined`.
+
+The lesson generalises: a syntax check proves a file parses, not that its code
+runs. Anything that renders needs to be executed against realistic data.
+
 ## Rules of thumb for new checks
 
 1. **Never let a status code alone be evidence.** Pair it with a word matcher.
@@ -527,6 +579,11 @@ came from instead of guessing.
    CDN infrastructure. Filter to the target before reporting it as the target's.
 14. **Record where each finding came from.** Per-source attribution turns "is
    this real?" into a question the operator can answer.
-15. **Don't claim absence you cannot establish.** DKIM selectors can't be
+15. **Execute UI code, don't just parse it.** `node --check` cannot catch an
+   undefined variable. Run every renderer against real data, an error dict and
+   an empty object.
+16. **A failed render must be visible.** If a card can be left in a loading
+   state by an exception, a display bug becomes a silent hang.
+17. **Don't claim absence you cannot establish.** DKIM selectors can't be
    enumerated, so a miss is "not found at the names we tried". Where absence is
    unprovable, the finding earns credit when present but costs nothing when not.

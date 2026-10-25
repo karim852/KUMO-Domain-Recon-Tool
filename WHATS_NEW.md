@@ -1,5 +1,26 @@
 # Kumo — themed build
 
+## Fix: the ports card never stopped loading
+
+On a real scan the ports pill showed **done** while the ports card sat on its
+loading skeleton forever. Two defects behind it.
+
+The CDN work introduced `if(d.cdn&&d.cdn_note)` in the ports renderer, where
+the payload is `data`, not `d`. That threw a `ReferenceError` as soon as a host
+had any open port, so on every real scan. **`node --check` passed it** — it is
+valid JavaScript that only fails when it runs.
+
+Worse, the failure was invisible. The pill is set before the card is filled, and
+`fillCard` threw before reaching the call that clears the `running` class, so
+the skeleton stayed up while the scan reported itself complete. `fillCard` now
+catches, shows the error in the card, and always leaves the running state, so a
+render bug can no longer present as a hang.
+
+New `test_renderers.py` executes every renderer in Node against real engine
+output, an error dict and an empty object. Put the typo back and `node --check`
+still passes while this test fails.
+
+
 ## Subdomains: Shodan InternetDB added as a fifth source (free, no key)
 
 Kumo already called `internetdb.shodan.io/{ip}` in the Shodan module and parsed
