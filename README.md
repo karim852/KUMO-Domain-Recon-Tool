@@ -4,8 +4,8 @@
 
 <p align="center">
 <img src="https://img.shields.io/badge/Python-3.8+-3b82f6?style=flat-square&logo=python&logoColor=white">
-<img src="https://img.shields.io/badge/Modules-27-22c55e?style=flat-square">
-<img src="https://img.shields.io/badge/Vuln_checks-358-ef4444?style=flat-square">
+<img src="https://img.shields.io/badge/Modules-29-22c55e?style=flat-square">
+<img src="https://img.shields.io/badge/Vuln_checks-420-ef4444?style=flat-square">
 <img src="https://img.shields.io/badge/Themes-4-a855f7?style=flat-square">
 <img src="https://img.shields.io/badge/API_Key-Not_required-22c55e?style=flat-square">
 <img src="https://img.shields.io/badge/Interface-CLI_+_Web-0ea5e9?style=flat-square">
@@ -19,8 +19,8 @@
 Give Kumo a domain and it maps everything reachable about it in one pass:
 **DNS and email security**, **certificates and subdomains** from CT logs,
 **open ports**, **technology fingerprints**, **leaked credentials** and
-infostealer infections, **cloud buckets**, and **358 vulnerability checks**
-against known exposures. Twenty-seven modules run in parallel, each one
+infostealer infections, **cloud buckets**, and **420 vulnerability checks**
+against known exposures. Twenty-nine modules run in parallel, each one
 streaming its own card the moment it lands — in the terminal or in the browser.
 
 No API key is required for any of it.
@@ -110,7 +110,7 @@ with the web interface on top.
 | Input | Runs |
 |---|---|
 | `1 4 12` | just those modules |
-| `a` | all 27 |
+| `a` | all 29 |
 | `f` | fast scan — skips the slow modules |
 | `w` | the web dashboard |
 | `q` | quit |
@@ -204,7 +204,7 @@ its colours through the same token set.
 
 ## 🔓 Vulnerability scanner
 
-**358 checks**, no external tool and no template directory to sync. The engine
+**420 checks**, no external tool and no template directory to sync. The engine
 mirrors nuclei's matcher model — `status`, `word`, `regex`, `size` and a small
 `dsl`, combined with `matchers_condition`.
 
@@ -216,7 +216,7 @@ mirrors nuclei's matcher model — `status`, `word`, `regex`, `size` and a small
 
 ## 🧩 Modules
 
-**27 modules**, every one running in parallel. Click a module to see what it returns on a real scan.
+**29 modules**, every one running in parallel. Click a module to see what it returns on a real scan.
 
 Run them by number from the home screen, or by name: `python3 kumo.py corp.demo -m dns ssl nuclei`
 
@@ -402,7 +402,7 @@ Fingerprints the WAF or CDN sitting in front of the target using 40+ signatures 
 </details>
 
 <details>
-<summary><b>🔓 Vulnerability Scanner — 358 built-in checks</b> &nbsp;·&nbsp; <code>nuclei</code></summary>
+<summary><b>🔓 Vulnerability Scanner — 420 built-in checks</b> &nbsp;·&nbsp; <code>nuclei</code></summary>
 
 <p align="center"><img src="docs/mod-nuclei.jpg" alt="nuclei module" width="90%"></p>
 
@@ -485,9 +485,33 @@ Pre-generates 26 investigation links for the target across the most useful OSINT
 
 <p align="center"><img src="docs/mod-osint.jpg" alt="osint panel" width="46%"></p>
 
----
+</details>
+
+<details>
+<summary><b>🧱 CMS Deep Scan — WordPress / Joomla / Drupal</b> &nbsp;·&nbsp; <code>cms</code></summary>
+
+Identifies the CMS first, then runs only that platform's checks, so a Drupal site is never probed for WordPress paths.
+
+Detection uses 18 weighted signals — asset paths, generator meta, headers — never a product name in the page text. A blog that writes *about* WordPress is not reported as running it.
+
+Once identified, it reads the version (tagged as inference, since a backported patch doesn't change the advertised number) and probes that CMS's own sensitive paths: **34 in total** — config backups, reachable installers, debug logs, exposed database files. On WordPress it also enumerates users via the REST API, plus plugins and themes with versions from their readmes.
+
+Fingerprinting covers **20 platforms** including Magento, Shopify, Ghost, Typo3 and PrestaShop. Deep checks exist for three of them, so anything else is reported as identified with no deep checks available, rather than returning an empty card that would read as a clean result.
 
 </details>
+
+<details>
+<summary><b>🎛️ Hosting Control Panels — 17 panels</b> &nbsp;·&nbsp; <code>panels</code></summary>
+
+Finds cPanel, WHM, Plesk, DirectAdmin, Webmin, Virtualmin, CyberPanel, aaPanel, Hestia, VestaCP, CentOS Web Panel, ISPConfig, Froxlor, Cockpit, Ajenti and more, across **20 ports**.
+
+Each panel is identified by its login interface — page markup, session cookies, form actions — never by its name, so a web hosting company's own marketing site reports none of the panels it sells.
+
+Cloudflare proxies ports 2082-2096 and 8443, so an open port there is the edge and not your server. Those are excluded behind a CDN and the output says why; non-proxied panel ports are still checked. A panel port that answers without a panel interface is reported as an unexplained open port instead.
+
+</details>
+
+---
 
 ---
 ## ⚙️ Optional API keys
@@ -539,14 +563,34 @@ Fast mode skips: `wayback` · `brute` · `subdomains` · `screenshot` ·
 ## 🧪 Tests
 
 ```bash
-python3 test_rules.py      # every rule fires on its fixture and on no decoy
-python3 test_modules.py    # every module returns cleanly inside its budget
-python3 test_live.py       # end-to-end against a real domain
+python3 test_rules.py              # every rule fires on its fixture and on no decoy
+python3 test_fp.py                 # nine benign sites must come back clean
+python3 test_cms.py                # CMS detection, probing and fingerprinting
+python3 test_panels.py             # panels found by interface, not by name
+python3 test_versions.py           # version boundaries, incl. the patched case
+python3 test_email_security.py     # SPF / DMARC / DKIM record parsing
+python3 test_stealer_coverage.py   # every harvested address is checked
+python3 test_subdomain_sources.py  # per-source attribution, no tenant leakage
+python3 test_renderers.py          # every UI card renders, in Node
+python3 test_modules.py            # every module returns cleanly inside its budget
+python3 test_live.py               # end-to-end against a real domain
 ```
 
-`test_rules.py` is the one that matters. It runs each vulnerability rule
-against a vulnerable fixture *and* against seven decoys, and fails if a rule
-either misses its target or fires on something harmless.
+`test_rules.py` is the one that matters. It runs each of the 420 vulnerability
+rules against a vulnerable fixture *and* against eleven decoys, and fails if a
+rule either misses its target or fires on something harmless.
+
+The decoys are the point. Most of these harnesses exist because a real false
+positive got through once: a site that merely writes about a CMS, a hosting
+company whose homepage sells cPanel and Plesk, a hardened site whose soft-404
+answered every probe with HTTP 200. Each one is now a permanent negative
+control. `docs/FALSE-POSITIVES.md` logs every class found, how it was fixed,
+and the rules of thumb that came out of it.
+
+`test_renderers.py` executes every dashboard card in Node against real data, an
+error dict and an empty object. `node --check` parses syntax but cannot catch an
+undefined variable, and one of those once left a card spinning forever while the
+progress bar said it had finished.
 
 ---
 

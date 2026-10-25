@@ -1,5 +1,45 @@
 # Kumo — themed build
 
+## Fingerprints stop reading prose as evidence
+
+The whatweb module already knew far more platforms than the new CMS module —
+20 against 3, with versions. Before wiring them together, both fingerprint
+tables got audited against a page that only *writes about* every product in
+them. The result was bad: **9 of 99 signatures fired in `_whatweb_python`, and
+9 of 19 in `scan_tech`.**
+
+The cause was structural. Both matched a single `body + headers` blob, so a
+product name printed in page text was indistinguishable from the real thing.
+`Joomla` matched `Joomla!` — the product's own branding, which every article
+about it uses. `october/` matched any URL containing a month name. `Express.js`
+matched a blog *quoting* `X-Powered-By: Express` in a debugging tip.
+
+Signatures now carry a scope: `("h", …)` matches headers and cookies only,
+`("b", …)` the body, a plain string either. An edge provider or WAF proves
+itself with the headers it adds, a runtime with its header or session cookie,
+never with its name in the page. Both tables are now at **0 prose matches**.
+
+Three of the nine were invisible to the first test and only surfaced after
+`blog.cmstest` was rewritten to spell brands the way their own marketing does
+and to quote headers the way a technical article does. The decoy had been
+easier than the real web.
+
+CMS and storefront signatures moved to module level so the whatweb module and
+the CMS deep scan agree on what a platform is, sharing one homepage fetch.
+`scan_cms` now records whether the fingerprint table independently corroborates
+its own detection, and separates storefront add-ons from rival platforms.
+
+**Identified is not the same as scanned.** Deep checks cover three platforms;
+the table knows twenty. A Magento storefront used to return an empty CMS card,
+which reads as "nothing here". It now names the platform and says there are no
+deep checks for it yet.
+
+Also fixed a flaw in the test harness itself: `test_renderers.py` derived
+renderer ids by stripping only `_plain`, so the `cms_none` and `panels_none`
+fixtures were calling an id that does not exist, falling through to the default
+branch, and passing having rendered nothing. It now asserts what each card
+actually says.
+
 ## Module 29 — hosting control panels
 
 A control panel is not a CMS. A CMS runs the website; a control panel runs the

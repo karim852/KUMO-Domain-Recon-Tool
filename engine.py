@@ -12008,7 +12008,7 @@ ALL_MODULES = {
     "whatweb":         ("WhatWeb Deep Tech Detection",           scan_whatweb),
     "robots":          ("Robots/Security/Sitemap",               scan_robots),
     "endpoints":       ("Sensitive Endpoints (80+ paths)",       scan_endpoints),
-    "nuclei":          ("Vulnerability Scanner (358 checks)",    scan_nuclei),
+    "nuclei":          ("Vulnerability Scanner (420 checks)",    scan_nuclei),
     "shodan":          ("Shodan InternetDB + CVEs",              scan_shodan),
     "censys":          ("Censys Hosts + Certificates",           scan_censys),
     "subdomains":      ("Subdomain Discovery", scan_subdomains),
