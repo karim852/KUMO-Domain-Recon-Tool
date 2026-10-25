@@ -103,6 +103,57 @@ def main():
     check("no WordPress path was probed on a Drupal site",
           not any("wp-" in (f.get("path") or "") for f in dr.get("findings", [])))
 
+    print(f"\n{B}Platform fingerprinting{X}  "
+          f"{D}(20 platforms recognised, 3 deep-scanned){X}")
+    for host, cms in (("wp.cmstest", "WordPress"), ("joomla.cmstest", "Joomla"),
+                      ("drupal.cmstest", "Drupal")):
+        r = results[host]
+        check(f"{cms:10} corroborated by the fingerprint table",
+              r.get("corroborated_by") == "platform fingerprint",
+              f"platforms={r.get('platforms')}")
+    check("WooCommerce listed as an add-on, not a rival platform",
+          results["wp.cmstest"].get("addons") == ["WooCommerce"]
+          and not results["wp.cmstest"].get("not_deep_scanned"))
+
+    mag = results["magento.cmstest"]
+    check("Magento storefront is fingerprinted", mag.get("platforms") == ["Magento"])
+    check("Magento is reported as having no deep checks",
+          mag.get("not_deep_scanned") == ["Magento"])
+    check("the result says so instead of coming back blank",
+          "no deep checks" in (mag.get("note") or ""), mag.get("note"))
+    check("no WordPress/Joomla/Drupal path probed on a Magento site",
+          not mag.get("findings"))
+
+    for host in ("blog.cmstest", "plain.cmstest"):
+        check(f"{host:14} fingerprints no platform at all",
+              not results[host].get("platforms"),
+              str(results[host].get("platforms")))
+
+    print(f"\n{B}No signature matches a bare product name{X}  "
+          f"{D}(guards the whole fingerprint table, not just the labs){X}")
+    # Every brand in the table, written the way its own marketing writes it.
+    # This is the page a tech blog or a hosting reseller publishes. Nothing in
+    # it is installed software, so nothing here may fingerprint.
+    import re as _re
+    names = sorted(set(list(engine._WW_CMS_SIGS) + list(engine._WW_ECOM_SIGS)))
+    prose = ("<html><head><title>Platform roundup</title></head><body>"
+             "<h1>Every platform compared</h1><p>"
+             + ". ".join(f"{n}! is worth a look, and {n} keeps improving"
+                         for n in names)
+             + ".</p><p>Debugging tip: check the <code>cf-ray</code>, "
+               "<code>x-sucuri-id</code> and <code>X-Powered-By: Express</code> "
+               "headers, and the <code>incap_ses</code> cookie.</p>"
+               "<p>We also cover settings.php and configuration.php hardening.</p>"
+               "</body></html>")
+    leaked = engine._platform_fingerprint(prose, {}, {})
+    check(f"all {len(names)} brands named in prose fingerprint nothing",
+          not leaked, f"leaked={leaked}" if leaked else "")
+
+    # and the same text must not fingerprint when it arrives as headers either
+    leaked_h = engine._platform_fingerprint("", {"X-Note": " ".join(names)}, {})
+    check("brand names in a header value fingerprint nothing",
+          not leaked_h, f"leaked={leaked_h}" if leaked_h else "")
+
     print(f"\n{B}Evidence discipline{X}")
     allf = [f for r in results.values() for f in r.get("findings", [])]
     check("every finding carries a confidence",

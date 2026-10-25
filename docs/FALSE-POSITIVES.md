@@ -676,3 +676,47 @@ something answers there and nothing proves what it is.
 20. **Don't claim absence you cannot establish.** DKIM selectors can't be
    enumerated, so a miss is "not found at the names we tried". Where absence is
    unprovable, the finding earns credit when present but costs nothing when not.
+21. **Scope every signature to where its evidence can exist.** A fingerprint
+   table that matches one `body + headers` blob cannot tell proof from prose:
+   a blog quoting `cf-ray` in a debugging tip looked exactly like a Cloudflare
+   response. Header and cookie evidence matches headers and cookies only; body
+   patterns match the body. The scope is part of the signature.
+22. **Make the decoy as hard as reality, brand spelling included.** The CMS
+   decoy wrote "Joomla" and so never tripped the `Joomla!` signature that any
+   real article would, because real writing uses the product's own branding.
+   A decoy that is easier than the web proves nothing.
+23. **Fixture names must resolve to the code under test.** `cms_none` derived a
+   renderer id that did not exist, fell through to the default branch, and
+   passed having rendered nothing. Assert on what the output *says*, not that
+   a string came back.
+
+## The whatweb fingerprint audit
+
+Auditing the two fingerprint tables against a page that merely *writes about*
+every product in them:
+
+| Table | Signatures | Fired on prose before | After |
+|---|---|---|---|
+| `_whatweb_python` | 99 | 9 | 0 |
+| `scan_tech` | 19 | 9 | 0 |
+
+The nine in `_whatweb_python` were `Joomla` (`Joomla!`), `Webflow`, `PrestaShop`,
+`Cloudflare`, `Sucuri WAF`, `Imperva`, `Cloudflare WAF`, `Express.js`
+(`X-Powered-By.*Express` read out of body text) and `PHP` (prose naming
+`settings.php`). Three of those — `Cloudflare WAF`, `Express.js` and `PHP` —
+were invisible to a synthetic prose test and only appeared once the decoy was
+rewritten to quote headers the way a technical article quotes them.
+
+The CMS and storefront signatures now live at module level (`_WW_CMS_SIGS`,
+`_WW_ECOM_SIGS`) so the whatweb module and the CMS deep scan agree on what a
+platform is, and `test_cms.py` asserts that all 20 brand names written in prose
+fingerprint nothing — the guard against a bare product name going back in.
+
+## Identified is not the same as scanned
+
+The deep scan covers WordPress, Joomla and Drupal; the fingerprint table knows
+twenty platforms. A Magento storefront used to come back with an empty CMS
+card, which reads as "nothing here". It now reports the platform and says
+plainly that there are no deep checks for it yet. Same rule as rule 10, applied
+to coverage rather than to lookups: never let a gap in Kumo look like a clean
+result on the target.

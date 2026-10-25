@@ -1526,13 +1526,24 @@ def render_cms(data):
     if data.get("error"):
         fail(data["error"]); return
     if not data.get("cms"):
-        warn(data.get("note") or "No CMS identified")
+        nd = data.get("not_deep_scanned") or []
+        if nd:
+            # a platform was identified; "no CMS" would be the wrong summary
+            info("Platform", ", ".join(nd))
+            warn(f"No deep checks for {'these platforms' if len(nd) > 1 else 'this platform'} yet")
+            dimprint("deep checks cover WordPress, Joomla and Drupal", 6)
+        else:
+            warn(data.get("note") or "No CMS identified")
         return
     info("CMS", f"{data.get('cms_name') or data['cms']}  ({data.get('confidence')} confidence)")
     if data.get("version"):
         info("Version", f"{data['version']}  (from {data.get('version_source')})")
     if data.get("signals"):
         dimprint("detected by: " + ", ".join(data["signals"]), 6)
+    if data.get("addons"):
+        info("Also running", ", ".join(data["addons"]))
+    if data.get("platform_conflict"):
+        warn(data["platform_conflict"])
 
     findings = data.get("findings") or []
     if findings:

@@ -788,6 +788,10 @@ function getBadges(id, data) {
       const c=data.severity_counts||{};
       if(c.critical) b.push(`<span class="badge b-fail">${c.critical} critical</span>`);
       else if(c.high) b.push(`<span class="badge b-warn">${c.high} high</span>`);
+    } else if((data.not_deep_scanned||[]).length){
+      // identified, but not deep-scanned -- "no CMS" would be a wrong summary
+      b.push(`<span class="badge b-purple">${escH(data.not_deep_scanned[0])}</span>`);
+      b.push('<span class="badge b-warn">no deep checks</span>');
     } else b.push('<span class="badge b-info">no CMS</span>');
   }
   if (id==='subdomains'){b.push(`<span class="badge b-info">${data.total||0} found</span>`);if(data.alive_count)b.push(`<span class="badge b-pass">${data.alive_count} alive</span>`);if(data.ct_total)b.push(`<span class="badge b-purple">${data.ct_total} CT</span>`);}
@@ -1684,6 +1688,18 @@ function renderContent(id, data) {
 
   case 'cms':{
     if(!data.cms){
+      // A platform may be identified without Kumo having deep checks for it.
+      // Saying "no CMS" there would be wrong: there is one, it just isn't
+      // one of the three that get probed.
+      const nd = data.not_deep_scanned||[];
+      if(nd.length){
+        return kv('Platform',nd.map(p=>`<span class="badge b-purple">${escH(p)}</span>`).join(' '))
+          + `<div class="c-yellow" style="font-size:11px;margin-top:8px">`
+          + `No deep checks for ${nd.length>1?'these platforms':'this platform'} yet`
+          + `</div>`
+          + `<div class="c-dim" style="font-size:10px;margin-top:4px">`
+          + `Deep checks cover WordPress, Joomla and Drupal.</div>`;
+      }
       return '<div class="c-dim">No CMS identified'
         + (data.note? ' — ' + escH(data.note) : '')
         + '</div>';
@@ -1695,6 +1711,10 @@ function renderContent(id, data) {
     if(data.version) h+=kv('Version',`<span class="c-yellow mono">${escH(data.version)}</span>`
       + ` <span class="c-dim" style="font-size:10px">from ${escH(data.version_source||'')}</span>`);
     if(data.signals?.length) h+=kv('Detected by',`<span class="c-dim" style="font-size:10px">${escH(data.signals.join(' · '))}</span>`);
+    if(data.addons?.length) h+=kv('Also running',
+      data.addons.map(a=>`<span class="badge b-info">${escH(a)}</span>`).join(' '));
+    if(data.platform_conflict) h+=kv('Note',
+      `<span class="c-yellow" style="font-size:11px">${escH(data.platform_conflict)}</span>`);
 
     const f=data.findings||[];
     if(f.length){

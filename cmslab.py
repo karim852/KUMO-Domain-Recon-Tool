@@ -30,7 +30,7 @@ import time
 
 HOST = "0.0.0.0"
 VHOSTS = ["wp.cmstest", "joomla.cmstest", "drupal.cmstest",
-          "blog.cmstest", "plain.cmstest"]
+          "blog.cmstest", "plain.cmstest", "magento.cmstest"]
 
 # ── WordPress ────────────────────────────────────────────────────────────
 WP_HOME = """<!DOCTYPE html>
@@ -167,6 +167,25 @@ Joomla site should move to Drupal instead.</p>
 <p>Our WordPress security checklist covers wp-config hardening, disabling
 XML-RPC, and keeping plugins current. For Drupal we cover settings.php
 permissions, and for Joomla the administrator directory.</p>
+
+<!-- The paragraphs below exist to break fingerprinting that matches product
+     names in page text. Every brand here is written the way its own marketing
+     writes it, bang included, and the headers are quoted the way a technical
+     article quotes them. A site that reports any of this as installed
+     software is reading prose as evidence. -->
+<p>Joomla! 5.1 shipped in March. Joomla! remains the only one of the three
+with a built-in ACL editor. Magento (now Adobe Commerce) and PrestaShop
+cover retail, while Webflow and Squarespace suit agencies. Typo3, MODX,
+Ghost and OpenCart round out the field.</p>
+<p>On the infrastructure side we put Cloudflare in front of everything, with
+Fastly for video. If you are debugging a cache miss, check the
+<code>cf-ray</code> and <code>cf-cache-status</code> response headers, or
+<code>X-Amz-Cf-Id</code> on CloudFront. Netlify and Vercel set their own:
+look for <code>x-nf-request-id</code> and <code>x-vercel-id</code>.</p>
+<p>For WAFs, Sucuri stamps <code>x-sucuri-id</code> on every response and
+Imperva sets an <code>incap_ses</code> cookie. We also tested
+<code>X-Powered-By: Express</code> fingerprinting and found it unreliable.</p>
+
 <a href="/articles/wordpress-security">More on WordPress security</a>
 <a href="/articles/drupal-vs-joomla">Drupal vs Joomla</a>
 </body></html>"""
@@ -179,7 +198,24 @@ PLAIN_HOME = """<!DOCTYPE html>
 </head><body><h1>Halvorsen Engineering</h1>
 <p>Precision components since 1974.</p></body></html>"""
 
+# A real storefront on a platform Kumo fingerprints but has no deep checks
+# for. The point of this host is that a blank result would be a lie: there IS
+# a CMS here, Kumo just cannot go deep on it, and it has to say which.
+MAGENTO_HOME = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<title>Brightwater Supply</title>
+<link rel="stylesheet" href="/skin/frontend/rwd/default/css/styles.css">
+<script src="/js/mage/cookies.js"></script>
+<script>var BLANK_URL = 'js/blank.html';
+Mage.Cookies.path = '/';</script>
+</head><body>
+<h1>Brightwater Supply</h1>
+<p>Industrial filtration, shipped same day.</p>
+<form action="/checkout/cart/add/" method="post"><button>Add to cart</button></form>
+</body></html>"""
+
 PROFILES = {
+    "magento.cmstest": {"/": (200, "text/html", MAGENTO_HOME)},
     "wp.cmstest": WP_ROUTES,
     "joomla.cmstest": JOOMLA_ROUTES,
     "drupal.cmstest": DRUPAL_ROUTES,
@@ -194,6 +230,8 @@ EXPECTED_CMS = {
     "drupal.cmstest": "drupal",
     "blog.cmstest": None,
     "plain.cmstest": None,
+    # fingerprinted as Magento, but not one of the three with deep checks
+    "magento.cmstest": None,
 }
 
 

@@ -179,6 +179,19 @@ def payloads():
             "version_source": None, "findings": [], "users": [],
             "plugins": [], "themes": [], "paths_probed": 0,
             "severity_counts": {}, "note": "No CMS identified.",
+            "platforms": [], "not_deep_scanned": [], "addons": [],
+        },
+        # a platform Kumo fingerprints but has no deep checks for: the card
+        # must name it rather than render "no CMS"
+        "cms_not_deep": {
+            "cms": None, "confidence": "none", "detection_score": 0,
+            "signals": [], "candidates": {}, "version": None,
+            "version_source": None, "findings": [], "users": [],
+            "plugins": [], "themes": [], "paths_probed": 0,
+            "severity_counts": {},
+            "platforms": ["Magento"], "not_deep_scanned": ["Magento"],
+            "addons": [],
+            "note": "Magento identified, but Kumo has no deep checks for it yet.",
         },
         "panels": {
             "domain": "example.com", "cdn": None, "cdn_note": "",
@@ -274,13 +287,20 @@ def main():
     harness = """
     const __out = [];
     for (const [mod, payload] of Object.entries(__PAYLOADS__)) {
-      const id = mod.replace(/_plain$/, '');
+      // Fixture names carry a variant suffix so one module can be exercised
+      // with several payload shapes. Strip it to get the real renderer id --
+      // without this, a fixture named cms_none calls a renderer that does not
+      // exist, falls through to the default case, and passes having tested
+      // nothing.
+      const id = mod.replace(/_(plain|none|not_deep)$/, '');
       for (const [label, data] of [['normal', payload], ['error', {error:'Module timed out after 60s'}], ['empty', {}]]) {
         try {
           const html = renderContent(id, data);
           const badges = getBadges(id, data);
           if (typeof html !== 'string') throw new Error('renderContent did not return a string');
-          __out.push({mod, label, ok:true, len:html.length});
+          __out.push({mod, label, ok:true, len:html.length,
+                      html: label === 'normal' ? html : undefined,
+                      badges: label === 'normal' ? JSON.stringify(badges) : undefined});
         } catch (e) {
           __out.push({mod, label, ok:false, err:String(e && e.message || e)});
         }
@@ -319,6 +339,33 @@ def main():
         print(f"  {mark} {mod:16} {D}{detail[:90]}{X}")
         for r in bad:
             print(f"       {R}{r['label']}: {r['err']}{X}")
+
+    # A renderer returning *a* string is not enough -- it has to render the
+    # right thing. These check what the card actually says.
+    print(f"\n{B}What the card actually says{X}")
+    normal = {r["mod"]: r for r in results if r["label"] == "normal"}
+
+    def says(mod, must, must_not=()):
+        row = normal.get(mod) or {}
+        html = row.get("html") or ""
+        badges = row.get("badges") or ""
+        blob = html + badges
+        missing = [s for s in must if s not in blob]
+        present = [s for s in must_not if s in blob]
+        ok = not missing and not present
+        if not ok:
+            fails.append({"mod": mod, "label": "content",
+                          "err": f"missing={missing} unexpected={present}"})
+        print(f"  {G+'ok  '+X if ok else R+'FAIL'+X} {mod:16} "
+              + (f"{D}says {must[0]!r}{X}" if ok
+                 else f"{R}missing={missing} unexpected={present}{X}"))
+
+    # the platform-without-deep-checks card must name the platform and must
+    # NOT claim no CMS was found
+    says("cms_not_deep", ["Magento", "No deep checks", "no deep checks"],
+         must_not=["No CMS identified"])
+    says("cms_none", ["No CMS identified"], must_not=["Magento"])
+    says("cms", ["WordPress"])
 
     print()
     if fails:

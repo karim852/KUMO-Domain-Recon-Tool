@@ -5042,25 +5042,48 @@ def scan_tech(domain):
     detected = {}
 
     categories = {
-        "CMS": {"WordPress": [r'wp-content', r'wp-includes'], "Drupal": [r'Drupal', r'sites/default/files'],
-                 "Joomla": [r'/media/jui/'], "Shopify": [r'cdn\.shopify\.com'], "Wix": [r'wix\.com'],
-                 "Squarespace": [r'squarespace\.com'], "Webflow": [r'webflow\.com'], "Magento": [r'Magento']},
+        # Product names are prose, not evidence -- see the note in
+        # _whatweb_python. Patterns here match asset paths, JS globals and
+        # headers; ("h", ...) restricts a pattern to headers and cookies.
+        "CMS": {"WordPress": [r'/wp-content/', r'/wp-includes/', r'wp-json'],
+                 "Drupal": [r'sites/default/files', r'Drupal\.settings', r'/misc/drupal\.js'],
+                 "Joomla": [r'/media/jui/', r'/components/com_', r'/media/system/js/',
+                            ("b", r'name=["\']generator["\'][^>]*Joomla')],
+                 "Shopify": [r'cdn\.shopify\.com'], "Wix": [r'static\.wixstatic\.com'],
+                 "Squarespace": [r'static\.squarespace\.com'],
+                 "Webflow": [r'assets[\-.]website\.files\.com', r'\.webflow\.io'],
+                 "Magento": [r'Mage\.Cookies', r'/skin/frontend/', r'var BLANK_URL']},
         "Frontend": {"React": [r'react\.production', r'react-dom'], "Vue.js": [r'vue\.js', r'Vue\.component'],
                      "Angular": [r'ng-app', r'ng-version'], "jQuery": [r'jquery'], "Next.js": [r'__NEXT_DATA__'],
                      "Nuxt.js": [r'__NUXT__'], "Bootstrap": [r'bootstrap\.min'], "Tailwind": [r'tailwindcss']},
-        "CDN": {"Cloudflare": [r'cloudflare', r'cf-ray'], "AWS CloudFront": [r'cloudfront\.net'],
-                "Fastly": [r'fastly'], "Vercel": [r'vercel'], "Netlify": [r'netlify']},
+        "CDN": {"Cloudflare": [("h", r'cf-ray'), ("h", r'cf-cache-status')],
+                "AWS CloudFront": [r'cloudfront\.net', ("h", r'X-Amz-Cf-Id')],
+                "Fastly": [("h", r'Fastly-|X-Served-By:\s*cache-'), r'fastly\.net'],
+                "Vercel": [r'vercel\.app', ("h", r'x-vercel-')],
+                "Netlify": [r'netlify\.app', ("h", r'x-nf-request-id')]},
         "Analytics": {"Google Analytics": [r'google-analytics\.com', r'gtag\('], "Facebook Pixel": [r'connect\.facebook\.net'],
-                      "Hotjar": [r'hotjar\.com'], "Segment": [r'segment\.com']},
-        "Security": {"Cloudflare WAF": [r'cf-ray'], "reCAPTCHA": [r'recaptcha'], "hCaptcha": [r'hcaptcha\.com'],
-                     "Sucuri WAF": [r'sucuri'], "Imperva": [r'incapsula']},
+                      "Hotjar": [r'static\.hotjar\.com'], "Segment": [r'cdn\.segment\.com']},
+        "Security": {"Cloudflare WAF": [("h", r'cf-ray')],
+                     "reCAPTCHA": [r'google\.com/recaptcha', r'grecaptcha'],
+                     "hCaptcha": [r'hcaptcha\.com'],
+                     "Sucuri WAF": [("h", r'x-sucuri-id|x-sucuri-cache'), r'sucuri\.net'],
+                     "Imperva": [("h", r'incap_ses|visid_incap|X-Iinfo'), r'/_Incapsula_Resource']},
     }
+
+    header_blob = str(resp.headers) + " " + str(resp.cookies.get_dict()
+                                                if hasattr(resp.cookies, "get_dict") else "")
+
+    def _hit(pattern):
+        if isinstance(pattern, tuple):
+            scope, pat = pattern
+            return re.search(pat, header_blob if scope == "h" else body, re.IGNORECASE)
+        return re.search(pattern, combined, re.IGNORECASE)
 
     for cat, techs in categories.items():
         found = []
         for name, patterns in techs.items():
             for p in patterns:
-                if re.search(p, combined, re.IGNORECASE):
+                if _hit(p):
                     found.append(name); break
         if found:
             detected[cat] = found
@@ -6320,6 +6343,81 @@ def _parse_whatweb_output(output):
     return detected
 
 
+# Platform fingerprints, shared by the whatweb module and the CMS deep scan
+# so both agree on what a platform is. Every pattern is structural: an asset
+# path, a JS global, a header or a cookie. A product's name in page text is
+# prose -- a blog comparing platforms, or a host selling them, prints every
+# brand here -- so no pattern matches a bare name. Scope prefixes:
+#   ("h", ...) headers and cookies only
+#   ("b", ...) body only
+#   plain str  either
+_WW_CMS_SIGS = {
+    "WordPress":          [r'wp-content/', r'wp-includes/', r'wp-json'],
+    "WordPress (login)":  [r'wp-login\.php'],
+    "Drupal":             [r'sites/default/files', r'Drupal\.settings', r'/misc/drupal\.js'],
+    "Joomla":             [r'/media/jui/', r'/components/com_', r'/media/system/js/',
+                           ("b", r'name=["\']generator["\'][^>]*Joomla')],
+    "Shopify":            [r'cdn\.shopify\.com', r'Shopify\.theme'],
+    "Wix":                [r'static\.wixstatic\.com', ("h", r'X-Wix-')],
+    "Squarespace":        [r'static\.squarespace\.com', r'squarespace-cdn\.com',
+                           ("b", r'name=["\']generator["\'][^>]*Squarespace')],
+    "Webflow":            [r'assets[\-.]website\.files\.com', r'uploads-ssl\.webflow\.com',
+                           r'\.webflow\.io',
+                           ("b", r'name=["\']generator["\'][^>]*Webflow')],
+    "Magento":            [r'Mage\.Cookies', r'/skin/frontend/', r'var BLANK_URL'],
+    "PrestaShop":         [r'/modules/blockcart/', r'var\s+prestashop',
+                           ("h", r'PrestaShop-\w+')],
+    "OpenCart":           [r'catalog/view/theme', r'route=common/home'],
+    "Ghost":              [r'/ghost/api/', ("b", r'content=["\']Ghost\s')],
+    "Typo3":              [r'typo3temp/', r'typo3conf/'],
+    "MODX":               [r'modx-Revolution', r'MODx\.'],
+    # not r'october/' -- that matches any URL holding a month name
+    "October CMS":        [r'/modules/system/assets/', r'/plugins/\w+/\w+/assets/',
+                           ("b", r'name=["\']generator["\'][^>]*October')],
+}
+
+_WW_ECOM_SIGS = {
+    "WooCommerce":        [r'/plugins/woocommerce/', r'wc-ajax=', r'wp-json/wc/'],
+    "BigCommerce":        [r'cdn\d*\.bigcommerce\.com', r'cdn\.bcapp\.dev'],
+    "Ecwid":              [r'app\.ecwid\.com', r'Ecwid\.init'],
+    "Stripe":             [r'js\.stripe\.com'],
+    "PayPal":             [r'paypal\.com/sdk', r'paypalobjects\.com'],
+}
+
+# The platforms scan_cms can actually go deep on. Anything else that is
+# fingerprinted gets reported as identified-but-not-deep-scanned, so a
+# Magento site is never mistaken for a site with nothing to check.
+_CMS_DEEP_SCANNED = {"WordPress", "Joomla", "Drupal"}
+
+
+def _platform_fingerprint(body, headers, cookies=""):
+    """
+    Identify CMS / storefront platforms from one already-fetched response.
+
+    Takes a response that has been fetched, so the CMS module and the whatweb
+    module can share a single homepage request instead of each making one.
+    Returns a sorted list of platform names.
+    """
+    header_blob = str(headers) + " " + str(cookies)
+    combined = body + str(headers)
+    out = []
+    for table in (_WW_CMS_SIGS, _WW_ECOM_SIGS):
+        for name, pats in table.items():
+            for p in pats:
+                if isinstance(p, tuple):
+                    hay = header_blob if p[0] == "h" else body
+                    pat = p[1]
+                else:
+                    hay, pat = combined, p
+                if re.search(pat, hay, re.IGNORECASE):
+                    out.append(name)
+                    break
+    # "WordPress (login)" only adds a detail to WordPress
+    if "WordPress (login)" in out and "WordPress" in out:
+        out.remove("WordPress (login)")
+    return sorted(set(out))
+
+
 def _whatweb_python(domain):
     """Deep Python-based tech fingerprinter — 80+ signatures."""
     if not HAS_REQUESTS:
@@ -6350,30 +6448,8 @@ def _whatweb_python(domain):
     detected = {}
 
     SIGNATURES = {
-        "CMS": {
-            "WordPress":          [r'wp-content/', r'wp-includes/', r'wp-json'],
-            "WordPress (login)":  [r'wp-login\.php'],
-            "Drupal":             [r'sites/default/files', r'Drupal\.settings', r'/misc/drupal\.js'],
-            "Joomla":             [r'/media/jui/', r'Joomla!', r'/components/com_'],
-            "Shopify":            [r'cdn\.shopify\.com', r'Shopify\.theme'],
-            "Wix":                [r'static\.wixstatic\.com', r'X-Wix-'],
-            "Squarespace":        [r'squarespace\.com', r'static\.squarespace\.com'],
-            "Webflow":            [r'webflow\.com', r'Webflow'],
-            "Magento":            [r'Mage\.Cookies', r'/skin/frontend/', r'var BLANK_URL'],
-            "PrestaShop":         [r'prestashop', r'/modules/blockcart/'],
-            "OpenCart":           [r'catalog/view/theme', r'route=common/home'],
-            "Ghost":              [r'ghost/api', r'content="Ghost '],
-            "Typo3":              [r'typo3temp/', r'typo3conf/'],
-            "MODX":               [r'modx-Revolution', r'MODx\.'],
-            "October CMS":        [r'october/', r'cms::'],
-        },
-        "E-Commerce": {
-            "WooCommerce":        [r'woocommerce', r'wc-api'],
-            "BigCommerce":        [r'bigcommerce\.com', r'cdn\.bcapp\.dev'],
-            "Ecwid":              [r'ecwid\.com', r'Ecwid\.init'],
-            "Stripe":             [r'js\.stripe\.com', r'stripe\.com/v1'],
-            "PayPal":             [r'paypal\.com/sdk', r'paypalobjects\.com'],
-        },
+        "CMS": _WW_CMS_SIGS,
+        "E-Commerce": _WW_ECOM_SIGS,
         "Frontend Framework": {
             "React":              [r'react\.production\.min', r'__REACT_DEVTOOLS', r'_reactFiber'],
             "Vue.js":             [r'vue\.min\.js', r'Vue\.component\(', r'__vue__'],
@@ -6400,26 +6476,42 @@ def _whatweb_python(domain):
             "Alpine.js":          [r'alpinejs', r'x-data='],
         },
         "Server / Language": {
-            "PHP":                [r'\.php["\s?/]', r'PHPSESSID'],
-            "ASP.NET":            [r'__VIEWSTATE', r'__EVENTVALIDATION', r'aspnet'],
-            "ASP.NET MVC":        [r'__RequestVerificationToken', r'mvc'],
-            "Java / JSP":         [r'\.jsp["\s?/]', r'JSESSIONID'],
-            "Ruby on Rails":      [r'_session_id', r'X-Runtime.*Ruby'],
-            "Django":             [r'csrfmiddlewaretoken', r'django'],
-            "Flask":              [r'Werkzeug/', r'flask'],
-            "Laravel":            [r'laravel_session', r'Laravel'],
-            "Express.js":         [r'X-Powered-By.*Express'],
-            "Node.js":            [r'X-Powered-By.*Node'],
-            "Python":             [r'X-Powered-By.*Python', r'gunicorn'],
+            # A runtime proves itself with its header or its session cookie.
+            # Article text quotes "X-Powered-By: Express" and names files like
+            # settings.php, so those patterns are scoped away from the body;
+            # a .php in an href or form action is still real evidence.
+            "PHP":                [("h", r'PHPSESSID|X-Powered-By:[^\n]*PHP'),
+                                   ("b", r'(?:href|src|action)=["\'][^"\']*\.php')],
+            "ASP.NET":            [r'__VIEWSTATE', r'__EVENTVALIDATION',
+                                   ("h", r'X-AspNet-Version|ASP\.NET_SessionId')],
+            "ASP.NET MVC":        [r'__RequestVerificationToken',
+                                   ("h", r'X-AspNetMvc-Version')],
+            "Java / JSP":         [("h", r'JSESSIONID'),
+                                   ("b", r'(?:href|src|action)=["\'][^"\']*\.jsp')],
+            "Ruby on Rails":      [("h", r'_session_id|X-Runtime')],
+            "Django":             [r'csrfmiddlewaretoken', ("h", r'csrftoken')],
+            "Flask":              [("h", r'Werkzeug/|session=eyJ')],
+            "Laravel":            [("h", r'laravel_session|XSRF-TOKEN')],
+            "Express.js":         [("h", r'X-Powered-By:\s*Express')],
+            "Node.js":            [("h", r'X-Powered-By:\s*Node')],
+            "Python":             [("h", r'X-Powered-By:[^\n]*Python|Server:[^\n]*gunicorn')],
         },
         "CDN / Hosting": {
-            "Cloudflare":         [r'cf-ray', r'cloudflare', r'__cfduid'],
-            "AWS CloudFront":     [r'cloudfront\.net', r'X-Amz-Cf-Id'],
-            "AWS S3":             [r's3\.amazonaws\.com', r'AmazonS3'],
-            "Fastly":             [r'Fastly-', r'fastly\.net'],
-            "Akamai":             [r'akamaiedge\.net', r'akamai'],
-            "Vercel":             [r'vercel\.app', r'x-vercel-'],
-            "Netlify":            [r'netlify\.app', r'netlify\.com'],
+            # An edge provider proves itself with the headers and cookies it
+            # adds, not with its name in the page. Body matches here are left
+            # to asset hostnames, which a site cannot mention by accident.
+            "Cloudflare":         [("h", r'cf-ray'), ("h", r'cf-cache-status'),
+                                   ("h", r'__cf[a-z]*uid|__cflb|cf_clearance'),
+                                   r'/cdn-cgi/(?:scripts|challenge-platform)/'],
+            "AWS CloudFront":     [r'cloudfront\.net', ("h", r'X-Amz-Cf-Id')],
+            "AWS S3":             [r's3[.\-][\w\-]*\.?amazonaws\.com',
+                                   ("h", r'AmazonS3')],
+            "Fastly":             [("h", r'Fastly-|X-Served-By:\s*cache-'),
+                                   r'fastly\.net'],
+            "Akamai":             [r'akamaiedge\.net|akamaihd\.net',
+                                   ("h", r'X-Akamai|AkamaiGHost')],
+            "Vercel":             [r'vercel\.app', ("h", r'x-vercel-')],
+            "Netlify":            [r'netlify\.app', ("h", r'x-nf-request-id|Netlify')],
             "GitHub Pages":       [r'github\.io'],
             "Heroku":             [r'heroku\.com', r'herokuapp\.com'],
             "DigitalOcean":       [r'digitaloceanspaces\.com'],
@@ -6441,11 +6533,13 @@ def _whatweb_python(domain):
             "Tawk.to":            [r'tawk\.to'],
         },
         "Security": {
-            "Cloudflare WAF":     [r'cf-ray'],
+            "Cloudflare WAF":     [("h", r'cf-ray')],
             "reCAPTCHA":          [r'recaptcha\.net', r'g-recaptcha'],
             "hCaptcha":           [r'hcaptcha\.com'],
-            "Sucuri WAF":         [r'Sucuri', r'sucuri\.net'],
-            "Imperva / Incapsula": [r'incapsula', r'Imperva'],
+            "Sucuri WAF":         [("h", r'x-sucuri-id|x-sucuri-cache'),
+                                   r'sucuri\.net'],
+            "Imperva / Incapsula": [("h", r'incap_ses|visid_incap|X-Iinfo|X-CDN:\s*Incapsula'),
+                                    r'/_Incapsula_Resource'],
             "Wordfence":          [r'wordfence'],
             "ModSecurity":        [r'Mod_Security', r'NOYB'],
         },
@@ -6482,11 +6576,30 @@ def _whatweb_python(domain):
         "Next.js":     r'"version":"([\d\.]+)".*next',
     }
 
+    # Where a pattern is allowed to match. A product name printed in the page
+    # text is prose, not proof: a blog comparing CMS platforms, or a hosting
+    # company selling them, says "Joomla!" and "Cloudflare" in plain copy. So
+    # evidence that only means something as a header or a cookie is scoped to
+    # headers and cookies, and never read out of the body.
+    #   "h" -> response headers and cookies only
+    #   "b" -> response body only
+    #   plain string -> either (asset URLs and JS globals, safe in both)
+    header_blob = str(hdrs) + " " + str(cookies)
+
+    def _ww_hit(pattern):
+        if isinstance(pattern, tuple):
+            scope, pat = pattern
+            hay = header_blob if scope == "h" else body
+        else:
+            hay = combined
+            pat = pattern
+        return re.search(pat, hay, re.IGNORECASE)
+
     for cat, techs in SIGNATURES.items():
         found = []
         for name, patterns in techs.items():
             for p in patterns:
-                if re.search(p, combined, re.IGNORECASE):
+                if _ww_hit(p):
                     entry = name
                     # Try to extract version
                     if name in version_patterns:
@@ -11439,15 +11552,53 @@ def scan_cms(domain):
         "candidates": det["candidates"], "version": None, "version_source": None,
         "findings": [], "users": [], "plugins": [], "themes": [],
         "paths_probed": 0, "severity_counts": {},
+        "platforms": [], "not_deep_scanned": [], "addons": [],
     }
     if det.get("error"):
         result["error"] = det["error"]
         return result
+
+    # One homepage fetch, shared between platform fingerprinting and the brand
+    # check below, rather than a request each.
+    _home = None
+    try:
+        _home = _cms_get(domain, "/")
+    except Exception:
+        pass
+
+    # The deep scan knows three platforms; the fingerprint table knows twenty.
+    # Run it so a Magento or Shopify site is named instead of coming back
+    # blank, which would read as "nothing here".
+    if _home is not None:
+        try:
+            result["platforms"] = _platform_fingerprint(
+                _home.text[:100000], dict(_home.headers),
+                {c.name: c.value for c in _home.cookies})
+        except Exception:
+            pass
+
+    # Storefront add-ons (WooCommerce on WordPress, Stripe anywhere) are not
+    # rival platforms, so they are listed separately rather than reported as
+    # a CMS nobody scanned.
+    result["addons"] = [p for p in result["platforms"] if p in _WW_ECOM_SIGS]
+    result["not_deep_scanned"] = [p for p in result["platforms"]
+                                  if p not in _CMS_DEEP_SCANNED
+                                  and p not in _WW_ECOM_SIGS]
+
     if not det["cms"]:
-        # Say what was seen rather than nothing, so a near miss is debuggable.
-        result["note"] = ("No CMS identified. Weak signals: "
-                          + (", ".join(f"{k}={v}" for k, v in det["candidates"].items())
-                             or "none")) if det["candidates"] else "No CMS identified."
+        if result["not_deep_scanned"]:
+            # Identified, but there are no checks for it yet. Say so plainly:
+            # silence here would be read as a clean result.
+            names = ", ".join(result["not_deep_scanned"])
+            result["note"] = (
+                f"{names} identified, but Kumo has no deep checks for "
+                f"{'it' if len(result['not_deep_scanned']) == 1 else 'them'} yet. "
+                f"Deep checks cover WordPress, Joomla and Drupal.")
+        else:
+            # Say what was seen rather than nothing, so a near miss is debuggable.
+            result["note"] = ("No CMS identified. Weak signals: "
+                              + (", ".join(f"{k}={v}" for k, v in det["candidates"].items())
+                                 or "none")) if det["candidates"] else "No CMS identified."
         return result
 
     cms = det["cms"]
@@ -11465,10 +11616,21 @@ def scan_cms(domain):
             "confidence": "version-inference",
         })
 
+    # Independent corroboration: the fingerprint table reached the same
+    # conclusion from different patterns, or it did not. Both are worth saying.
+    _name = _cms_name(cms)
+    if result["platforms"]:
+        if _name in result["platforms"]:
+            result["corroborated_by"] = "platform fingerprint"
+            result["signals"] = list(result["signals"]) + ["platform fingerprint agrees"]
+        elif result["not_deep_scanned"]:
+            result["platform_conflict"] = (
+                f"detected {_name}, but fingerprinting also matched "
+                f"{', '.join(result['not_deep_scanned'])}")
+
     base_sigs = _catchall_baseline(domain)
     brand = None
     try:
-        _home = _cms_get(domain, "/")
         brand = _site_brand(domain, _home) if _home is not None else None
     except Exception:
         pass
