@@ -1,5 +1,38 @@
 # Kumo — themed build
 
+## Per-email stealer check now checks every address
+
+The breachintel card's "Per-Email Stealer Check" was checking far fewer
+addresses than it appeared to, and on many domains none at all.
+
+Four problems, all now fixed:
+
+1. **The first per-email block was dead code.** It built its address list in a
+   loop whose body was a bare `pass`, so the list was always empty and the
+   block never ran.
+2. **The harvester's addresses never reached it.** `harvested_emails` was
+   hardcoded to `[]` with a comment saying another module would fill it;
+   nothing ever did. So the check only saw Chiasmodon and ProxyNova results,
+   never the company's published staff addresses — the ones most worth
+   checking. If those two APIs returned nothing, **zero** lookups ran.
+3. **A silent cap of 20**, applied alphabetically. On a domain with 60
+   addresses, 40 went unchecked with nothing in the output saying so.
+4. **A rate-limited lookup counted as clean.** Any non-200 response made the
+   address disappear from the results, and a 429 is exactly what a free API
+   returns when you check a lot of addresses.
+
+`_collect_domain_emails` is now a shared, cached harvester that both
+email_harvest and breachintel call, so the check sees every address found.
+There is no cap unless you set `KUMO_MAX_EMAIL_CHECKS`, and the card shows
+collected / checked / clean / not-determined / skipped with a per-source
+breakdown. `compromised` is tri-state, so "could not check" is displayed and
+counted separately from "clean" and never looks green.
+
+New `test_stealer_coverage.py` proves all 60 of 60 collected addresses get
+checked, that nothing is dropped silently, and that a failed lookup is never
+reported as clean.
+
+
 ## Email security module rewritten
 
 `scan_dns` read SPF, DMARC and DKIM with substring searches. On tag-value

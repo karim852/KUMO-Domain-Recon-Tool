@@ -8610,14 +8610,13 @@ def scan_breachintel(domain):
                     "detail": f"Primary malware: {top_family[0]} ({top_family[1]} infections)",
                 })
 
-            # Per-email stealer check — extract emails from employee_urls
+            # NOTE: this block used to build `employee_emails` from
+            # hr["employee_urls"], but its loop body was a bare `pass`, so the
+            # set was always empty, the `if employee_emails:` below never fired
+            # and hr["email_stealer_checks"] was always []. The per-email check
+            # that actually runs is SOURCE 5 further down, which now reads every
+            # harvested address. Kept here only as the per-email result shape.
             employee_emails = set()
-            for url_entry in hr["employee_urls"][:20]:
-                if isinstance(url_entry, dict):
-                    url_val = url_entry.get("url", "")
-                    # Try to extract email-like username from URL
-                    # e.g. https://mail.domain.com/mail/user.nsf
-                    pass
 
             def check_email_stealer(email):
                 try:
@@ -9003,13 +9002,28 @@ def scan_breachintel(domain):
         if _em and _em.endswith("@" + _dom_lo):
             all_stealer_emails.add(_em)
 
-    results["sources"]["harvested_emails"] = []  # populated separately by email_harvest module
+    # Every address the email harvester found. This is the main source: the
+    # harvester scrapes the site, crt.sh and DNS, and used to be ignored here
+    # (harvested_emails was hardcoded to [] with a comment saying another module
+    # would fill it, which nothing ever did). So the stealer check only ever saw
+    # credential-leak emails and missed the company's actual published staff
+    # addresses — the ones most worth checking.
+    try:
+        _harvested, _hdetails, _hsources = _collect_domain_emails(domain)
+    except Exception:
+        _harvested, _hdetails, _hsources = set(), {}, []
+    for _em in _harvested:
+        _em = (_em or "").lower().strip()
+        if _em.endswith("@" + _dom_lo):
+            all_stealer_emails.add(_em)
+    results["sources"]["harvested_emails"] = sorted(_harvested)
 
     # Final safety guard — strip any non-@domain email that slipped through
     all_stealer_emails = {e for e in all_stealer_emails if e.endswith("@" + _dom_lo)}
 
     # Run HR check on collected emails (up to 20, in parallel)
     hr_per_email = {}
+    _skipped = 0
     if all_stealer_emails:
         _HR_HDR = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36", "Accept": "application/json"}
 
@@ -9020,6 +9034,13 @@ def scan_breachintel(domain):
                     f"https://cavalier.hudsonrock.com/api/json/v2/osint-tools/search-by-email?email={_q(email)}",
                     headers=_HR_HDR, timeout=10, verify=False, allow_redirects=True
                 )
+                if _r.status_code == 429:
+                    # Rate limited. "Not compromised" would be a false
+                    # negative, so the unknown is reported as unknown.
+                    return email, {"compromised": None, "status": "rate_limited"}
+                if _r.status_code != 200:
+                    return email, {"compromised": None,
+                                   "status": f"http_{_r.status_code}"}
                 if _r.status_code == 200:
                     _j = _r.json()
                     _stealers = _j.get("stealers", [])
@@ -9038,11 +9059,25 @@ def scan_breachintel(domain):
                             "count":                    len(_stealers),
                         }
                     return email, {"compromised": False}
-            except Exception:
-                pass
-            return email, None
+            except Exception as _e:
+                # A timeout or connection error is also not evidence of safety.
+                return email, {"compromised": None, "status": f"error: {type(_e).__name__}"}
+            return email, {"compromised": None, "status": "no_response"}
 
-        _email_list = sorted(all_stealer_emails)[:20]
+        # Check EVERY collected address. This used to be sorted(...)[:20], which
+        # silently dropped every address past the twentieth alphabetically — on
+        # a domain with 60 staff addresses, 40 went unchecked and nothing in the
+        # output said so. KUMO_MAX_EMAIL_CHECKS caps it for anyone who needs to
+        # (0 or unset means no limit), and whatever happens the counts are
+        # reported rather than quietly truncated.
+        try:
+            _cap = int(os.environ.get("KUMO_MAX_EMAIL_CHECKS", "0") or 0)
+        except ValueError:
+            _cap = 0
+        _all_sorted = sorted(all_stealer_emails)
+        _email_list = _all_sorted[:_cap] if _cap > 0 else _all_sorted
+        _skipped = len(_all_sorted) - len(_email_list)
+
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as _hrex:
             for _email, _result in _hrex.map(_check_hr_email, _email_list):
                 if _result is not None:
@@ -9061,6 +9096,24 @@ def scan_breachintel(domain):
                         })
 
     results["sources"]["hr_per_email"] = hr_per_email
+    # Coverage, so the operator can see what was actually checked rather than
+    # having to assume the list is complete.
+    _vals = list(hr_per_email.values())
+    results["sources"]["hr_per_email_stats"] = {
+        "emails_collected": len(all_stealer_emails),
+        "emails_checked":   len(hr_per_email),
+        "emails_skipped":   _skipped,
+        "compromised":      sum(1 for v in _vals if v.get("compromised") is True),
+        "clean":            sum(1 for v in _vals if v.get("compromised") is False),
+        "unknown":          sum(1 for v in _vals if v.get("compromised") is None),
+        "sources": {
+            "harvester":  len(_harvested),
+            "chiasmodon": len([1 for _l in chia.get("employee_logins", [])
+                               if (_l.get("email") or "").lower().endswith("@" + _dom_lo)]),
+            "proxynova":  len([1 for _e in pn.get("unique_emails", [])
+                               if str(_e).lower().endswith("@" + _dom_lo)]),
+        },
+    }
 
     # ══════════════════════════════════════════════════════
     # OSINT DEEP LINKS (always generated, no key needed)
@@ -9088,17 +9141,37 @@ def scan_breachintel(domain):
 # MODULE: EMAIL HARVESTER
 # ═══════════════════════════════════════════════════════════════
 
-def scan_email_harvest(domain):
+import threading as _threading
+
+_EMAIL_HARVEST_CACHE = {}
+_EMAIL_HARVEST_LOCK = _threading.Lock()
+
+
+def _collect_domain_emails(domain):
     """
-    Harvest @domain.com employee email addresses from multiple open sources:
+    Harvest @domain email addresses from open sources. Returns
+    (emails_set, details, sources_used).
+
+    Shared by scan_email_harvest and scan_breachintel so the per-email stealer
+    check sees every address the harvester found. The result is cached per
+    domain for the life of the process and guarded by a lock, because the two
+    modules run concurrently in the web UI: without it they would either
+    duplicate every request or race.
+
+    Sources:
       1. Hunter.io public domain search (no key, limited)
       2. crt.sh certificate transparency logs
       3. Web page scraping (contact/about/team pages)
       4. Homepage scrape
       5. DNS SOA record (admin email field)
-    Only collects emails — stealer checks happen in breachintel module.
     """
     import re as _re
+
+    key = (domain or "").lower()
+    with _EMAIL_HARVEST_LOCK:
+        if key in _EMAIL_HARVEST_CACHE:
+            cached = _EMAIL_HARVEST_CACHE[key]
+            return set(cached[0]), dict(cached[1]), list(cached[2])
 
     emails_found = set()
     sources_used = []
@@ -9208,9 +9281,22 @@ def scan_email_harvest(domain):
         pass
 
 
-    # Collect unique emails as simple sorted list
-    email_list = sorted(emails_found)
+    with _EMAIL_HARVEST_LOCK:
+        _EMAIL_HARVEST_CACHE[key] = (set(emails_found), dict(email_details),
+                                     list(set(sources_used)))
+    return emails_found, email_details, list(set(sources_used))
 
+
+def scan_email_harvest(domain):
+    """
+    Harvest @domain employee email addresses from open sources.
+
+    Only collects emails. The per-email infostealer lookup happens in the
+    breachintel module, which reads the same harvest through
+    _collect_domain_emails.
+    """
+    emails_found, _details, sources_used = _collect_domain_emails(domain)
+    email_list = sorted(emails_found)
     return {
         "total":        len(email_list),
         "emails":       email_list,

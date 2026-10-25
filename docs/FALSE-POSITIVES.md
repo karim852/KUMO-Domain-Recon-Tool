@@ -380,6 +380,70 @@ does.
 end through a stubbed resolver, including the case where absence must NOT be
 claimed.
 
+## Fifth pass — the per-email stealer check
+
+The card has a "Per-Email Stealer Check" section. It was checking far fewer
+addresses than it looked like, and in one path, none at all.
+
+### 18. The first per-email check was dead code
+
+```python
+employee_emails = set()
+for url_entry in hr["employee_urls"][:20]:
+    if isinstance(url_entry, dict):
+        url_val = url_entry.get("url", "")
+        pass          # <- the whole loop body
+if employee_emails:   # always False
+```
+
+The set was never populated, so the block never ran and
+`hr["email_stealer_checks"]` was always empty.
+
+### 19. The harvester's addresses never reached the check
+
+`results["sources"]["harvested_emails"]` was hardcoded to `[]` with a comment
+saying the email_harvest module would fill it. Nothing ever did — that line was
+the only reference to the key in the entire codebase. Meanwhile
+`scan_email_harvest`'s own docstring said "stealer checks happen in breachintel
+module". Each module was waiting for the other.
+
+The practical effect: the stealer check only ever saw addresses that came back
+from Chiasmodon and ProxyNova, the credential-leak sources. The company's
+actual published staff addresses — scraped from the site, crt.sh and DNS, and
+the ones most worth checking — were never looked up. On a domain where those
+two APIs returned nothing, **zero** lookups were performed.
+
+`_collect_domain_emails` is now a shared, cached, lock-guarded harvester that
+both modules call, so the check sees every address the harvester found. The
+cache matters because the two modules run concurrently in the web UI; without
+it they would duplicate every request or race.
+
+### 20. A hard cap of 20, applied silently
+
+```python
+_email_list = sorted(all_stealer_emails)[:20]
+```
+
+Alphabetical, so on a domain with 60 addresses the 40 after the twentieth went
+unchecked — and nothing in the output said so. The card read "N infected / 20
+checked" with no hint that 40 more existed.
+
+The cap is now opt-in through `KUMO_MAX_EMAIL_CHECKS` (unset means check
+everything), and `hr_per_email_stats` reports collected / checked / skipped
+with a per-source breakdown, so the coverage is visible instead of assumed.
+
+### 21. A rate-limited lookup counted as clean
+
+`if _r.status_code == 200:` and nothing else — any other status fell through to
+`return email, None` and the address vanished from the results. A 429 from
+Hudson Rock, which is exactly what happens when you check a lot of addresses
+against a free API, produced silence that read as safety.
+
+`compromised` is now tri-state: `True`, `False`, or `None` for "not
+determined", carrying the reason. The UI counts and lists those separately and
+never colours them as clean. This is the same rule as the DNS module's failed
+lookups: **absence of an answer is not an answer.**
+
 ## Rules of thumb for new checks
 
 1. **Never let a status code alone be evidence.** Pair it with a word matcher.
@@ -401,6 +465,8 @@ claimed.
    BIMI records are parsed, not searched: `p=none` is a substring of `sp=none`.
 10. **A failed lookup is not an absent record.** If a check reports something
    missing, be sure the query actually succeeded first.
-11. **Don't claim absence you cannot establish.** DKIM selectors can't be
+11. **Never cap a result set silently.** If a limit applies, report what was
+   collected, what was checked and what was skipped.
+12. **Don't claim absence you cannot establish.** DKIM selectors can't be
    enumerated, so a miss is "not found at the names we tried". Where absence is
    unprovable, the finding earns credit when present but costs nothing when not.

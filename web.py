@@ -1228,12 +1228,31 @@ function renderContent(id, data) {
     const hrPE=(data.sources||{}).hr_per_email||{};
     const hrPEEmails=Object.keys(hrPE);
     if(hrPEEmails.length){
-      const infected=hrPEEmails.filter(e=>hrPE[e]?.compromised);
+      // compromised is tri-state: true / false / null. null means the lookup
+      // did not answer (rate limit, timeout), which is NOT the same as clean
+      // and must never be counted or displayed as such.
+      const infected=hrPEEmails.filter(e=>hrPE[e]?.compromised===true);
+      const unknown =hrPEEmails.filter(e=>hrPE[e]?.compromised===null||hrPE[e]?.compromised===undefined);
+      const st2=(data.sources||{}).hr_per_email_stats||{};
       h+=`<div class="sec" style="color:${infected.length?'var(--red)':'var(--green)'}">☠ Stealer Check — ${infected.length} infected / ${hrPEEmails.length} checked</div>`;
+      h+=`<div style="font-size:10px;color:var(--text3);margin:-2px 0 7px">`
+       + `collected <b>${st2.emails_collected||hrPEEmails.length}</b> address(es)`
+       + (st2.sources?` (harvester ${st2.sources.harvester||0} · chiasmodon ${st2.sources.chiasmodon||0} · proxynova ${st2.sources.proxynova||0})`:'')
+       + ` · checked <b>${st2.emails_checked||hrPEEmails.length}</b>`
+       + (st2.clean!==undefined?` · clean <b>${st2.clean}</b>`:'')
+       + (unknown.length?` · <span class="c-yellow">not determined <b>${unknown.length}</b></span>`:'')
+       + (st2.emails_skipped?` · <span class="c-yellow">skipped <b>${st2.emails_skipped}</b> (KUMO_MAX_EMAIL_CHECKS)</span>`:'')
+       + `</div>`;
+      if(unknown.length){
+        h+=`<div class="alert a-yellow" style="font-size:10px;padding:5px 8px;margin-bottom:6px">`
+         + `${unknown.length} address(es) could not be checked (rate limit or timeout). `
+         + `Not determined, not clean: ${unknown.slice(0,6).map(e=>escH(e)).join(', ')}`
+         + (unknown.length>6?` +${unknown.length-6} more`:'')+`</div>`;
+      }
       [...hrPEEmails].sort((a,b)=>(hrPE[b].compromised?1:0)-(hrPE[a].compromised?1:0)).forEach(em=>{
         const st=hrPE[em]||{};
-        const inf=st.compromised;
-        if(!inf) return; // skip CLEAN — user only cares about infected
+        const inf=st.compromised===true;
+        if(!inf) return; // clean and not-determined are summarised above
         h+=`<div class="alert a-red" style="margin-bottom:5px;padding:6px 10px">
           <div style="font-weight:700;font-size:11px;font-family:monospace">${escH(em)}
             <span class="badge ${inf?'b-fail':'b-pass'}" style="margin-left:6px">${inf?'☠ INFECTED':'✓ CLEAN'}</span>
