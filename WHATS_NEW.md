@@ -212,7 +212,7 @@ Mining now also covers `http/vulnerabilities/backdoor`. Templates that prove a
 backdoor by POSTing a command to it are excluded by design — the miner keeps
 GET-detection templates only.
 
-Full inventory: [`docs/RULES.md`](docs/RULES.md).
+Full inventory: [`docs/CHECKS.md`](docs/CHECKS.md).
 
 ## Three more precision fixes
 

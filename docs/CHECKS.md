@@ -1,10 +1,16 @@
-# Kumo vulnerability playbook
+# What Kumo checks
 
-**420 rules.** Every one is a GET plus a response signature: Kumo probes a path and matches evidence in the reply. No rule sends a payload, executes anything, or interacts with what it finds.
+**420 vulnerability rules**, **141 sensitive paths**, **64 API probes**.
 
-Validation: `test_rules.py` runs every rule against 11 decoy responses, proves each rule's evidence survives its own path scrub, and checks version rules against both vulnerable and patched releases. `test_versions.py` repeats the version checks over real HTTP. `test_fp.py` scans nine benign host shapes. `test_live.py` scans the vulnerable lab.
+Every check is a GET plus a response signature. Nothing sends a payload, executes anything, or interacts with what it finds.
 
-Findings carry a `confidence` field. `confirmed` means the response itself held the evidence; `version-inference` means only an advertised version number was compared, which a backported distro patch can leave stale — verify those before reporting.
+- [Vulnerability rules](#vulnerability-rules)
+- [Sensitive paths](#sensitive-paths)
+- [API probes](#api-probes)
+
+---
+
+## Vulnerability rules
 
 | severity | count |
 |---|---|
@@ -13,13 +19,13 @@ Findings carry a `confidence` field. `confirmed` means the response itself held 
 | medium | 137 |
 | low | 63 |
 
-**Origin:** nuclei 338, handwritten 32, kumo-webshell 27, nuclei-unauth 23
+Origin: nuclei 338, handwritten 32, kumo-webshell 27, nuclei-unauth 23
 
 | # | severity | id | path | name |
 |---|---|---|---|---|
 | 1 | critical | `CVE-2024-40711` | `/api/v1/serverinfo` | Veeam Backup & Replication - Unauthenticated |
 | 2 | critical | `CVE-2025-49001` | `/de2api/user/info` | DataEase < 2.10.10 - JWT Authentication Bypass |
-| 3 | critical | `CVE-2026-18072` | `/?_wplogin=35fe7057ffed92ff7bc5a0b90f302a77fb5843ad6c972294d68da0b0553b3900` | Advanced Responsive Video Embedder 10.8.7/10.8.8 - Hardcoded B |
+| 3 | critical | `CVE-2026-18072` | `/?_wplogin=35fe7057ffed92ff7bc5a0b90f302a77fb5843ad6c972294d68da0b0553b3900` | Advanced Responsive Video Embedder 10.8.7/10.8.8 - Hardcoded Backdoor  |
 | 4 | critical | `CVE-2026-21445` | `/api/v1/monitor/messages` | Langflow - Broken Access Control |
 | 5 | critical | `CVE-2026-42281` | `/cors?url=http://127.0.0.1:8080/version` | MagicMirror <= 2.35.0 - Server-Side Request Forgery |
 | 6 | critical | `CVE-2026-59774` | `/api/v1/repos/search?limit=1` | Gitea 1.22.1-1.27.0 - Unauthenticated Arbitrary File Read |
@@ -29,7 +35,7 @@ Findings carry a `confidence` field. `confirmed` means the response itself held 
 | 10 | critical | `axiom-digitalocean-key-exposure` | `/.axiom/accounts/do.json` | DigitalOcean Key Exposure via Axiom |
 | 11 | critical | `bitbucket-auth-bypass` | `/admin%20/db` | Bitbucket Server > 4.8 - Authentication Bypass |
 | 12 | critical | `circarlife-installer` | `/html/setup.html` | CirCarLife - Installer |
-| 13 | critical | `commax-credentials-disclosure` | `/overview.asp` | COMMAX Smart Home Ruvie CCTV Bridge DVR - RTSP Credentials Dis |
+| 13 | critical | `commax-credentials-disclosure` | `/overview.asp` | COMMAX Smart Home Ruvie CCTV Bridge DVR - RTSP Credentials Disclosure |
 | 14 | critical | `docker-api` | `/version` | Docker Remote API Exposed |
 | 15 | critical | `elasticsearch` | `/_cluster/health` | Elasticsearch Exposed |
 | 16 | critical | `env-file` | `/.env` | Environment File Exposed |
@@ -73,9 +79,9 @@ Findings carry a `confidence` field. `confirmed` means the response itself held 
 | 54 | critical | `webshell-wso-upload` | `/wp-content/uploads/wso.php` | WSO Web Shell Present (uploads) |
 | 55 | critical | `wp-config-bak` | `/wp-config.php.bak` | WordPress Config Backup Exposed |
 | 56 | critical | `wp-install` | `/wp-admin/install.php?step=1` | WordPress Exposed Installation |
-| 57 | critical | `wp-woocommerce-email-verification` | `/my-account/?alg_wc_ev_verify_email=eyJpZCI6MSwiY29kZSI6MH0=` | Email Verification for WooCommerce < 1.8.2 - Loose Comparison  |
+| 57 | critical | `wp-woocommerce-email-verification` | `/my-account/?alg_wc_ev_verify_email=eyJpZCI6MSwiY29kZSI6MH0=` | Email Verification for WooCommerce < 1.8.2 - Loose Comparison to Authe |
 | 58 | critical | `zipline-installer` | `/setup` | Zipline - Installer |
-| 59 | high | `CVE-2023-49230` | `/cgi-bin/MANGA/index.cgi` | Peplink Balance Two before 8.4.0 - Unauthenticated Config Uplo |
+| 59 | high | `CVE-2023-49230` | `/cgi-bin/MANGA/index.cgi` | Peplink Balance Two before 8.4.0 - Unauthenticated Config Upload |
 | 60 | high | `CVE-2025-1232` | `/wp-json/wp/v2/pages?per_page=100` | Site Reviews < 7.2.5 - Unauthenticated Stored XSS |
 | 61 | high | `CVE-2025-55523` | `/download_work_dir_file?path=/etc/passwd` | Agent-Zero 0.8.0 - 0.9.4 - Arbitrary File Download |
 | 62 | high | `CVE-2026-4020` | `/wp-json/gravitysmtp/v1/tests/mock-data?page=gravitysmtp-settings` | Gravity SMTP WordPress Plugin - Sensitive Information Exposure |
@@ -168,7 +174,7 @@ Findings carry a `confidence` field. `confirmed` means the response itself held 
 | 149 | high | `pcoweb-unauth` | `/config/pw_left_bar.html` | pCOWeb - Unauth |
 | 150 | high | `phalcon-framework-source` | `/anything_here` | Phalcon Framework - Source Code Leakage |
 | 151 | high | `photoprism-unauth-exposure` | `/api/v1/config` | PhotoPrism - Unauthenticated Exposure |
-| 152 | high | `php2shell-unpatched-php` | `/` | PHP Runtime Unpatched for php2shell RCE (CVE-2026-109618/10961 |
+| 152 | high | `php2shell-unpatched-php` | `/` | PHP Runtime Unpatched for php2shell RCE (CVE-2026-109618/109619) |
 | 153 | high | `phpbb-installer` | `/install/app.php` | phpBB Installation File Exposure |
 | 154 | high | `phpinfo` | `/phpinfo.php` | phpinfo() Exposed |
 | 155 | high | `phpipam-installer` | `/index.php?page=install` | PHP IPAM Installation Page - Exposed |
@@ -179,7 +185,7 @@ Findings carry a `confidence` field. `confirmed` means the response itself held 
 | 160 | high | `private-key-exposure` | `/node_modules/mqtt/test/helpers/` | Private key exposure via helper detector |
 | 161 | high | `profittrailer-installer` | `/setup/license` | ProfitTrailer Setup Page - Exposure |
 | 162 | high | `prometheus-unauth` | `/config` | Prometheus Monitoring System - Unauthenticated |
-| 163 | high | `qihang-media-disclosure` | `/xml/User/User.xml` | QiHang Media Web Digital Signage 3.0.9 - Cleartext Credentials |
+| 163 | high | `qihang-media-disclosure` | `/xml/User/User.xml` | QiHang Media Web Digital Signage 3.0.9 - Cleartext Credentials Disclos |
 | 164 | high | `rabbitmq-mgmt` | `/api/overview` | RabbitMQ Management Exposed |
 | 165 | high | `rack-mini-profiler` | `/?pp=env` | rack-mini-profiler - Environment Information Disclosure |
 | 166 | high | `rails-database-config` | `/config/database.yml` | Ruby on Rails Database Configuration File - Detect |
@@ -194,7 +200,7 @@ Findings carry a `confidence` field. `confirmed` means the response itself held 
 | 175 | high | `sabnzbd-installer` | `/sabnzbd/wizard/` | SABnzbd Quick-Start Wizard - Exposure |
 | 176 | high | `saltbo-zpan-installer` | `/api/system/options/core.email` | Saltbo/zpan Installer - Exposure |
 | 177 | high | `searchreplacedb2-exposure` | `/searchreplacedb2.php` | Safe Search Replace Exposure |
-| 178 | high | `secnet-info-leak` | `/actpt_5g.data` | Secnet Intelligent Routing System actpt_5g.data - Information  |
+| 178 | high | `secnet-info-leak` | `/actpt_5g.data` | Secnet Intelligent Routing System actpt_5g.data - Information Leak |
 | 179 | high | `selenium-exposure` | `/wd/hub` | Selenium - Node Exposure |
 | 180 | high | `service-pwd` | `/_vti_pvt/service.pwd` | service.pwd - Sensitive Information Disclosure |
 | 181 | high | `servicenow-title-injection` | `/login.do?jvar_page_title=<style><foo>Injected Title</foo></style>` | Service Now - Title Injection |
@@ -237,17 +243,17 @@ Findings carry a `confidence` field. `confirmed` means the response itself held 
 | 218 | high | `wordpress-total-upkeep-backup-download` | `/wp-content/plugins/boldgrid-backup/cron/restore-info.json` | WordPress Total Upkeep Database and Files Backup Download |
 | 219 | high | `wp-config-setup` | `/wp-admin/setup-config.php?step=1` | WordPress Setup Configuration |
 | 220 | high | `wpconfig-aws-keys` | `/wp-config.php.bak` | AWS S3 keys Leak |
-| 221 | medium | `CVE-2024-13126` | `/wp-content/uploads/download-manager-files/` | WordPress Download Manager < 3.3.07 - Unauthenticated Data Exp |
+| 221 | medium | `CVE-2024-13126` | `/wp-content/uploads/download-manager-files/` | WordPress Download Manager < 3.3.07 - Unauthenticated Data Exposure |
 | 222 | medium | `CVE-2024-30570` | `/debuginfo.htm` | Netgear R6850 - Information Disclosure |
 | 223 | medium | `CVE-2024-45591` | `/xwiki/rest/wikis/xwiki/spaces/Main/pages/WebHome/history` | XWiki Platform - Unauthorized Document History Access |
 | 224 | medium | `CVE-2024-54764` | `/login/hostinfo2.cgi` | ipTIME A2004 - Unauthorized Access |
-| 225 | medium | `CVE-2025-58226` | `/wp-admin/admin-ajax.php?action=fb3d_send_posts` | WordPress 3D FlipBook Plugin <= 1.16.17 - Sensitive Informatio |
-| 226 | medium | `CVE-2026-0717` | `/wp-json/lottiefiles/v1/settings/` | LottieFiles for Gutenberg <= 3.0.0 - Unauthenticated Settings  |
+| 225 | medium | `CVE-2025-58226` | `/wp-admin/admin-ajax.php?action=fb3d_send_posts` | WordPress 3D FlipBook Plugin <= 1.16.17 - Sensitive Information Exposu |
+| 226 | medium | `CVE-2026-0717` | `/wp-json/lottiefiles/v1/settings/` | LottieFiles for Gutenberg <= 3.0.0 - Unauthenticated Settings Disclosu |
 | 227 | medium | `CVE-2026-13153` | `/wp-json/essential-blocks/v1/products?per_page=20` | Essential Blocks < 6.4.0 - Information Disclosure |
 | 228 | medium | `CVE-2026-27796` | `/api/trpc/integration.all` | Homarr < 1.54.0 - Information Disclosure |
 | 229 | medium | `CVE-2026-29066` | `/etc/passwd` | TinaCMS - Path Traversal |
 | 230 | medium | `CVE-2026-6826` | `/ccm/system/dialogs/file/usage/1` | Concrete CMS <9.5.1 - Unauthenticated File Usage Disclosure |
-| 231 | medium | `CVE-2026-8236` | `/index.php/ccm/system/dialogs/file/usage/1` | Concrete CMS <9.5.1 - Unauthenticated File-Usage Internal Meta |
+| 231 | medium | `CVE-2026-8236` | `/index.php/ccm/system/dialogs/file/usage/1` | Concrete CMS <9.5.1 - Unauthenticated File-Usage Internal Metadata Dis |
 | 232 | medium | `aem-acs-common` | `/etc/acs-commons/jcr-compare.html` | Adobe AEM ACS Common Exposure |
 | 233 | medium | `aem-dump-contentnode` | `/content.infinity.json` | AEM Dump Content Node Properties |
 | 234 | medium | `aem-offloading-browser` | `/libs/granite/offloading/content/view.html` | Adobe AEM Offloading Browser |
@@ -284,7 +290,7 @@ Findings carry a `confidence` field. `confirmed` means the response itself held 
 | 265 | medium | `ds-store` | `/.DS_Store` | .DS_Store Exposed |
 | 266 | medium | `environment-rb` | `/environment.rb` | Environment Ruby File Disclosure |
 | 267 | medium | `espeasy-installer` | `/ESPEasy` | ESPEasy Installation Exposure |
-| 268 | medium | `exposed-alps-spring` | `/profile` | Exposed Spring Data REST Application-Level Profile Semantics ( |
+| 268 | medium | `exposed-alps-spring` | `/profile` | Exposed Spring Data REST Application-Level Profile Semantics (ALPS) |
 | 269 | medium | `exposed-hg` | `/.hg/hgrc` | HG Configuration - Detect |
 | 270 | medium | `exposed-nomad` | `/ui/jobs` | Nomad - Exposed Jobs |
 | 271 | medium | `exposed-sharepoint-list` | `/_vti_bin/lists.asmx?WSDL` | Sharepoint List - Detect |
@@ -437,3 +443,268 @@ Findings carry a `confidence` field. `confirmed` means the response itself held 
 | 418 | low | `vscode-mcp-json` | `/mcp.json` | Visual Studio Code MCP Configuration ("mcp.json") Exposure |
 | 419 | low | `wordpress-wp-env-exposure` | `/.wp-env.json` | WordPress Configuration wp-env - Exposure |
 | 420 | low | `yii-debugger` | `/debug/default/view.html` | View Yii Debugger Information |
+
+---
+
+## Sensitive paths
+
+141 paths probed by the `endpoints` module.
+
+### Admin & Login panels
+
+| path | what it is | severity |
+|---|---|---|
+| `/admin/` | Admin Panel | high |
+| `/admin/login` | Admin Login | high |
+| `/administrator/` | Administrator Panel | high |
+| `/wp-admin/` | WordPress Admin | high |
+| `/wp-login.php` | WordPress Login | medium |
+| `/phpmyadmin/` | phpMyAdmin | critical |
+| `/phpmyadmin/index.php` | phpMyAdmin Index | critical |
+| `/adminer.php` | Adminer DB Tool | critical |
+| `/adminer/` | Adminer DB Tool | critical |
+| `/pma/` | phpMyAdmin (pma) | critical |
+| `/cpanel/` | cPanel | critical |
+| `/webmail/` | Webmail | medium |
+| `/manager/html` | Tomcat Manager | critical |
+| `/manager/status` | Tomcat Status | high |
+| `/jenkins/` | Jenkins CI | high |
+| `/jenkins/login` | Jenkins Login | high |
+| `/grafana/` | Grafana Dashboard | high |
+| `/kibana/` | Kibana Dashboard | high |
+| `/solr/` | Apache Solr | high |
+
+### Config & Secrets
+
+| path | what it is | severity |
+|---|---|---|
+| `/.env` | .env File | critical |
+| `/.env.local` | .env.local | critical |
+| `/.env.production` | .env.production | critical |
+| `/.env.backup` | .env.backup | critical |
+| `/config.php` | config.php | critical |
+| `/configuration.php` | Joomla Config | critical |
+| `/wp-config.php.bak` | WP Config Backup | critical |
+| `/wp-config.php~` | WP Config Backup ~ | critical |
+| `/database.yml` | Rails DB Config | critical |
+| `/application.yml` | App Config YAML | high |
+| `/settings.py` | Django Settings | high |
+| `/config.json` | config.json | high |
+| `/config.xml` | config.xml | medium |
+
+### Source Control
+
+| path | what it is | severity |
+|---|---|---|
+| `/.git/config` | .git Config | critical |
+| `/.git/HEAD` | .git HEAD | critical |
+| `/.git/COMMIT_EDITMSG` | .git Commit Msg | high |
+| `/.svn/entries` | SVN Entries | high |
+| `/.hg/` | Mercurial Repo | high |
+
+### Backups & Dumps
+
+| path | what it is | severity |
+|---|---|---|
+| `/backup.sql` | SQL Backup | critical |
+| `/dump.sql` | SQL Dump | critical |
+| `/backup.zip` | Backup ZIP | critical |
+| `/backup.tar.gz` | Backup TAR | critical |
+| `/db.sqlite` | SQLite DB | critical |
+| `/database.sql` | Database SQL | critical |
+
+### Debug & Info
+
+| path | what it is | severity |
+|---|---|---|
+| `/phpinfo.php` | phpinfo() | high |
+| `/info.php` | phpinfo (info.php) | high |
+| `/test.php` | test.php | medium |
+| `/server-status` | Apache server-status | medium |
+| `/server-info` | Apache server-info | medium |
+| `/_profiler/` | Symfony Profiler | high |
+| `/debug/` | Debug Endpoint | high |
+| `/trace` | Trace Endpoint | medium |
+
+### API & Documentation
+
+| path | what it is | severity |
+|---|---|---|
+| `/api/` | API Root | info |
+| `/api/v1/` | API v1 | info |
+| `/api/v2/` | API v2 | info |
+| `/graphql` | GraphQL Endpoint | medium |
+| `/graphiql` | GraphiQL IDE | high |
+| `/swagger-ui.html` | Swagger UI | medium |
+| `/swagger-ui/` | Swagger UI Alt | medium |
+| `/api-docs` | OpenAPI Docs | medium |
+| `/api-docs.json` | OpenAPI JSON | medium |
+| `/.well-known/openid-configuration` | OIDC Config | info |
+| `/.well-known/jwks.json` | JWKS (JWT Keys) | medium |
+
+### Cloud / Infrastructure
+
+| path | what it is | severity |
+|---|---|---|
+| `/actuator` | Spring Actuator | high |
+| `/actuator/env` | Spring Actuator /env | critical |
+| `/actuator/health` | Spring Actuator Health | info |
+| `/actuator/metrics` | Spring Actuator Metrics | medium |
+| `/actuator/beans` | Spring Actuator Beans | medium |
+| `/actuator/mappings` | Spring Actuator Maps | medium |
+| `/health` | Health Check | info |
+| `/metrics` | Metrics Endpoint | medium |
+| `/status` | Status Page | info |
+
+### Miscellaneous known paths
+
+| path | what it is | severity |
+|---|---|---|
+| `/xmlrpc.php` | XML-RPC (WP) | medium |
+| `/crossdomain.xml` | crossdomain.xml | low |
+| `/clientaccesspolicy.xml` | Client Access Policy | low |
+| `/.DS_Store` | .DS_Store (macOS) | medium |
+| `/Thumbs.db` | Thumbs.db | low |
+| `/web.config` | IIS web.config | high |
+| `/WEB-INF/web.xml` | Java WEB-INF | critical |
+| `/docker-compose.yml` | Docker Compose | high |
+| `/Dockerfile` | Dockerfile | medium |
+| `/.htpasswd` | .htpasswd | critical |
+| `/.htaccess` | .htaccess | medium |
+
+### Additional exposures mined from the nuclei-templates repo
+
+| path | what it is | severity |
+|---|---|---|
+| `/.gem/credentials` | Ruby Gem::ConfigFile Credential - Exposure | high |
+| `/.msmtprc` | Msmtp - Config Exposure | high |
+| `/.remote-sync.json` | Atom Synchronization Exposure | high |
+| `/collibra.properties` | Collibra Properties Exposure | high |
+| `/config/databases.yml` | Symfony Database Configuration File - Detect | high |
+| `/configuration.yml` | Redmine Configuration File - Detect | high |
+| `/db/robomongo.json` | RoboMongo Credential - Exposure | high |
+| `/kcfinder/browse.php` | KCFinder - Exposure | high |
+| `/requestlogs` | ServiceStack Request Logs - Unauthenticated Access | high |
+| `/sftp.json` | VSCode SFTP File Exposure | high |
+| `/webapi/v1/system/accountmanage/account` | Lvmeng - UTS Disclosure | high |
+| `/.claude/settings.json` | Claude Code Project Settings Exposure | medium |
+| `/.coveralls.yml` | Coveralls Configuration File Exposure | medium |
+| `/.git-credentials` | Git Credentials - Detect | medium |
+| `/.git/` | Git Metadata Directory Exposure | medium |
+| `/.htdeployment` | .htdeployment - Files Tree Cache File | medium |
+| `/.php_cs.cache` | PHP-CS-Fixer Cache - File Disclosure | medium |
+| `/.vscode/` | Visual Studio Code Directories - Detect | medium |
+| `/Properties/launchSettings.json` | ASP.NET Launch Settings - Exposure | medium |
+| `/_ignition/logs` | Laravel Ignition - Log Viewer Information Disclosure | medium |
+| `/appconfigs` | Apache Pinot - Exposure | medium |
+| `/appspec.yml` | Appspec YML/YAML - Detect | medium |
+| `/artifactory/api/build` | JFrog Artifactory Build - Exposure | medium |
+| `/azuredeploy.json` | Azure Resource Manager Template - File Exposure | medium |
+| `/filezilla.xml` | Filezilla | medium |
+| `/ioncube/loader-wizard.php` | ioncube Loader Wizard Disclosure | medium |
+| `/issues.json` | Redmine Issues - Exposure | medium |
+| `/lfm.php` | Lazy File Manager | medium |
+| `/prober.php` | PHP Prober - Exposure | medium |
+| `/static/shards.html` | NGINX Shards Disclosure | medium |
+| `/.apdisk` | Apdisk - File Disclosure | low |
+| `/.badarg.log` | Badarg Log File Exposure | low |
+| `/.composer-auth.json` | Composer-auth Json File Disclosure | low |
+| `/.editorconfig` | Editor Configuration File - Detect | low |
+| `/.gcloudignore` | Google Cloud Ignore File Exposure | low |
+| `/.mailmap` | Git Mailmap File Disclosure | low |
+| `/.phpunit.result.cache` | PHPUnit Result Cache File Exposure | low |
+| `/.viminfo` | Viminfo - File Disclosure | low |
+| `/.vscode/launch.json` | Visual Studio Code launch.json Exposure | low |
+| `/?view=log` | ZoneMinder System Log - Detect | low |
+| `/Trace.axd` | ASP.NET Trace.AXD - Exposure | low |
+| `/Vagrantfile` | Vagrantfile Exposure | low |
+| `/Wiki.jsp?page=SystemInfo` | Apache JSPWiki - User IP Enumeration | low |
+| `/access.log` | Publicly accessible access-log file | low |
+| `/admin/master/console/config` | Keycloak Admin Console Configuration Disclosure | low |
+| `/anonymous-cli-metrics.json` | NPM Anonymous CLI Metrics Json | low |
+| `/buildspec.yml` | AWS CodeBuild Build Spec - Exposure | low |
+| `/cfcache.map` | Discover Cold Fusion cfcache.map Files | low |
+| `/database_credentials.inc` | Database Credentials File Exposure | low |
+| `/go.mod` | Go.mod Disclosure | low |
+| `/google-services.json` | Google Service Json | low |
+| `/jsapi_ticket.json` | JsAPI Ticket Json | low |
+| `/log/system.log` | ICEFlow VPN Disclosure | low |
+| `/pantheon.upstream.yml` | Pantheon upstream.yml Disclosure | low |
+| `/php.ini` | Php.ini File Disclosure | low |
+| `/phpsysinfo/index.php?disp=bootstrap` | phpSysInfo Exposure | low |
+| `/stats?json` | OpenTSDB - Detect | low |
+| `/storage.yml` | Ruby on Rails storage.yml File Disclosure | low |
+| `/usage/` | Webalizer Xtended Statistics Exposed | low |
+
+---
+
+## API probes
+
+64 paths probed by the `api_fuzzer` module.
+
+| path | what it is | severity |
+|---|---|---|
+| `/swagger.json` | Swagger spec | high |
+| `/swagger/v1/swagger.json` | Swagger spec (ASP.NET) | high |
+| `/openapi.json` | OpenAPI spec | high |
+| `/openapi.yaml` | OpenAPI spec (YAML) | high |
+| `/v2/api-docs` | Springfox API docs | high |
+| `/v3/api-docs` | SpringDoc OpenAPI | high |
+| `/api-docs` | API docs | medium |
+| `/swagger-ui.html` | Swagger UI | medium |
+| `/swagger-ui/index.html` | Swagger UI | medium |
+| `/redoc` | ReDoc UI | medium |
+| `/graphiql` | GraphiQL IDE | high |
+| `/playground` | GraphQL Playground | high |
+| `/.well-known/openid-configuration` | OIDC discovery | medium |
+| `/.well-known/oauth-authorization-server` | OAuth metadata | medium |
+| `/.well-known/security.txt` | security.txt | info |
+| `/wp-json/wp/v2/users` | WordPress user enumeration | high |
+| `/wp-json` | WordPress REST root | medium |
+| `/actuator` | Spring Actuator root | high |
+| `/actuator/health` | Spring Actuator health | medium |
+| `/actuator/env` | Spring Actuator env | critical |
+| `/actuator/mappings` | Spring Actuator mappings | high |
+| `/manifest.json` | App manifest | info |
+| `/api/config` | API config | high |
+| `/config.json` | Config JSON | high |
+| `/env.js` | Runtime env JS | high |
+| `/_next/data` | Next.js data routes | medium |
+| `/users` | Users list | high |
+| `/users/me` | Current user info | high |
+| `/user` | User endpoint | high |
+| `/accounts` | Accounts | high |
+| `/customers` | Customers | high |
+| `/orders` | Orders | high |
+| `/products` | Products | medium |
+| `/admin` | Admin endpoint | critical |
+| `/admin/users` | Admin user list | critical |
+| `/auth/login` | Auth login | medium |
+| `/login` | Login endpoint | medium |
+| `/register` | Registration | medium |
+| `/token` | Token endpoint | high |
+| `/refresh` | Token refresh | high |
+| `/config` | Config endpoint | high |
+| `/settings` | Settings | medium |
+| `/debug` | Debug endpoint | critical |
+| `/metrics` | Metrics | medium |
+| `/health` | Health check | low |
+| `/status` | Status endpoint | low |
+| `/version` | Version disclosure | low |
+| `/info` | Info endpoint | low |
+| `/docs` | API docs | medium |
+| `/swagger` | Swagger UI | medium |
+| `/swagger.json` | Swagger JSON | medium |
+| `/openapi.json` | OpenAPI spec | medium |
+| `/redoc` | ReDoc | medium |
+| `/keys` | Keys endpoint | critical |
+| `/secrets` | Secrets | critical |
+| `/tokens` | Tokens list | high |
+| `/export` | Data export | high |
+| `/logs` | Logs endpoint | high |
+| `/files` | Files endpoint | high |
+| `/upload` | Upload endpoint | high |
+| `/backup` | Backup endpoint | high |
+| `/events` | Events | medium |
+| `/search` | Search endpoint | low |
+| `/graphql` | GraphQL under base | high |

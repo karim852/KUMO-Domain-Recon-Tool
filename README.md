@@ -204,6 +204,9 @@ its colours through the same token set.
 
 ## 🔓 Vulnerability scanner
 
+> Full inventory of every check: **[docs/CHECKS.md](docs/CHECKS.md)** — 420 vulnerability rules, 141 sensitive paths, 64 API probes.
+
+
 **358 checks**, no external tool and no template directory to sync. The engine
 mirrors nuclei's matcher model — `status`, `word`, `regex`, `size` and a small
 `dsl`, combined with `matchers_condition`.
