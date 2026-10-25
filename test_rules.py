@@ -168,6 +168,29 @@ NEGATIVE = {
 
 
 def main():
+    # Rule ids must be unique. Every lookup keyed by id -- this harness, the
+    # browser extension's table generator, anything correlating a finding back
+    # to its rule -- silently drops a duplicate rather than erroring, so a
+    # collision hides one rule completely. Check before anything else.
+    all_rules = engine.VULN_RULES + engine.VULN_RULES_EXTENDED
+    seen = {}
+    dupes = {}
+    for r in all_rules:
+        rid = r["id"]
+        if rid in seen:
+            dupes.setdefault(rid, [seen[rid]]).append(r["name"])
+        seen[rid] = r["name"]
+    if dupes:
+        print("\033[91mDUPLICATE RULE IDS\033[0m — each of these hides a rule "
+              "from any id-keyed lookup:")
+        for rid, names in dupes.items():
+            print(f"  {rid}")
+            for n in names:
+                print(f"      {n}")
+        return 1
+    print(f"{len(all_rules)} rules, {len(seen)} unique ids  "
+          "\033[92mno collisions\033[0m")
+
     rules = {r["id"]: r for r in engine.VULN_RULES}
     print(f"Validating {len(rules)} rules × ({len(NEGATIVE)} negative + 1 positive) fixtures\n")
 

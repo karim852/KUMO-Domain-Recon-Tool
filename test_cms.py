@@ -135,7 +135,12 @@ def main():
     # This is the page a tech blog or a hosting reseller publishes. Nothing in
     # it is installed software, so nothing here may fingerprint.
     import re as _re
-    names = sorted(set(list(engine._WW_CMS_SIGS) + list(engine._WW_ECOM_SIGS)))
+    # EVERY brand in the whole table, not just the CMS and storefront ones.
+    # Checking only those twenty left nine prose matches in the other nine
+    # categories -- Backbone.js, Tawk.to, Wordfence, Keycloak, GraphQL,
+    # gRPC-Web, WebSocket, REST API and Netlify -- which the browser
+    # extension's copy of this test is what actually caught.
+    names = sorted({n for sigs in engine._WW_SIGNATURES.values() for n in sigs})
     prose = ("<html><head><title>Platform roundup</title></head><body>"
              "<h1>Every platform compared</h1><p>"
              + ". ".join(f"{n}! is worth a look, and {n} keeps improving"
@@ -145,14 +150,39 @@ def main():
                "headers, and the <code>incap_ses</code> cookie.</p>"
                "<p>We also cover settings.php and configuration.php hardening.</p>"
                "</body></html>")
-    leaked = engine._platform_fingerprint(prose, {}, {})
+    def _scan_all(body, headers):
+        """Run the FULL signature table the way _whatweb_python does."""
+        hblob = str(headers)
+        hay = body + hblob
+        out = []
+        for cat, sigs in engine._WW_SIGNATURES.items():
+            for name, pats in sigs.items():
+                for pat in pats:
+                    if isinstance(pat, tuple):
+                        target = hblob if pat[0] == "h" else body
+                        src = pat[1]
+                    else:
+                        target, src = hay, pat
+                    if _re.search(src, target, _re.I):
+                        out.append(f"{cat}/{name}")
+                        break
+        return out
+
+    leaked = _scan_all(prose, {})
     check(f"all {len(names)} brands named in prose fingerprint nothing",
           not leaked, f"leaked={leaked}" if leaked else "")
 
     # and the same text must not fingerprint when it arrives as headers either
-    leaked_h = engine._platform_fingerprint("", {"X-Note": " ".join(names)}, {})
+    leaked_h = _scan_all("", {"X-Note": " ".join(names)})
     check("brand names in a header value fingerprint nothing",
           not leaked_h, f"leaked={leaked_h}" if leaked_h else "")
+
+    # the scoped-away evidence must still work where it genuinely belongs
+    check("Cloudflare detected from its own header",
+          any("Cloudflare" in x for x in _scan_all("", {"cf-ray": "8a1b-CDG"})))
+    check("Cloudflare NOT detected from the same words in the body",
+          not any("Cloudflare" in x
+                  for x in _scan_all("<p>we use cloudflare, see cf-ray</p>", {})))
 
     print(f"\n{B}Evidence discipline{X}")
     allf = [f for r in results.values() for f in r.get("findings", [])]

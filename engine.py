@@ -3044,7 +3044,7 @@ VULN_RULES_EXTENDED = [
         "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['https://', '@github.com'], 'condition': 'or'}],
     },
     {
-        "id": 'git-config', "name": 'Git Configuration - Detect',
+        "id": 'git-config-detect', "name": 'Git Configuration - Detect',
         "severity": 'medium', "path": '/.git/config',
         "matchers_condition": "and", "origin": "nuclei",
         "description": 'Git Configuration - Detect (ported from nuclei template http/exposures/configs/git-config.yaml)',
@@ -3534,7 +3534,7 @@ VULN_RULES_EXTENDED = [
         "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['"status":"success"'], 'condition': 'or'}],
     },
     {
-        "id": 'prometheus-metrics', "name": 'Prometheus Metrics - Detect',
+        "id": 'prometheus-metrics-detect', "name": 'Prometheus Metrics - Detect',
         "severity": 'medium', "path": '/metrics',
         "matchers_condition": "and", "origin": "nuclei",
         "description": 'Prometheus Metrics - Detect (ported from nuclei template http/exposures/configs/prometheus-metrics.yaml)',
@@ -3835,7 +3835,7 @@ VULN_RULES_EXTENDED = [
         "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['<SetupConfig'], 'condition': 'or'}],
     },
     {
-        "id": 'elasticsearch', "name": 'ElasticSearch Information Disclosure',
+        "id": 'elasticsearch-detect', "name": 'ElasticSearch Information Disclosure',
         "severity": 'low', "path": '/_cluster/health?pretty',
         "matchers_condition": "and", "origin": "nuclei",
         "description": 'ElasticSearch Information Disclosure (ported from nuclei template http/misconfiguration/elasticsearch.yaml)',
@@ -6390,6 +6390,135 @@ _WW_ECOM_SIGS = {
 _CMS_DEEP_SCANNED = {"WordPress", "Joomla", "Drupal"}
 
 
+# The full whatweb signature table, at module level so the browser-extension
+# extractor can read it. It was function-local, which meant the extractor had
+# to literal_eval it; once the CMS entries moved out to their own constants the
+# table stopped being a literal and the extension silently lost it.
+_WW_SIGNATURES = {
+    "CMS": _WW_CMS_SIGS,
+    "E-Commerce": _WW_ECOM_SIGS,
+    "Frontend Framework": {
+        "React":              [r'react\.production\.min', r'__REACT_DEVTOOLS', r'_reactFiber'],
+        "Vue.js":             [r'vue\.min\.js', r'Vue\.component\(', r'__vue__'],
+        "Angular":            [r'ng-version=', r'angular\.min\.js', r'ng-app='],
+        "Next.js":            [r'__NEXT_DATA__', r'/_next/static/'],
+        "Nuxt.js":            [r'__NUXT__', r'_nuxt/'],
+        "Svelte":             [r'__svelte', r'svelte-'],
+        "Ember.js":           [r'ember\.min\.js', r'Ember\.Application'],
+        "Backbone.js":        [r'(?:src|href)=["\'][^"\']*backbone(?:\.min)?\.js',
+                               r'Backbone\.Model|Backbone\.View'],
+        "jQuery":             [r'jquery[\.\-][\d]', r'jquery\.min\.js'],
+        "Bootstrap":          [r'bootstrap\.min\.css', r'bootstrap\.min\.js', r'class="container"'],
+        "Tailwind CSS":       [r'tailwindcss', r'class="[^"]*(?:flex|grid|px-|py-|text-)[^"]*"'],
+        "Material UI":        [r'material-ui', r'MuiButton', r'@mui/'],
+        "HTMX":               [r'htmx\.org', r'hx-get='],
+    },
+    "JavaScript Libraries": {
+        "Lodash":             [r'lodash\.min\.js', r'_\.VERSION'],
+        "Moment.js":          [r'moment\.min\.js', r'moment\.utc'],
+        "Axios":              [r'axios\.min\.js'],
+        "D3.js":              [r'd3\.min\.js', r'd3-selection'],
+        "Chart.js":           [r'chart\.min\.js', r'Chart\.register'],
+        "Three.js":           [r'three\.min\.js', r'THREE\.WebGLRenderer'],
+        "Socket.io":          [r'socket\.io\.js', r'socket\.io/socket\.io'],
+        "Alpine.js":          [r'alpinejs', r'x-data='],
+    },
+    "Server / Language": {
+        # A runtime proves itself with its header or its session cookie.
+        # Article text quotes "X-Powered-By: Express" and names files like
+        # settings.php, so those patterns are scoped away from the body;
+        # a .php in an href or form action is still real evidence.
+        "PHP":                [("h", r'PHPSESSID|X-Powered-By:[^\n]*PHP'),
+                               ("b", r'(?:href|src|action)=["\'][^"\']*\.php')],
+        "ASP.NET":            [r'__VIEWSTATE', r'__EVENTVALIDATION',
+                               ("h", r'X-AspNet-Version|ASP\.NET_SessionId')],
+        "ASP.NET MVC":        [r'__RequestVerificationToken',
+                               ("h", r'X-AspNetMvc-Version')],
+        "Java / JSP":         [("h", r'JSESSIONID'),
+                               ("b", r'(?:href|src|action)=["\'][^"\']*\.jsp')],
+        "Ruby on Rails":      [("h", r'_session_id|X-Runtime')],
+        "Django":             [r'csrfmiddlewaretoken', ("h", r'csrftoken')],
+        "Flask":              [("h", r'Werkzeug/|session=eyJ')],
+        "Laravel":            [("h", r'laravel_session|XSRF-TOKEN')],
+        "Express.js":         [("h", r'X-Powered-By:\s*Express')],
+        "Node.js":            [("h", r'X-Powered-By:\s*Node')],
+        "Python":             [("h", r'X-Powered-By:[^\n]*Python|Server:[^\n]*gunicorn')],
+    },
+    "CDN / Hosting": {
+        # An edge provider proves itself with the headers and cookies it
+        # adds, not with its name in the page. Body matches here are left
+        # to asset hostnames, which a site cannot mention by accident.
+        "Cloudflare":         [("h", r'cf-ray'), ("h", r'cf-cache-status'),
+                               ("h", r'__cf[a-z]*uid|__cflb|cf_clearance'),
+                               r'/cdn-cgi/(?:scripts|challenge-platform)/'],
+        "AWS CloudFront":     [r'cloudfront\.net', ("h", r'X-Amz-Cf-Id')],
+        "AWS S3":             [r's3[.\-][\w\-]*\.?amazonaws\.com',
+                               ("h", r'AmazonS3')],
+        "Fastly":             [("h", r'Fastly-|X-Served-By:\s*cache-'),
+                               r'fastly\.net'],
+        "Akamai":             [r'akamaiedge\.net|akamaihd\.net',
+                               ("h", r'X-Akamai|AkamaiGHost')],
+        "Vercel":             [r'vercel\.app', ("h", r'x-vercel-')],
+        "Netlify":            [r'netlify\.app', ("h", r'x-nf-request-id|Server:\s*Netlify')],
+        "GitHub Pages":       [r'github\.io'],
+        "Heroku":             [r'heroku\.com', r'herokuapp\.com'],
+        "DigitalOcean":       [r'digitaloceanspaces\.com'],
+        "Azure":              [r'azurewebsites\.net', r'azure\.com'],
+        "Google Cloud":       [r'storage\.googleapis\.com', r'appspot\.com'],
+    },
+    "Analytics / Marketing": {
+        "Google Analytics":   [r'google-analytics\.com/analytics', r'gtag\('],
+        "Google Tag Manager": [r'googletagmanager\.com'],
+        "Facebook Pixel":     [r'connect\.facebook\.net', r'fbq\('],
+        "Hotjar":             [r'hotjar\.com', r'hjid'],
+        "Mixpanel":           [r'mixpanel\.com', r'mixpanel\.track'],
+        "Segment":            [r'segment\.com', r'analytics\.js'],
+        "Intercom":           [r'intercom\.io', r'Intercom\('],
+        "HubSpot":            [r'hubspot\.com', r'hs-scripts'],
+        "Drift":              [r'drift\.com', r'driftt\.com'],
+        "Zendesk":            [r'zdassets\.com', r'zendesk\.com/embeddable'],
+        "Crisp":              [r'crisp\.chat'],
+        "Tawk.to":            [r'embed\.tawk\.to'],
+    },
+    "Security": {
+        "Cloudflare WAF":     [("h", r'cf-ray')],
+        "reCAPTCHA":          [r'recaptcha\.net', r'g-recaptcha'],
+        "hCaptcha":           [r'hcaptcha\.com'],
+        "Sucuri WAF":         [("h", r'x-sucuri-id|x-sucuri-cache'),
+                               r'sucuri\.net'],
+        "Imperva / Incapsula": [("h", r'incap_ses|visid_incap|X-Iinfo|X-CDN:\s*Incapsula'),
+                                r'/_Incapsula_Resource'],
+        "Wordfence":          [r'/plugins/wordfence/',
+                               ("h", r'x-wf-|wfwaf-|wordfence-waf')],
+        "ModSecurity":        [r'Mod_Security', r'NOYB'],
+    },
+    "Authentication": {
+        "Auth0":              [r'auth0\.com', r'cdn\.auth0\.com'],
+        "Okta":               [r'okta\.com', r'oktacdn\.com'],
+        "Keycloak":           [r'/auth/realms/',
+                               r'/realms/[^/"\']+/protocol/openid-connect'],
+        "Firebase Auth":      [r'firebase\.googleapis\.com', r'firebaseapp\.com'],
+        "AWS Cognito":        [r'cognito-idp', r'amazoncognito\.com'],
+        "OneLogin":           [r'onelogin\.com'],
+    },
+    "Monitoring / APM": {
+        "Sentry":             [r'sentry\.io', r'sentry_key'],
+        "Datadog":            [r'datadoghq\.com', r'ddtrace'],
+        "New Relic":          [r'newrelic\.com', r'nr-data\.net'],
+        "Dynatrace":          [r'dynatrace\.com', r'ruxitagentjs'],
+        "Elastic APM":        [r'elastic\.co/guide/en/apm'],
+    },
+    "API / Backend": {
+        "GraphQL":            [r'(?:src|href|action|url)["\'\s:=]+[^"\'\s]*/graphql',
+                               r'__schema|graphiql'],
+        "REST API":           [r'/api/v[0-9]', ("h", r'application/json')],
+        "gRPC-Web":           [("h", r'application/grpc-web')],
+        "WebSocket":          [r'new\s+WebSocket\s*\(', r'wss?://[^"\'\s]+'],
+        "Swagger / OpenAPI":  [r'swagger-ui', r'openapi\.json', r'api-docs'],
+    },
+}
+
+
 def _platform_fingerprint(body, headers, cookies=""):
     """
     Identify CMS / storefront platforms from one already-fetched response.
@@ -6447,125 +6576,7 @@ def _whatweb_python(domain):
 
     detected = {}
 
-    SIGNATURES = {
-        "CMS": _WW_CMS_SIGS,
-        "E-Commerce": _WW_ECOM_SIGS,
-        "Frontend Framework": {
-            "React":              [r'react\.production\.min', r'__REACT_DEVTOOLS', r'_reactFiber'],
-            "Vue.js":             [r'vue\.min\.js', r'Vue\.component\(', r'__vue__'],
-            "Angular":            [r'ng-version=', r'angular\.min\.js', r'ng-app='],
-            "Next.js":            [r'__NEXT_DATA__', r'/_next/static/'],
-            "Nuxt.js":            [r'__NUXT__', r'_nuxt/'],
-            "Svelte":             [r'__svelte', r'svelte-'],
-            "Ember.js":           [r'ember\.min\.js', r'Ember\.Application'],
-            "Backbone.js":        [r'backbone\.js', r'Backbone\.Model'],
-            "jQuery":             [r'jquery[\.\-][\d]', r'jquery\.min\.js'],
-            "Bootstrap":          [r'bootstrap\.min\.css', r'bootstrap\.min\.js', r'class="container"'],
-            "Tailwind CSS":       [r'tailwindcss', r'class="[^"]*(?:flex|grid|px-|py-|text-)[^"]*"'],
-            "Material UI":        [r'material-ui', r'MuiButton', r'@mui/'],
-            "HTMX":               [r'htmx\.org', r'hx-get='],
-        },
-        "JavaScript Libraries": {
-            "Lodash":             [r'lodash\.min\.js', r'_\.VERSION'],
-            "Moment.js":          [r'moment\.min\.js', r'moment\.utc'],
-            "Axios":              [r'axios\.min\.js'],
-            "D3.js":              [r'd3\.min\.js', r'd3-selection'],
-            "Chart.js":           [r'chart\.min\.js', r'Chart\.register'],
-            "Three.js":           [r'three\.min\.js', r'THREE\.WebGLRenderer'],
-            "Socket.io":          [r'socket\.io\.js', r'socket\.io/socket\.io'],
-            "Alpine.js":          [r'alpinejs', r'x-data='],
-        },
-        "Server / Language": {
-            # A runtime proves itself with its header or its session cookie.
-            # Article text quotes "X-Powered-By: Express" and names files like
-            # settings.php, so those patterns are scoped away from the body;
-            # a .php in an href or form action is still real evidence.
-            "PHP":                [("h", r'PHPSESSID|X-Powered-By:[^\n]*PHP'),
-                                   ("b", r'(?:href|src|action)=["\'][^"\']*\.php')],
-            "ASP.NET":            [r'__VIEWSTATE', r'__EVENTVALIDATION',
-                                   ("h", r'X-AspNet-Version|ASP\.NET_SessionId')],
-            "ASP.NET MVC":        [r'__RequestVerificationToken',
-                                   ("h", r'X-AspNetMvc-Version')],
-            "Java / JSP":         [("h", r'JSESSIONID'),
-                                   ("b", r'(?:href|src|action)=["\'][^"\']*\.jsp')],
-            "Ruby on Rails":      [("h", r'_session_id|X-Runtime')],
-            "Django":             [r'csrfmiddlewaretoken', ("h", r'csrftoken')],
-            "Flask":              [("h", r'Werkzeug/|session=eyJ')],
-            "Laravel":            [("h", r'laravel_session|XSRF-TOKEN')],
-            "Express.js":         [("h", r'X-Powered-By:\s*Express')],
-            "Node.js":            [("h", r'X-Powered-By:\s*Node')],
-            "Python":             [("h", r'X-Powered-By:[^\n]*Python|Server:[^\n]*gunicorn')],
-        },
-        "CDN / Hosting": {
-            # An edge provider proves itself with the headers and cookies it
-            # adds, not with its name in the page. Body matches here are left
-            # to asset hostnames, which a site cannot mention by accident.
-            "Cloudflare":         [("h", r'cf-ray'), ("h", r'cf-cache-status'),
-                                   ("h", r'__cf[a-z]*uid|__cflb|cf_clearance'),
-                                   r'/cdn-cgi/(?:scripts|challenge-platform)/'],
-            "AWS CloudFront":     [r'cloudfront\.net', ("h", r'X-Amz-Cf-Id')],
-            "AWS S3":             [r's3[.\-][\w\-]*\.?amazonaws\.com',
-                                   ("h", r'AmazonS3')],
-            "Fastly":             [("h", r'Fastly-|X-Served-By:\s*cache-'),
-                                   r'fastly\.net'],
-            "Akamai":             [r'akamaiedge\.net|akamaihd\.net',
-                                   ("h", r'X-Akamai|AkamaiGHost')],
-            "Vercel":             [r'vercel\.app', ("h", r'x-vercel-')],
-            "Netlify":            [r'netlify\.app', ("h", r'x-nf-request-id|Netlify')],
-            "GitHub Pages":       [r'github\.io'],
-            "Heroku":             [r'heroku\.com', r'herokuapp\.com'],
-            "DigitalOcean":       [r'digitaloceanspaces\.com'],
-            "Azure":              [r'azurewebsites\.net', r'azure\.com'],
-            "Google Cloud":       [r'storage\.googleapis\.com', r'appspot\.com'],
-        },
-        "Analytics / Marketing": {
-            "Google Analytics":   [r'google-analytics\.com/analytics', r'gtag\('],
-            "Google Tag Manager": [r'googletagmanager\.com'],
-            "Facebook Pixel":     [r'connect\.facebook\.net', r'fbq\('],
-            "Hotjar":             [r'hotjar\.com', r'hjid'],
-            "Mixpanel":           [r'mixpanel\.com', r'mixpanel\.track'],
-            "Segment":            [r'segment\.com', r'analytics\.js'],
-            "Intercom":           [r'intercom\.io', r'Intercom\('],
-            "HubSpot":            [r'hubspot\.com', r'hs-scripts'],
-            "Drift":              [r'drift\.com', r'driftt\.com'],
-            "Zendesk":            [r'zdassets\.com', r'zendesk\.com/embeddable'],
-            "Crisp":              [r'crisp\.chat'],
-            "Tawk.to":            [r'tawk\.to'],
-        },
-        "Security": {
-            "Cloudflare WAF":     [("h", r'cf-ray')],
-            "reCAPTCHA":          [r'recaptcha\.net', r'g-recaptcha'],
-            "hCaptcha":           [r'hcaptcha\.com'],
-            "Sucuri WAF":         [("h", r'x-sucuri-id|x-sucuri-cache'),
-                                   r'sucuri\.net'],
-            "Imperva / Incapsula": [("h", r'incap_ses|visid_incap|X-Iinfo|X-CDN:\s*Incapsula'),
-                                    r'/_Incapsula_Resource'],
-            "Wordfence":          [r'wordfence'],
-            "ModSecurity":        [r'Mod_Security', r'NOYB'],
-        },
-        "Authentication": {
-            "Auth0":              [r'auth0\.com', r'cdn\.auth0\.com'],
-            "Okta":               [r'okta\.com', r'oktacdn\.com'],
-            "Keycloak":           [r'keycloak', r'/auth/realms/'],
-            "Firebase Auth":      [r'firebase\.googleapis\.com', r'firebaseapp\.com'],
-            "AWS Cognito":        [r'cognito-idp', r'amazoncognito\.com'],
-            "OneLogin":           [r'onelogin\.com'],
-        },
-        "Monitoring / APM": {
-            "Sentry":             [r'sentry\.io', r'sentry_key'],
-            "Datadog":            [r'datadoghq\.com', r'ddtrace'],
-            "New Relic":          [r'newrelic\.com', r'nr-data\.net'],
-            "Dynatrace":          [r'dynatrace\.com', r'ruxitagentjs'],
-            "Elastic APM":        [r'elastic\.co/guide/en/apm'],
-        },
-        "API / Backend": {
-            "GraphQL":            [r'graphql', r'__schema', r'graphiql'],
-            "REST API":           [r'/api/v[0-9]', r'application/json'],
-            "gRPC-Web":           [r'grpc-web'],
-            "WebSocket":          [r'ws://', r'wss://', r'WebSocket'],
-            "Swagger / OpenAPI":  [r'swagger-ui', r'openapi\.json', r'api-docs'],
-        },
-    }
+    SIGNATURES = _WW_SIGNATURES
 
     version_patterns = {
         "WordPress":   r'wp-includes/js/wp-embed\.min\.js\?ver=([\d\.]+)',
