@@ -194,6 +194,68 @@ CMS_ROUTES = {
 
 ROUTES.update(CMS_ROUTES)
 
+# ── Fixtures for the webshell/backdoor + unauth exposure rule batch ──
+# These are INERT: each one serves the signature strings its rule looks for
+# as plain text. There is no shell here, no code execution, nothing to run —
+# only the banner text a real shell would print, so detection can be tested.
+RULE_BATCH_ROUTES = {
+    '/c99.php': (200, 'text/html', '<!DOCTYPE html><html><head><title>Kumo fixture</title></head><body><pre>c99shell</pre></body></html>'),
+    '/images/c99.php': (200, 'text/html', '<!DOCTYPE html><html><head><title>Kumo fixture</title></head><body><pre>c99shell</pre></body></html>'),
+    '/r57.php': (200, 'text/html', '<!DOCTYPE html><html><head><title>Kumo fixture</title></head><body><pre>r57shell</pre></body></html>'),
+    '/wso.php': (200, 'text/html', '<!DOCTYPE html><html><head><title>Kumo fixture</title></head><body><pre>Web Shell by oRb</pre></body></html>'),
+    '/wp-content/uploads/wso.php': (200, 'text/html', '<!DOCTYPE html><html><head><title>Kumo fixture</title></head><body><pre>Web Shell by oRb</pre></body></html>'),
+    '/b374k.php': (200, 'text/html', '<!DOCTYPE html><html><head><title>Kumo fixture</title></head><body><pre>b374k</pre></body></html>'),
+    '/filesman.php': (200, 'text/html', '<!DOCTYPE html><html><head><title>Kumo fixture</title></head><body><pre>FilesMan</pre></body></html>'),
+    '/idx.php': (200, 'text/html', '<!DOCTYPE html><html><head><title>Kumo fixture</title></head><body><pre>IndoXploit</pre></body></html>'),
+    '/alfa.php': (200, 'text/html', '<!DOCTYPE html><html><head><title>Kumo fixture</title></head><body><pre>ALFA TEaM</pre></body></html>'),
+    '/wp-includes/ALFA_DATA/': (200, 'text/html', '<!DOCTYPE html><html><head><title>Kumo fixture</title></head><body><pre>ALFA_DATA</pre></body></html>'),
+    '/p0wny.php': (200, 'text/html', '<!DOCTYPE html><html><head><title>Kumo fixture</title></head><body><pre>p0wny@shell</pre></body></html>'),
+    '/mini.php': (200, 'text/html', '<!DOCTYPE html><html><head><title>Kumo fixture</title></head><body><pre>Mini Shell</pre></body></html>'),
+    '/marijuana.php': (200, 'text/html', '<!DOCTYPE html><html><head><title>Kumo fixture</title></head><body><pre>Marijuana Shell</pre></body></html>'),
+    '/priv8.php': (200, 'text/html', '<!DOCTYPE html><html><head><title>Kumo fixture</title></head><body><pre>Priv8 Shell</pre></body></html>'),
+    '/shell.php': (200, 'text/html', '<!DOCTYPE html><html><head><title>Kumo fixture</title></head><body><pre>Web Shell by</pre></body></html>'),
+    '/wp-content/uploads/shell.php': (200, 'text/html', '<!DOCTYPE html><html><head><title>Kumo fixture</title></head><body><pre>Web Shell by</pre></body></html>'),
+    '/cmd.php': (200, 'text/html', '<!DOCTYPE html><html><head><title>Kumo fixture</title></head><body><pre>execute command</pre></body></html>'),
+    '/phpshell.php': (200, 'text/html', '<!DOCTYPE html><html><head><title>Kumo fixture</title></head><body><pre>PHP Shell Run command</pre></body></html>'),
+    '/adminer-4.8.1.php': (200, 'text/html', '<!DOCTYPE html><html><head><title>Kumo fixture</title></head><body><pre>Adminer adminer.org</pre></body></html>'),
+    '/up.php': (200, 'text/html', '<!DOCTYPE html><html><head><title>Kumo fixture</title></head><body><pre>Uploader by</pre></body></html>'),
+    '/bypass.php': (200, 'text/html', '<!DOCTYPE html><html><head><title>Kumo fixture</title></head><body><pre>Symlink Bypass</pre></body></html>'),
+    '/wp-content/plugins/hello.php': (200, 'text/html', '<!DOCTYPE html><html><head><title>Kumo fixture</title></head><body><pre>Web Shell by</pre></body></html>'),
+    '/404.php': (200, 'text/html', '<!DOCTYPE html><html><head><title>Kumo fixture</title></head><body><pre>Web Shell by</pre></body></html>'),
+    '/wp-content/wp-config.php': (200, 'text/plain', '# kumo lab fixture\nWeb Shell by\n'),
+    '/cmd.jsp': (200, 'text/html', '<!DOCTYPE html><html><head><title>Kumo fixture</title></head><body><pre>Runtime.getRuntime().exec</pre></body></html>'),
+    '/cmd.aspx': (200, 'text/html', '<!DOCTYPE html><html><head><title>Kumo fixture</title></head><body><pre>ASPX Shell</pre></body></html>'),
+    '/.antproxy.php': (200, 'text/plain', '# kumo lab fixture\nantproxy\n'),
+    '/overview.asp': (200, 'text/html', '<!DOCTYPE html><html><head><title>Kumo fixture</title></head><body><pre>DVR Lists rtsp:// login_check.js MAX USER :</pre></body></html>'),
+    '/my-account/': (200, 'text/html', '<!DOCTYPE html><html><head><title>Kumo fixture</title></head><body><pre>Your account has been activated! From your account dashboard you can view your</pre></body></html>'),
+    '/.credentials': (200, 'text/plain', '# kumo lab fixture\nclient_id <?php\n'),
+    '/application/down.php': (200, 'text/html', '<!DOCTYPE html><html><head><title>Kumo fixture</title></head><body><pre>EasyImage</pre></body></html>'),
+    '/storage/oauth-private.key': (200, 'text/plain', '# kumo lab fixture\n-----BEGIN RSA PRIVATE KEY----- <!DOCTYPE\n'),
+    '/lucee/admin/web.cfm': (200, 'text/html', '<!DOCTYPE html><html><head><title>Kumo fixture</title></head><body><pre>Lucee box">New Password</div></pre></body></html>'),
+    '/.msmtprc': (200, 'text/plain', '# kumo lab fixture\naccount host from auth octet-stream\n'),
+    '/xml/User/User.xml': (200, 'text/plain', '# kumo lab fixture\n<?xml version account=\n'),
+    '/.gem/credentials': (200, 'text/plain', '# kumo lab fixture\n:rubygems_api_key: <?php\n'),
+    '/config/postProcessing/testNaming': (200, 'text/html', '<!DOCTYPE html><html><head><title>Kumo fixture</title></head><body><pre><svg/onload=alert(document.domain)></pre></body></html>'),
+    '/lan.html': (200, 'text/html', '<!DOCTYPE html><html><head><title>Kumo fixture</title></head><body><pre>IPC@CHIP Solare Datensysteme GmbH mailto:info@solar-log.com</pre></body></html>'),
+    '/terraform.tfstate': (200, 'text/html', '<!DOCTYPE html><html><head><title>Kumo fixture</title></head><body><pre>"outputs" "resources"</pre></body></html>'),
+    '/hoteldruid/inizio.php': (200, 'text/html', '<!DOCTYPE html><html><head><title>Kumo fixture</title></head><body><pre><title> HotelDruid </title> <b>INSERT:</b> <b>TABLES:</b></pre></body></html>'),
+    '/wifi_base.shtml': (200, 'text/html', '<!DOCTYPE html><html><head><title>Kumo fixture</title></head><body><pre><title>APP</title> var passphraseKey12="";</pre></body></html>'),
+    '/wp-admin/js/theme.js': (200, 'text/html', "<!DOCTYPE html><html><head><title>Kumo fixture</title></head><body><pre>self.view.collection.once( 'query:success', function() { escapeSelector</pre></body></html>"),
+    '/wp-content/plugins/boldgrid-backup/cron/restore-info.json': (200, 'text/plain', '# kumo lab fixture\n"filepath" /wp-content/boldgrid_backup_\n'),
+    '/wp-admin/setup-config.php': (200, 'text/html', '<!DOCTYPE html><html><head><title>Kumo fixture</title></head><body><pre>Below you should enter your database connection details.</pre></body></html>'),
+    '/v1/health/service/consul': (200, 'text/html', '<!DOCTYPE html><html><head><title>Kumo fixture</title></head><body><pre>Node Service consul-network-segment</pre></body></html>'),
+    '/wp-content/backups-dup-lite/tmp/': (200, 'text/html', '<!DOCTYPE html><html><head><title>Kumo fixture</title></head><body><pre>Index of /wp-content/backups-dup-lite/</pre></body></html>'),
+    '/bin.tidy.infinity.json': (200, 'text/plain', '# kumo lab fixture\n"jcr:primaryType": "jcr:uuid":\n'),
+    '/database_credentials.inc': (200, 'text/plain', '# kumo lab fixture\nDATABASE_USER DATABASE_PASS Access denied\n'),
+    '/cgi-bin/info.cgi': (200, 'text/html', '<!DOCTYPE html><html><head><title>Kumo fixture</title></head><body><pre>Product= Model=</pre></body></html>'),
+    '/cap.js': (200, 'text/html', '<!DOCTYPE html><html><head><title>Kumo fixture</title></head><body><pre>var talkTypes= var userInfo=</pre></body></html>'),
+    '/.bash_history': (200, 'text/plain', '# kumo lab fixture\nmkdir <?xml\n'),
+    '/dashboard.html': (200, 'text/html', '<!DOCTYPE html><html><head><title>Kumo fixture</title></head><body><pre>Nginx+ Dashboard</pre></body></html>'),
+    '/api/v1/targets': (200, 'text/html', '<!DOCTYPE html><html><head><title>Kumo fixture</title></head><body><pre>"activeTargets" X-Server-Hostname</pre></body></html>'),
+}
+
+ROUTES.update(RULE_BATCH_ROUTES)
+
 
 def graphql_body(qs):
     if "__schema" in qs or "__typename" in qs:

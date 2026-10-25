@@ -776,17 +776,115 @@ def scan_ports(domain, extra_ports=None):
                     p["filtered_reason"] = "did not respond on re-check (transient)"
             open_ports = confirmed
 
+    # ── CDN edge attribution ──────────────────────────────────────────────
+    # When the target resolves to a CDN, the ports that answer belong to the
+    # edge, not the origin. They stay in the output (knowing a site is proxied
+    # matters) but are labelled and stripped of risk, so an operator is never
+    # handed "Kubernetes API open" for what is really Cloudflare's :8443.
+    cdn = _cdn_identity(target_ip, domain)
+    edge_ports = 0
+    if cdn:
+        edge_set = _CLOUDFLARE_EDGE_PORTS if cdn == "cloudflare" else {80, 443, 8080, 8443}
+        for p in results:
+            if p["open"] and p["port"] in edge_set:
+                p["edge"] = cdn
+                p["risk"] = "info"
+                p["confidence"] = "edge"
+                p["service"] = f"{p['service']} (via {cdn} edge)"
+                edge_ports += 1
+        open_ports = [p for p in results if p["open"]]
+
+    origin_ports = [p for p in open_ports if not p.get("edge")]
+
     return {
         "results":       results,
         "open":          open_ports,
+        "origin_open":   origin_ports,
         "total_scanned": len(ports_to_scan),
         "from_intel":    len(shodan_censys_ports),
         "target_ip":     target_ip,
+        "cdn":           cdn,
+        "edge_ports":    edge_ports,
+        "cdn_note":      (f"{domain} resolves to the {cdn} edge ({target_ip}). "
+                          f"{edge_ports} open port(s) belong to that edge and are "
+                          f"open on every {cdn}-proxied domain — they are not the "
+                          f"origin's attack surface. The origin was not reached." )
+                         if cdn else "",
         "port_catchall": port_catchall,
         "catchall_note": ("Host answered on random unused ports — a firewall/proxy "
                           "accepts every connection. Only ports with real service "
                           "evidence are reported.") if port_catchall else "",
     }
+
+
+# ═══════════════════════════════════════════════════════════════
+# SHARED: CDN / REVERSE-PROXY EDGE DETECTION
+# ═══════════════════════════════════════════════════════════════
+# A domain behind Cloudflare resolves to Cloudflare's edge, and that edge
+# accepts connections on a fixed set of ports for EVERY proxied domain. A port
+# scan therefore reports the same handful of "open" ports on every Cloudflare
+# site — with real TLS handshakes behind them, so banner verification confirms
+# them. They are genuinely open; they are just not the customer's origin, and
+# reporting them as the target's attack surface is misleading.
+
+# Cloudflare's published IPv4 ranges (www.cloudflare.com/ips/).
+_CLOUDFLARE_V4 = (
+    "173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",
+    "141.101.64.0/18", "108.162.192.0/18", "190.93.240.0/20", "188.114.96.0/20",
+    "197.234.240.0/22", "198.41.128.0/17", "162.158.0.0/15", "104.16.0.0/13",
+    "104.24.0.0/14", "172.64.0.0/13", "131.0.72.0/22",
+)
+
+# The ports Cloudflare's edge proxies for HTTP(S). Open on every proxied domain.
+_CLOUDFLARE_EDGE_PORTS = {80, 443, 2052, 2053, 2082, 2083, 2086, 2087,
+                          2095, 2096, 8080, 8443, 8880}
+
+_FASTLY_V4 = ("151.101.0.0/16", "199.232.0.0/16", "23.235.32.0/20", "43.249.72.0/22")
+_SUCURI_V4 = ("192.88.134.0/23", "185.93.228.0/22", "66.248.200.0/22")
+
+
+def _ip_in_ranges(ip, ranges):
+    try:
+        import ipaddress
+        addr = ipaddress.ip_address(ip)
+        return any(addr in ipaddress.ip_network(c) for c in ranges)
+    except Exception:
+        return False
+
+
+def _cdn_identity(ip, domain=None):
+    """
+    Name the CDN/WAF edge in front of a target, or None.
+
+    IP ranges are checked first because they are authoritative; a response
+    header check is the fallback for providers whose ranges are not pinned here.
+    """
+    if _ip_in_ranges(ip, _CLOUDFLARE_V4):
+        return "cloudflare"
+    if _ip_in_ranges(ip, _FASTLY_V4):
+        return "fastly"
+    if _ip_in_ranges(ip, _SUCURI_V4):
+        return "sucuri"
+    if not domain or not HAS_REQUESTS:
+        return None
+    try:
+        r = requests.get(f"https://{domain}/", timeout=6, verify=False,
+                         allow_redirects=False,
+                         headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"})
+        h = {k.lower(): str(v).lower() for k, v in r.headers.items()}
+        if "cf-ray" in h or h.get("server", "") == "cloudflare":
+            return "cloudflare"
+        if "x-served-by" in h and "fastly" in h.get("x-served-by", ""):
+            return "fastly"
+        if "x-sucuri-id" in h:
+            return "sucuri"
+        if "x-akamai-transformed" in h or "akamai" in h.get("server", ""):
+            return "akamai"
+        if "x-amz-cf-id" in h or h.get("via", "").find("cloudfront") >= 0:
+            return "cloudfront"
+    except Exception:
+        pass
+    return None
 
 
 def _verify_port(ip, hostname, port, banner=""):
@@ -848,14 +946,34 @@ def _resp_part(resp, part, scrub=None):
     `scrub` removes the requested path (and its segments) from the text first,
     so a server echoing the URL back can never satisfy a product matcher.
     """
+    def _body_text(r):
+        """
+        Decode the body for matching, without trusting charset auto-detection.
+
+        requests falls back to chardet when a response has no charset, and on a
+        binary file full of NUL bytes that guesses something like UTF-16 and
+        returns mojibake — which is why the .DS_Store rule never matched its own
+        "Bud1" magic. Decoding the raw bytes directly keeps byte signatures
+        intact, and latin-1 maps every byte to a character so nothing is lost.
+        """
+        raw = getattr(r, "content", None)
+        if raw is None:
+            return getattr(r, "text", "") or ""
+        if isinstance(raw, str):
+            return raw
+        try:
+            return raw.decode("utf-8")
+        except Exception:
+            return raw.decode("latin-1", "replace")
+
     try:
         if part == "header":
             text = "\n".join(f"{k}: {v}" for k, v in resp.headers.items())
         elif part == "body":
-            text = resp.text or ""
+            text = _body_text(resp)
         elif part == "all":
             hdr = "\n".join(f"{k}: {v}" for k, v in resp.headers.items())
-            text = hdr + "\n\n" + (resp.text or "")
+            text = hdr + "\n\n" + _body_text(resp)
         else:
             return ""
     except Exception:
@@ -3731,6 +3849,383 @@ VULN_RULES_EXTENDED = [
         "description": 'XWiki Platform - Unauthorized Document History Access (ported from nuclei template http/cves/2024/CVE-2024-45591.yaml)',
         "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['historySummary', 'pageId', 'comment'], 'condition': 'or'}],
     },
+
+    # ══ Web shell / backdoor presence + unauthenticated exposure batch ══
+    # Detection only: each rule is a GET plus a response signature. None of
+    # them sends a payload, interacts with a shell, or executes anything on
+    # the target. A hit on a webshell rule is an incident, not a finding.
+
+    {
+        "id": 'webshell-c99', "name": 'C99 Web Shell Present',
+        "severity": 'critical', "path": '/c99.php',
+        "matchers_condition": 'and', "origin": 'kumo-webshell',
+        "description": 'C99 Web Shell Present. A web shell at this path means the host is already compromised: treat it as an active incident, not a finding to schedule.',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'body', 'words': ['c99shell', '!C99Shell', 'c99madshell'], 'condition': 'or'}],
+    },
+    {
+        "id": 'webshell-c99-alt', "name": 'C99 Web Shell Present (alt path)',
+        "severity": 'critical', "path": '/images/c99.php',
+        "matchers_condition": 'and', "origin": 'kumo-webshell',
+        "description": 'C99 Web Shell Present (alt path). A web shell at this path means the host is already compromised: treat it as an active incident, not a finding to schedule.',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'body', 'words': ['c99shell', '!C99Shell', 'c99madshell'], 'condition': 'or'}],
+    },
+    {
+        "id": 'webshell-r57', "name": 'R57 Web Shell Present',
+        "severity": 'critical', "path": '/r57.php',
+        "matchers_condition": 'and', "origin": 'kumo-webshell',
+        "description": 'R57 Web Shell Present. A web shell at this path means the host is already compromised: treat it as an active incident, not a finding to schedule.',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'body', 'words': ['r57shell', 'r57 shell', 'RusH security team'], 'condition': 'or'}],
+    },
+    {
+        "id": 'webshell-wso', "name": 'WSO Web Shell Present',
+        "severity": 'critical', "path": '/wso.php',
+        "matchers_condition": 'and', "origin": 'kumo-webshell',
+        "description": 'WSO Web Shell Present. A web shell at this path means the host is already compromised: treat it as an active incident, not a finding to schedule.',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'body', 'words': ['Web Shell by oRb', 'wsoEx', 'wso_ex', 'WSOsetcookie'], 'condition': 'or'}],
+    },
+    {
+        "id": 'webshell-wso-upload', "name": 'WSO Web Shell Present (uploads)',
+        "severity": 'critical', "path": '/wp-content/uploads/wso.php',
+        "matchers_condition": 'and', "origin": 'kumo-webshell',
+        "description": 'WSO Web Shell Present (uploads). A web shell at this path means the host is already compromised: treat it as an active incident, not a finding to schedule.',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'body', 'words': ['Web Shell by oRb', 'wsoEx', 'WSOsetcookie'], 'condition': 'or'}],
+    },
+    {
+        "id": 'webshell-b374k', "name": 'b374k Web Shell Present',
+        "severity": 'critical', "path": '/b374k.php',
+        "matchers_condition": 'and', "origin": 'kumo-webshell',
+        "description": 'b374k Web Shell Present. A web shell at this path means the host is already compromised: treat it as an active incident, not a finding to schedule.',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'body', 'words': ['b374k', 'b374k shell', 'b374k/'], 'condition': 'or'}],
+    },
+    {
+        "id": 'webshell-filesman', "name": 'FilesMan Web Shell Present',
+        "severity": 'critical', "path": '/filesman.php',
+        "matchers_condition": 'and', "origin": 'kumo-webshell',
+        "description": 'FilesMan Web Shell Present. A web shell at this path means the host is already compromised: treat it as an active incident, not a finding to schedule.',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'body', 'words': ['FilesMan', 'Files Man', 'filesMan'], 'condition': 'or'}],
+    },
+    {
+        "id": 'webshell-indoxploit', "name": 'IndoXploit Web Shell Present',
+        "severity": 'critical', "path": '/idx.php',
+        "matchers_condition": 'and', "origin": 'kumo-webshell',
+        "description": 'IndoXploit Web Shell Present. A web shell at this path means the host is already compromised: treat it as an active incident, not a finding to schedule.',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'body', 'words': ['IndoXploit', 'indoxploit', 'IDX Shell'], 'condition': 'or'}],
+    },
+    {
+        "id": 'webshell-alfa', "name": 'ALFA TEaM Web Shell Present',
+        "severity": 'critical', "path": '/alfa.php',
+        "matchers_condition": 'and', "origin": 'kumo-webshell',
+        "description": 'ALFA TEaM Web Shell Present. A web shell at this path means the host is already compromised: treat it as an active incident, not a finding to schedule.',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'body', 'words': ['ALFA TEaM', 'AlfaShell', 'alfa_', 'ALFA DATA'], 'condition': 'or'}],
+    },
+    {
+        "id": 'webshell-alfa-data', "name": 'ALFA Shell Data Directory Present',
+        "severity": 'critical', "path": '/wp-includes/ALFA_DATA/',
+        "matchers_condition": 'and', "origin": 'kumo-webshell',
+        "description": 'ALFA Shell Data Directory Present. A web shell at this path means the host is already compromised: treat it as an active incident, not a finding to schedule.',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'body', 'words': ['ALFA_DATA', 'alfacgiapi', 'ALFA TEaM'], 'condition': 'or'}],
+    },
+    {
+        "id": 'webshell-p0wny', "name": 'p0wny Web Shell Present',
+        "severity": 'critical', "path": '/p0wny.php',
+        "matchers_condition": 'and', "origin": 'kumo-webshell',
+        "description": 'p0wny Web Shell Present. A web shell at this path means the host is already compromised: treat it as an active incident, not a finding to schedule.',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'body', 'words': ['p0wny@shell', 'p0wny-shell', 'p0wny'], 'condition': 'or'}],
+    },
+    {
+        "id": 'webshell-mini', "name": 'Mini Shell Present',
+        "severity": 'critical', "path": '/mini.php',
+        "matchers_condition": 'and', "origin": 'kumo-webshell',
+        "description": 'Mini Shell Present. A web shell at this path means the host is already compromised: treat it as an active incident, not a finding to schedule.',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'body', 'words': ['Mini Shell', 'MiniShell', 'mini shell by'], 'condition': 'or'}],
+    },
+    {
+        "id": 'webshell-marijuana', "name": 'Marijuana Web Shell Present',
+        "severity": 'critical', "path": '/marijuana.php',
+        "matchers_condition": 'and', "origin": 'kumo-webshell',
+        "description": 'Marijuana Web Shell Present. A web shell at this path means the host is already compromised: treat it as an active incident, not a finding to schedule.',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'body', 'words': ['Marijuana Shell', 'marijuana.php', 'MARIJUANA'], 'condition': 'or'}],
+    },
+    {
+        "id": 'webshell-priv8', "name": 'Priv8 Web Shell Present',
+        "severity": 'critical', "path": '/priv8.php',
+        "matchers_condition": 'and', "origin": 'kumo-webshell',
+        "description": 'Priv8 Web Shell Present. A web shell at this path means the host is already compromised: treat it as an active incident, not a finding to schedule.',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'body', 'words': ['Priv8 Shell', 'priv8 tools', 'PRIV8'], 'condition': 'or'}],
+    },
+    {
+        "id": 'webshell-generic-shell-php', "name": 'Generic PHP Web Shell Present',
+        "severity": 'critical', "path": '/shell.php',
+        "matchers_condition": 'and', "origin": 'kumo-webshell',
+        "description": 'Generic PHP Web Shell Present. A web shell at this path means the host is already compromised: treat it as an active incident, not a finding to schedule.',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'body', 'words': ['Web Shell by', 'Shell by oRb', 'c99shell', 'r57shell', 'b374k', 'IndoXploit', 'ALFA TEaM', 'p0wny@shell', 'FilesMan'], 'condition': 'or'}],
+    },
+    {
+        "id": 'webshell-generic-uploads', "name": 'Generic PHP Web Shell in uploads',
+        "severity": 'critical', "path": '/wp-content/uploads/shell.php',
+        "matchers_condition": 'and', "origin": 'kumo-webshell',
+        "description": 'Generic PHP Web Shell in uploads. A web shell at this path means the host is already compromised: treat it as an active incident, not a finding to schedule.',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'body', 'words': ['Web Shell by', 'c99shell', 'r57shell', 'b374k', 'IndoXploit', 'ALFA TEaM', 'p0wny@shell', 'FilesMan'], 'condition': 'or'}],
+    },
+    {
+        "id": 'webshell-cmd-php', "name": 'Command-execution Shell Present',
+        "severity": 'critical', "path": '/cmd.php',
+        "matchers_condition": 'and', "origin": 'kumo-webshell',
+        "description": 'Command-execution Shell Present. A web shell at this path means the host is already compromised: treat it as an active incident, not a finding to schedule.',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'body', 'words': ['execute command', 'Command execute', 'cmd_output', 'shell_exec('], 'condition': 'or'}],
+    },
+    {
+        "id": 'webshell-phpshell', "name": 'PHP-Shell Console Present',
+        "severity": 'critical', "path": '/phpshell.php',
+        "matchers_condition": 'and', "origin": 'kumo-webshell',
+        "description": 'PHP-Shell Console Present. A web shell at this path means the host is already compromised: treat it as an active incident, not a finding to schedule.',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'body', 'words': ['PHP Shell', 'Run command'], 'condition': 'and'}],
+    },
+    {
+        "id": 'webshell-adminer-drop', "name": 'Adminer dropped as a shell',
+        "severity": 'high', "path": '/adminer-4.8.1.php',
+        "matchers_condition": 'and', "origin": 'kumo-webshell',
+        "description": 'Adminer dropped as a shell. A web shell at this path means the host is already compromised: treat it as an active incident, not a finding to schedule.',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'body', 'words': ['Adminer', 'adminer.org'], 'condition': 'and'}],
+    },
+    {
+        "id": 'webshell-uploader', "name": 'File Uploader Backdoor Present',
+        "severity": 'critical', "path": '/up.php',
+        "matchers_condition": 'and', "origin": 'kumo-webshell',
+        "description": 'File Uploader Backdoor Present. A web shell at this path means the host is already compromised: treat it as an active incident, not a finding to schedule.',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'body', 'words': ['Uploader by', 'upload shell', 'Simple Uploader', 'Mass Uploader'], 'condition': 'or'}],
+    },
+    {
+        "id": 'webshell-bypass', "name": 'Symlink/Bypass Shell Present',
+        "severity": 'critical', "path": '/bypass.php',
+        "matchers_condition": 'and', "origin": 'kumo-webshell',
+        "description": 'Symlink/Bypass Shell Present. A web shell at this path means the host is already compromised: treat it as an active incident, not a finding to schedule.',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'body', 'words': ['Symlink Bypass', 'bypass shell', 'Symlink Manager'], 'condition': 'or'}],
+    },
+    {
+        "id": 'webshell-wordpress-plugin', "name": 'Backdoored WordPress Plugin Shell',
+        "severity": 'critical', "path": '/wp-content/plugins/hello.php',
+        "matchers_condition": 'and', "origin": 'kumo-webshell',
+        "description": 'Backdoored WordPress Plugin Shell. A web shell at this path means the host is already compromised: treat it as an active incident, not a finding to schedule.',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'body', 'words': ['Web Shell by', 'c99shell', 'eval(base64_decode', 'FilesMan'], 'condition': 'or'}],
+    },
+    {
+        "id": 'webshell-404-decoy', "name": 'Backdoor disguised as 404 handler',
+        "severity": 'critical', "path": '/404.php',
+        "matchers_condition": 'and', "origin": 'kumo-webshell',
+        "description": 'Backdoor disguised as 404 handler. A web shell at this path means the host is already compromised: treat it as an active incident, not a finding to schedule.',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'body', 'words': ['Web Shell by', 'c99shell', 'FilesMan', 'eval(base64_decode', 'p0wny@shell'], 'condition': 'or'}],
+    },
+    {
+        "id": 'webshell-wp-config-decoy', "name": 'Backdoor disguised as wp-config',
+        "severity": 'critical', "path": '/wp-content/wp-config.php',
+        "matchers_condition": 'and', "origin": 'kumo-webshell',
+        "description": 'Backdoor disguised as wp-config. A web shell at this path means the host is already compromised: treat it as an active incident, not a finding to schedule.',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'body', 'words': ['Web Shell by', 'c99shell', 'FilesMan', 'eval(base64_decode'], 'condition': 'or'}],
+    },
+    {
+        "id": 'webshell-jsp', "name": 'JSP Web Shell Present',
+        "severity": 'critical', "path": '/cmd.jsp',
+        "matchers_condition": 'and', "origin": 'kumo-webshell',
+        "description": 'JSP Web Shell Present. A web shell at this path means the host is already compromised: treat it as an active incident, not a finding to schedule.',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'body', 'words': ['Runtime.getRuntime().exec', 'JSP Shell', 'jsp shell', 'cmdExec'], 'condition': 'or'}],
+    },
+    {
+        "id": 'webshell-aspx', "name": 'ASPX Web Shell Present',
+        "severity": 'critical', "path": '/cmd.aspx',
+        "matchers_condition": 'and', "origin": 'kumo-webshell',
+        "description": 'ASPX Web Shell Present. A web shell at this path means the host is already compromised: treat it as an active incident, not a finding to schedule.',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'body', 'words': ['ASPX Shell', 'aspxspy', 'ASPXSpy', 'Process.Start('], 'condition': 'or'}],
+    },
+    {
+        "id": 'webshell-antsword-proxy', "name": 'AntSword Proxy Backdoor Present',
+        "severity": 'critical', "path": '/.antproxy.php',
+        "matchers_condition": 'and', "origin": 'kumo-webshell',
+        "description": 'AntSword Proxy Backdoor Present. A web shell at this path means the host is already compromised: treat it as an active incident, not a finding to schedule.',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'body', 'words': ['antproxy', 'antsword', 'AntSword'], 'condition': 'or'}],
+    },
+    {
+        "id": 'commax-credentials-disclosure', "name": 'COMMAX Smart Home Ruvie CCTV Bridge DVR - RTSP Credentials Disclosure',
+        "severity": 'critical', "path": '/overview.asp',
+        "matchers_condition": 'and', "origin": 'nuclei',
+        "description": 'COMMAX Smart Home Ruvie CCTV Bridge DVR - RTSP Credentials Disclosure (ported from nuclei template http/vulnerabilities/other/commax-credentials-disclosure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['DVR Lists', 'rtsp://', 'login_check.js', 'MAX USER :'], 'condition': 'and'}],
+    },
+    {
+        "id": 'wp-woocommerce-email-verification', "name": 'Email Verification for WooCommerce < 1.8.2 - Loose Comparison to Authentication ',
+        "severity": 'critical', "path": '/my-account/?alg_wc_ev_verify_email=eyJpZCI6MSwiY29kZSI6MH0=',
+        "matchers_condition": 'and', "origin": 'nuclei',
+        "description": 'Email Verification for WooCommerce < 1.8.2 - Loose Comparison to Authentication Bypass (ported from nuclei template http/vulnerabilities/wordpress/wp-woocommerce-email-verification.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Your account has been activated!', 'From your account dashboard you can view your'], 'condition': 'and'}],
+    },
+    {
+        "id": 'dot-credentials-exposure', "name": 'Dot Credentials - Exposure',
+        "severity": 'high', "path": '/.credentials',
+        "matchers_condition": 'and', "origin": 'nuclei',
+        "description": 'Dot Credentials - Exposure (ported from nuclei template http/exposures/files/dot-credentials-exposure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['client_id', 'client_secret', 'access_token', 'refresh_token', 'aws_access_key_id'], 'condition': 'or'}, {'type': 'word', 'part': 'all', 'words': ['<body', '<!DOCTYPE', '<script', '<?php'], 'condition': 'or'}, {'type': 'dsl', 'dsl': ['not_html']}],
+    },
+    {
+        "id": 'easyimage-downphp-lfi', "name": 'EasyImage down.php - Arbitrary File Read',
+        "severity": 'high', "path": '/application/down.php?dw=config/config.php',
+        "matchers_condition": 'and', "origin": 'nuclei',
+        "description": 'EasyImage down.php - Arbitrary File Read (ported from nuclei template http/vulnerabilities/other/easyimage-downphp-lfi.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['EasyImage'], 'condition': 'and'}],
+    },
+    {
+        "id": 'laravel-passport-keys-exposed', "name": 'Laravel Passport - OAuth2 Keys Exposed',
+        "severity": 'high', "path": '/storage/oauth-private.key',
+        "matchers_condition": 'and', "origin": 'nuclei',
+        "description": 'Laravel Passport - OAuth2 Keys Exposed (ported from nuclei template http/misconfiguration/laravel-passport-keys-exposed.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['-----BEGIN RSA PRIVATE KEY-----', '-----BEGIN PUBLIC KEY-----'], 'condition': 'or'}, {'type': 'word', 'part': 'all', 'words': ['<!DOCTYPE'], 'condition': 'or'}, {'type': 'dsl', 'dsl': ['not_html']}],
+    },
+    {
+        "id": 'lucee-unset-credentials', "name": 'Lucee - Unset Credentials',
+        "severity": 'high', "path": '/lucee/admin/web.cfm',
+        "matchers_condition": 'and', "origin": 'nuclei',
+        "description": 'Lucee - Unset Credentials (ported from nuclei template http/vulnerabilities/other/lucee-unset-credentials.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Lucee', 'box">New Password</div>'], 'condition': 'and'}],
+    },
+    {
+        "id": 'msmtp-config', "name": 'Msmtp - Config Exposure',
+        "severity": 'high', "path": '/.msmtprc',
+        "matchers_condition": 'and', "origin": 'nuclei',
+        "description": 'Msmtp - Config Exposure (ported from nuclei template http/exposures/configs/msmtp-config.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['account', 'host', 'from', 'auth'], 'condition': 'and'}, {'type': 'word', 'part': 'all', 'words': ['octet-stream'], 'condition': 'or'}, {'type': 'dsl', 'dsl': ['not_html']}],
+    },
+    {
+        "id": 'qihang-media-disclosure', "name": 'QiHang Media Web Digital Signage 3.0.9 - Cleartext Credentials Disclosure',
+        "severity": 'high', "path": '/xml/User/User.xml',
+        "matchers_condition": 'and', "origin": 'nuclei',
+        "description": 'QiHang Media Web Digital Signage 3.0.9 - Cleartext Credentials Disclosure (ported from nuclei template http/vulnerabilities/other/qihang-media-disclosure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['<?xml version', 'account='], 'condition': 'and'}],
+    },
+    {
+        "id": 'rubygems-credentials-exposure', "name": 'Ruby Gem::ConfigFile Credential - Exposure',
+        "severity": 'high', "path": '/.gem/credentials',
+        "matchers_condition": 'and', "origin": 'nuclei',
+        "description": 'Ruby Gem::ConfigFile Credential - Exposure (ported from nuclei template http/exposures/files/rubygems-credentials-exposure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': [':rubygems_api_key:'], 'condition': 'or'}, {'type': 'word', 'part': 'all', 'words': ['<body', '<!DOCTYPE', '<script', '<?php'], 'condition': 'or'}],
+    },
+    {
+        "id": 'sick-beard-xss', "name": 'Sickbeard - Cross-Site Scripting',
+        "severity": 'high', "path": '/config/postProcessing/testNaming?pattern=%3Csvg/onload=alert(document.domain)%3E',
+        "matchers_condition": 'and', "origin": 'nuclei',
+        "description": 'Sickbeard - Cross-Site Scripting (ported from nuclei template http/vulnerabilities/other/sick-beard-xss.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['<svg/onload=alert(document.domain)>'], 'condition': 'or'}],
+    },
+    {
+        "id": 'solar-log-authbypass', "name": 'Solar-Log 500 2.8.2 - Incorrect Access Control',
+        "severity": 'high', "path": '/lan.html',
+        "matchers_condition": 'and', "origin": 'nuclei',
+        "description": 'Solar-Log 500 2.8.2 - Incorrect Access Control (ported from nuclei template http/vulnerabilities/other/solar-log-authbypass.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['IPC@CHIP'], 'condition': 'and'}, {'type': 'word', 'part': 'all', 'words': ['Solare Datensysteme GmbH', 'mailto:info@solar-log.com'], 'condition': 'and'}],
+    },
+    {
+        "id": 'terraform-tfstate-exposure', "name": 'Terraform State - File Exposure',
+        "severity": 'high', "path": '/terraform.tfstate',
+        "matchers_condition": 'and', "origin": 'nuclei',
+        "description": 'Terraform State - File Exposure (ported from nuclei template http/exposures/files/terraform-tfstate-exposure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['"outputs"', '"resources"'], 'condition': 'and'}],
+    },
+    {
+        "id": 'unauth-hoteldruid-panel', "name": 'Hoteldruid Management Panel Access',
+        "severity": 'high', "path": '/hoteldruid/inizio.php',
+        "matchers_condition": 'and', "origin": 'nuclei',
+        "description": 'Hoteldruid Management Panel Access (ported from nuclei template http/vulnerabilities/other/unauth-hoteldruid-panel.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['<title> HotelDruid </title>', '<b>INSERT:</b>', '<b>TABLES:</b>'], 'condition': 'and'}],
+    },
+    {
+        "id": 'unauth-wavink-panel', "name": 'Wavlink Panel - Unauthenticated Access',
+        "severity": 'high', "path": '/wifi_base.shtml',
+        "matchers_condition": 'and', "origin": 'nuclei',
+        "description": 'Wavlink Panel - Unauthenticated Access (ported from nuclei template http/misconfiguration/unauth-wavink-panel.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['<title>APP</title>'], 'condition': 'or'}, {'type': 'word', 'part': 'all', 'words': ['var passphraseKey12="";'], 'condition': 'or'}],
+    },
+    {
+        "id": 'wordpress-click2shell', "name": 'WordPress Click2Shell Theme Preview Selector Injection',
+        "severity": 'high', "path": '/wp-admin/js/theme.js',
+        "matchers_condition": 'and', "origin": 'nuclei',
+        "description": 'WordPress Click2Shell Theme Preview Selector Injection (ported from nuclei template http/vulnerabilities/wordpress/wordpress-click2shell.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ["self.view.collection.once( 'query:success', function() {"], 'condition': 'and'}, {'type': 'word', 'part': 'all', 'words': ['escapeSelector'], 'condition': 'or'}],
+    },
+    {
+        "id": 'wordpress-total-upkeep-backup-download', "name": 'WordPress Total Upkeep Database and Files Backup Download',
+        "severity": 'high', "path": '/wp-content/plugins/boldgrid-backup/cron/restore-info.json',
+        "matchers_condition": 'and', "origin": 'nuclei',
+        "description": 'WordPress Total Upkeep Database and Files Backup Download (ported from nuclei template http/vulnerabilities/wordpress/wordpress-total-upkeep-backup-download.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['"filepath"', '/wp-content/boldgrid_backup_'], 'condition': 'and'}, {'type': 'dsl', 'dsl': ['not_html']}],
+    },
+    {
+        "id": 'wp-config-setup', "name": 'WordPress Setup Configuration',
+        "severity": 'high', "path": '/wp-admin/setup-config.php?step=1',
+        "matchers_condition": 'and', "origin": 'nuclei',
+        "description": 'WordPress Setup Configuration (ported from nuclei template http/vulnerabilities/wordpress/wp-config-setup.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Below you should enter your database connection details.'], 'condition': 'or'}],
+    },
+    {
+        "id": 'hashicorp-consul-unauth', "name": 'Hashicorp Consul API Unauthenticated',
+        "severity": 'medium', "path": '/v1/health/service/consul',
+        "matchers_condition": 'and', "origin": 'nuclei',
+        "description": 'Hashicorp Consul API Unauthenticated (ported from nuclei template http/misconfiguration/hashicorp-consul-unauth.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Node', 'Service', 'consul-network-segment'], 'condition': 'and'}],
+    },
+    {
+        "id": 'unauthenticated-duplicator-disclosure', "name": 'WordPress Duplicator Plugin - Information disclosure',
+        "severity": 'medium', "path": '/wp-content/backups-dup-lite/tmp/',
+        "matchers_condition": 'and', "origin": 'nuclei',
+        "description": 'WordPress Duplicator Plugin - Information disclosure (ported from nuclei template http/vulnerabilities/wordpress/unauthenticated-duplicator-disclosure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Index of /wp-content/backups-dup-lite/'], 'condition': 'or'}],
+    },
+    {
+        "id": 'aem-osgi-bundles', "name": 'Adobe AEM Installed OSGI Bundles',
+        "severity": 'low', "path": '/bin.tidy.infinity.json',
+        "matchers_condition": 'and', "origin": 'nuclei',
+        "description": 'Adobe AEM Installed OSGI Bundles (ported from nuclei template http/misconfiguration/aem/aem-osgi-bundles.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['"jcr:primaryType":', '"jcr:uuid":'], 'condition': 'and'}, {'type': 'dsl', 'dsl': ['not_html']}],
+    },
+    {
+        "id": 'database-credentials', "name": 'Database Credentials File Exposure',
+        "severity": 'low', "path": '/database_credentials.inc',
+        "matchers_condition": 'and', "origin": 'nuclei',
+        "description": 'Database Credentials File Exposure (ported from nuclei template http/exposures/files/database-credentials.yaml)',
+        "matchers": [{'type': 'status', 'status': [200, 401, 403]}, {'type': 'word', 'part': 'all', 'words': ['DATABASE_USER', 'DB_USER'], 'condition': 'or'}, {'type': 'word', 'part': 'all', 'words': ['DATABASE_PASS', 'DB_PASS', 'PASS'], 'condition': 'or'}, {'type': 'word', 'part': 'all', 'words': ['Access denied', 'Unauthorized'], 'condition': 'or'}],
+    },
+    {
+        "id": 'dlink-unauth-cgi-script', "name": 'D-Link DNS Series  CGI Script - Unauthenticated',
+        "severity": 'low', "path": '/cgi-bin/info.cgi',
+        "matchers_condition": 'and', "origin": 'nuclei',
+        "description": 'D-Link DNS Series  CGI Script - Unauthenticated (ported from nuclei template http/misconfiguration/dlink-unauth-cgi-script.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Product=', 'Model='], 'condition': 'and'}],
+    },
+    {
+        "id": 'intelbras-dvr-unauth', "name": 'Intelbras DVR - Unrestricted Access',
+        "severity": 'low', "path": '/cap.js',
+        "matchers_condition": 'and', "origin": 'nuclei',
+        "description": 'Intelbras DVR - Unrestricted Access (ported from nuclei template http/misconfiguration/intelbras-dvr-unauth.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['var talkTypes=', 'var userInfo='], 'condition': 'and'}],
+    },
+    {
+        "id": 'shell-history', "name": 'Shell History',
+        "severity": 'low', "path": '/.bash_history',
+        "matchers_condition": 'and', "origin": 'nuclei',
+        "description": 'Shell History (ported from nuclei template http/misconfiguration/shell-history.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['mkdir', 'chmod', 'nano', 'pico', 'sudo', 'ps aux', 'logout'], 'condition': 'or'}, {'type': 'word', 'part': 'all', 'words': ['<?xml', '<env', 'application/javascript', 'image/'], 'condition': 'or'}, {'type': 'dsl', 'dsl': ['not_html']}],
+    },
+    {
+        "id": 'unauthenticated-nginx-dashboard', "name": 'Nginx Dashboard',
+        "severity": 'low', "path": '/dashboard.html',
+        "matchers_condition": 'and', "origin": 'nuclei',
+        "description": 'Nginx Dashboard (ported from nuclei template http/misconfiguration/unauthenticated-nginx-dashboard.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['Nginx+ Dashboard'], 'condition': 'or'}],
+    },
+    {
+        "id": 'victoriametrics-vmagent-api-exposure', "name": 'VictoriaMetrics vmagent - Unauthenticated Targets Exposure',
+        "severity": 'low', "path": '/api/v1/targets',
+        "matchers_condition": 'and', "origin": 'nuclei',
+        "description": 'VictoriaMetrics vmagent - Unauthenticated Targets Exposure (ported from nuclei template http/exposures/apis/victoriametrics-vmagent-api-exposure.yaml)',
+        "matchers": [{'type': 'status', 'status': [200]}, {'type': 'word', 'part': 'all', 'words': ['"activeTargets"'], 'condition': 'or'}, {'type': 'word', 'part': 'all', 'words': ['X-Server-Hostname'], 'condition': 'or'}],
+    },
 ]
 
 
@@ -3770,13 +4265,7 @@ def _run_vuln_rules(domain, base_sigs=None, timeout=7, brand=None):
             # echoed back. Only whole-path forms and long segments are removed —
             # scrubbing short tokens (e.g. "php" from /phpinfo.php) would also
             # destroy legitimate body text such as "PHP Version".
-            from urllib.parse import quote as _q
-            p = rule["path"]
-            scrub = {p, p.strip("/"), _q(p), p.lower(), domain}
-            for seg in p.strip("/").split("/"):
-                if len(seg) >= 8:
-                    scrub.add(seg)
-            scrub = {s for s in scrub if s and len(s) >= 5}
+            scrub = _rule_scrub(rule, domain)
             if _eval_rule(r, rule, scrub):
                 with _lk:
                     findings.append({
@@ -3797,6 +4286,47 @@ def _run_vuln_rules(domain, base_sigs=None, timeout=7, brand=None):
     with concurrent.futures.ThreadPoolExecutor(max_workers=25) as ex:
         list(ex.map(run, all_rules))
     return findings
+
+
+def _rule_scrub(rule, domain=None):
+    """
+    Build the set of strings to strip from a response before matching a rule.
+
+    The requested path is removed so a server echoing the URL back cannot
+    satisfy a product matcher. But a token the rule itself lists as evidence is
+    NOT a path echo — it is the product name, and for real products the path and
+    the product name are legitimately the same (/transmission/web/ -> the word
+    "Transmission"). Scrubbing those made fourteen rules impossible to fire,
+    including docker-api and graphql-introspection, which is why the live lab
+    only ever reported 18 of 20 expected hits.
+
+    Path echoes are still caught: the full path forms and any segment that is
+    not claimed as evidence are stripped, and _is_site_own_page separately
+    rejects the target's own templated pages.
+    """
+    from urllib.parse import quote as _q
+    p = rule.get("path", "") or ""
+    scrub = {p, p.strip("/"), _q(p), p.lower()}
+    if domain:
+        scrub.add(domain)
+    for seg in p.strip("/").split("/"):
+        if len(seg) >= 8:
+            scrub.add(seg)
+    scrub = {s for s in scrub if s and len(s) >= 5}
+
+    evidence = []
+    for m in rule.get("matchers", []):
+        if m.get("type") == "word":
+            evidence += [str(w).lower() for w in (m.get("words") or [])]
+    if not evidence:
+        return scrub
+    keep = set()
+    for s in scrub:
+        sl = s.lower()
+        if any(sl in w or w in sl for w in evidence):
+            continue          # the rule matches on this: it is evidence, not an echo
+        keep.add(s)
+    return keep
 
 
 def _page_title(r, n=200_000):

@@ -1,5 +1,39 @@
 # Kumo — themed build
 
+## Rule playbook: 365 → 418 checks
+
+53 new rules, every one decoy-screened before it was allowed in and verified
+firing against a lab fixture:
+
+* **27 web shell / backdoor presence signatures** (C99, R57, WSO, b374k,
+  FilesMan, IndoXploit, ALFA TEaM, p0wny, Mini Shell, Marijuana, Priv8,
+  AntSword proxy, JSP and ASPX shells, plus shells disguised as `404.php`,
+  `wp-config.php` and a plugin file). Detection only: each matches the shell's
+  own interface text. Kumo reports that a shell is present; it never talks to
+  one. A hit here is an incident, not a finding to schedule.
+* **26 unauthenticated-exposure and installer rules** mined fresh from
+  projectdiscovery/nuclei-templates through the repaired pipeline.
+
+Mining now also covers `http/vulnerabilities/backdoor`. Templates that prove a
+backdoor by POSTing a command to it are excluded by design — the miner keeps
+GET-detection templates only.
+
+Full inventory: [`docs/RULES.md`](docs/RULES.md).
+
+## Three more precision fixes
+
+* **Fourteen rules could never fire.** The anti-echo scrub was stripping the
+  very words those rules matched on, `docker-api` and `graphql-introspection`
+  among them. `test_rules.py` never caught it because it evaluated rules
+  *without* the scrub the scanner applies. It now runs them exactly as the
+  scanner does and carries a dead-rule check.
+* **Binary bodies were mis-decoded**, so the `.DS_Store` rule never matched its
+  own `Bud1` magic bytes.
+* **Cloudflare edge ports** were reported as the target's open ports. They are
+  open on every proxied domain. Kumo now names the CDN, labels those ports, and
+  keeps them out of alerts.
+
+
 ## Precision pass — false positives
 
 Kumo now ships with a **false-positive lab** (`fplab.py`) alongside the

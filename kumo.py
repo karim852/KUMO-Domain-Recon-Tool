@@ -749,11 +749,19 @@ def render_ports(data):
     if not open_ports:
         warn("No open ports"); return
     print()
-    table_header(["PORT", "SERVICE", "RISK"], [10, 16, 12])
+    table_header(["PORT", "SERVICE", "RISK"], [10, 30, 12])
     for p in open_ports:
         risk_color = {"critical": C.R, "high": C.Y, "medium": C.Y, "low": C.G}.get(p["risk"], C.W)
-        table_row([p["port"], p["service"], p["risk"].upper()], [10, 16, 12], [C.W, C.CY, risk_color])
-    risky = [p for p in open_ports if p["risk"] in ("critical", "high")]
+        name_color = C.D if p.get("edge") else C.CY
+        table_row([p["port"], p["service"], p["risk"].upper()], [10, 30, 12],
+                  [C.W, name_color, risk_color])
+    if data.get("cdn"):
+        print()
+        warn(data["cdn_note"], 4)
+    # Ports belonging to a CDN edge are not the origin's surface, so they are
+    # never alerted on — that was the loudest false positive on proxied sites.
+    risky = [p for p in open_ports
+             if p["risk"] in ("critical", "high") and not p.get("edge")]
     if risky:
         print(f"\n    {C.M}Alerts:{C.RS}")
         for p in risky:

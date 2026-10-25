@@ -122,13 +122,15 @@ def main():
 
     fails = []
     for rid, rule in rules.items():
-        # positive
+        # Evaluate exactly as the live scanner does, scrub included. Testing
+        # without the scrub hid fourteen rules whose own evidence words were
+        # being stripped before matching, so they could never fire in a scan.
+        scrub = engine._rule_scrub(rule, "example.com")
         pos = POSITIVE.get(rid)
-        if pos is not None and not engine._eval_rule(pos, rule):
+        if pos is not None and not engine._eval_rule(pos, rule, scrub):
             fails.append((rid, "POSITIVE did not fire"))
-        # negatives
         for nname, nresp in NEGATIVE.items():
-            if engine._eval_rule(nresp, rule):
+            if engine._eval_rule(nresp, rule, scrub):
                 fails.append((rid, f"FALSE POSITIVE on '{nname}'"))
 
     width = max(len(r) for r in rules)
@@ -146,12 +148,37 @@ def main():
     ext = engine.VULN_RULES_EXTENDED
     ext_fails = []
     for rule in ext:
+        scrub = engine._rule_scrub(rule, "example.com")
         for nname, nresp in NEGATIVE.items():
             try:
-                if engine._eval_rule(nresp, rule):
+                if engine._eval_rule(nresp, rule, scrub):
                     ext_fails.append((rule["id"], rule["severity"], rule["name"][:46], nname))
             except Exception as e:
                 ext_fails.append((rule["id"], rule["severity"], f"CRASH: {e}"[:46], nname))
+
+    # ── dead-rule check ──────────────────────────────────────────────
+    # A rule whose evidence never survives its own scrub can never fire. These
+    # are invisible in a scan: no error, no finding, just silence.
+    dead = []
+    for rule in engine.VULN_RULES + ext:
+        scrub = {s.lower() for s in engine._rule_scrub(rule, "example.com")}
+        for m in rule.get("matchers", []):
+            if m.get("type") != "word":
+                continue
+            ws = [str(w).lower() for w in (m.get("words") or [])]
+            if not ws:
+                continue
+            killed = [w for w in ws if any(s in w or w in s for s in scrub)]
+            if (m.get("condition") == "and" and killed) or \
+               (m.get("condition") != "and" and len(killed) == len(ws)):
+                dead.append((rule["id"], rule["path"]))
+                break
+    print(f"\n  Dead-rule check: {len(engine.VULN_RULES) + len(ext)} rules")
+    for rid, p in dead[:20]:
+        print(f"    \033[91mDEAD\033[0m {rid:<40} evidence scrubbed by its own path {p}")
+    if not dead:
+        print("    \033[92mevery rule's evidence survives its own path scrub\033[0m")
+    ext_fails += [(rid, "dead", "evidence scrubbed by own path", p) for rid, p in dead]
 
     print(f"\n  Ported playbook: {len(ext)} rules × {len(NEGATIVE)} decoys")
     for rid, sev, name, nname in ext_fails[:30]:

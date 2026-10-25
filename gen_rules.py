@@ -74,6 +74,12 @@ def to_rule(t):
     path = t["paths"][0]
     if not path.startswith("/") or SKIP_PATH.search(path) or len(path) > 90:
         return None
+    # A URL fragment never reaches the server: requests for "/#/alerts" ask for
+    # "/". Such a rule silently matches against the homepage, which is the same
+    # failure mode as the query-only probes. Nuclei gets away with it on SPAs
+    # whose index carries the evidence; as a Kumo rule it is just mislabelled.
+    if "#" in path:
+        return None
     base = path.split("?")[0].rstrip("/").rsplit("/", 1)[-1]
     if base and JUNK_BASENAME.match(base):
         return None

@@ -11,7 +11,14 @@ from collections import defaultdict
 
 ROOT = "/tmp/nt"
 DIRS = ["http/exposures", "http/exposed-panels", "http/misconfiguration",
-        "http/technologies", "http/default-logins"]
+        "http/technologies", "http/default-logins",
+        # Planted webshells and backdoors. Only the GET-detection templates
+        # survive the filter in main(): the ones that prove a backdoor by
+        # POSTing a command to it are excluded, by design — Kumo reports that a
+        # shell is present, it does not drive it.
+        "http/vulnerabilities/backdoor",
+        "http/vulnerabilities/wordpress",
+        "http/vulnerabilities/other"]
 
 SEV_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4, "unknown": 5}
 

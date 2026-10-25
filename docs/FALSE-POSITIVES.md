@@ -130,6 +130,53 @@ Detection is unchanged; only the false findings are gone. The one endpoint
 finding that disappeared from the vulnerable lab was `/?view=log` — the
 homepage, which was never a finding.
 
+## Second pass — what the labs found next
+
+### 7. Fourteen rules could never fire
+
+The anti-echo scrub strips the requested path from a response before matching,
+so a server echoing the URL cannot satisfy a product matcher. But for real
+products the path and the product name are legitimately the same — a rule for
+`/transmission/web/` matching the word `Transmission` had its own evidence
+scrubbed away before it was tested. Fourteen rules were structurally dead,
+including the hand-written `docker-api` and `graphql-introspection`. That is
+why the live lab only ever reported 18 of 20 expected hits.
+
+`_rule_scrub` now keeps any token the rule itself declares as evidence. Path
+echoes are still caught by the remaining scrub and by `_is_site_own_page`.
+
+`test_rules.py` missed this because it evaluated rules **without** the scrub the
+scanner applies. It now evaluates exactly as the scanner does, and carries a
+dead-rule check so an unfireable rule fails the suite instead of sitting silent.
+
+### 8. Binary bodies were mis-decoded
+
+`requests` falls back to charset auto-detection when a response has no charset.
+On a NUL-heavy binary file it guesses something like UTF-16 and returns
+mojibake, so the `.DS_Store` rule never matched its own `Bud1` magic bytes.
+`_resp_part` now decodes the raw bytes directly, with a latin-1 fallback that
+maps every byte to a character.
+
+### 9. URL fragments never reach the server
+
+Seven mined templates had paths like `/#/alerts`. Everything after `#` is
+stripped by the client, so those rules silently probed the homepage — the same
+failure mode as the query-only probes. They are dropped, and `gen_rules.py`
+rejects fragment paths.
+
+### 10. CDN edge ports reported as the target's surface
+
+A domain behind Cloudflare resolves to Cloudflare's edge, which accepts
+connections on a fixed set of ports for **every** proxied domain — with real
+TLS behind them, so banner verification confirmed them. Kumo reported those as
+the target's open ports.
+
+`_cdn_identity` recognises Cloudflare, Fastly, Sucuri, Akamai and CloudFront by
+IP range first, then by response headers. Edge ports stay in the output, because
+knowing a site is proxied matters, but they are labelled `via <cdn> edge`,
+forced to `info`, and excluded from alerts in both UIs. The result carries
+`origin_open` for the ports that are actually the target's.
+
 ## Rules of thumb for new checks
 
 1. **Never let a status code alone be evidence.** Pair it with a word matcher.
