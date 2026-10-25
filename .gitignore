@@ -5,3 +5,6 @@ __pycache__/
 *.log
 report*.json
 screenshots/
+
+# local-only: full inventory of every check (not published)
+docs/CHECKS.md
