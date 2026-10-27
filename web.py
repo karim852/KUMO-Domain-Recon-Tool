@@ -15,7 +15,8 @@ except ImportError:
     print("[!] Flask required for web mode: pip install flask")
     exit(1)
 
-from engine import clean_domain, ALL_MODULES, FAST_SKIP, run_scan
+from engine import (clean_domain, ALL_MODULES, FAST_SKIP, run_scan, UA_PRESETS,
+                    parse_headers, set_http_profile, clear_http_profile)
 
 app = Flask(__name__)
 
@@ -401,6 +402,21 @@ body{background:
 .btn-stop .stop-ico{width:9px;height:9px;background:#fff;border-radius:2px;display:inline-block}
 .scanning .btn-scan,.scanning .btn-fast{display:none}
 
+.btn-http{background:transparent;border-color:var(--border2);color:var(--text2)}
+.btn-http:hover,.btn-http.on{border-color:var(--cyan);color:var(--cyan);background:var(--cyan-dim)}
+.btn-http.set{border-color:var(--cyan);color:var(--cyan)}
+.scanning .btn-http{display:none}
+.http-panel{background:var(--bg2);border-bottom:1px solid var(--border);padding:12px 24px;display:none;gap:16px;flex-wrap:wrap;align-items:flex-start}
+.http-panel.on{display:flex}
+.http-field{display:flex;flex-direction:column;gap:6px;flex:1;min-width:260px}
+.http-field label{font-size:9px;color:var(--text3);font-family:'JetBrains Mono',monospace;letter-spacing:1px}
+.http-field select,.http-field input,.http-field textarea{background:var(--bg3);border:1px solid var(--border2);border-radius:var(--input-r);color:var(--text);font-family:'JetBrains Mono',monospace;font-size:12px;padding:8px 10px;outline:none}
+.http-field select:focus,.http-field input:focus,.http-field textarea:focus{border-color:rgb(var(--glow-rgb))}
+.http-field textarea{min-height:64px;resize:vertical}
+.http-field input[hidden]{display:none}
+.http-note{font-size:10px;color:var(--text3);font-family:'JetBrains Mono',monospace}
+.http-note.err{color:var(--red)}
+
 /* live elapsed timer chip in header */
 .hdr-timer{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text2);display:none;align-items:center;gap:6px}
 .hdr-timer.on{display:inline-flex}
@@ -589,7 +605,22 @@ body{background:
   </div>
   <button class="btn btn-scan" id="scanBtn" onclick="startScan(false)"><span id="scanBtnTxt">SCAN</span></button>
   <button class="btn btn-fast" id="fastBtn" onclick="startScan(true)">⚡ FAST</button>
+  <button class="btn btn-http" id="httpBtn" onclick="toggleHttpPanel()" aria-expanded="false" aria-controls="httpPanel">⚙ HTTP</button>
   <button class="btn btn-stop" id="stopBtn" onclick="stopScan()"><span class="stop-ico"></span> STOP</button>
+</div>
+
+<div class="http-panel" id="httpPanel">
+  <div class="http-field">
+    <label for="uaSelect">USER-AGENT</label>
+    <select id="uaSelect" onchange="onHttpChange()"></select>
+    <input id="uaCustom" type="text" placeholder="Custom User-Agent string" autocomplete="off" spellcheck="false" oninput="onHttpChange()" hidden>
+    <span class="http-note" id="uaPreview"></span>
+  </div>
+  <div class="http-field">
+    <label for="hdrInput">CUSTOM HEADERS</label>
+    <textarea id="hdrInput" placeholder="Cookie: session=abc123&#10;Authorization: Bearer eyJ...&#10;X-Bug-Bounty: researcher" spellcheck="false" oninput="onHttpChange()"></textarea>
+    <span class="http-note" id="hdrNote">One "Name: value" per line. Sent only to the target and its subdomains.</span>
+  </div>
 </div>
 
 <div class="pill-bar" id="pillBar">
@@ -1932,12 +1963,86 @@ function applyCardSeverity(id, badges) {
   else if (/b-pass/.test(b))  card.classList.add('sev-ok');
 }
 
+// ── HTTP options ──
+const UA_PRESETS = __UA_PRESETS_JSON__;
+const HTTP_HDR_NOTE = 'One "Name: value" per line. Sent only to the target and its subdomains.';
+
+function initHttpPanel(){
+  const sel = document.getElementById('uaSelect');
+  const opts = [['', 'Default (Chrome)'], ...Object.keys(UA_PRESETS).map(k => [k, k]), ['random', 'random (rotate per request)'], ['custom', 'custom…']];
+  sel.innerHTML = opts.map(([v, t]) => `<option value="${escH(v)}">${escH(t)}</option>`).join('');
+  let saved = {};
+  try { saved = JSON.parse(localStorage.getItem('kumo-http') || '{}') || {}; } catch(e) {}
+  if (saved.ua && [...sel.options].some(o => o.value === saved.ua)) sel.value = saved.ua;
+  document.getElementById('uaCustom').value = saved.uaCustom || '';
+  document.getElementById('hdrInput').value = saved.headers || '';
+  onHttpChange(true);
+}
+
+function toggleHttpPanel(){
+  const panel = document.getElementById('httpPanel');
+  const btn = document.getElementById('httpBtn');
+  const on = panel.classList.toggle('on');
+  btn.classList.toggle('on', on);
+  btn.setAttribute('aria-expanded', on ? 'true' : 'false');
+}
+
+function parseHeaderLines(text){
+  const headers = {};
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line) continue;
+    const i = line.indexOf(':');
+    if (i < 1) throw new Error(`Invalid header: ${line}`);
+    const name = line.slice(0, i).trim();
+    if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(name)) throw new Error(`Invalid header name: ${name}`);
+    headers[name] = line.slice(i + 1).trim();
+  }
+  return headers;
+}
+
+function getHttpOptions(){
+  const sel = document.getElementById('uaSelect').value;
+  const ua = sel === 'custom' ? document.getElementById('uaCustom').value.trim() : sel;
+  return {user_agent: ua || null, headers: parseHeaderLines(document.getElementById('hdrInput').value)};
+}
+
+function onHttpChange(skipSave){
+  const sel = document.getElementById('uaSelect').value;
+  const custom = document.getElementById('uaCustom');
+  custom.hidden = sel !== 'custom';
+  const preview = document.getElementById('uaPreview');
+  preview.textContent = sel === 'custom' ? '' : sel === 'random' ? 'A different browser User-Agent is picked for every request.' : (UA_PRESETS[sel || 'chrome'] || '');
+  const note = document.getElementById('hdrNote');
+  let count = 0;
+  try {
+    count = Object.keys(parseHeaderLines(document.getElementById('hdrInput').value)).length;
+    note.textContent = HTTP_HDR_NOTE; note.classList.remove('err');
+  } catch(e) {
+    note.textContent = e.message; note.classList.add('err');
+  }
+  const active = (sel && !(sel === 'custom' && !custom.value.trim())) || count > 0;
+  document.getElementById('httpBtn').classList.toggle('set', active);
+  if (skipSave === true) return;
+  try {
+    localStorage.setItem('kumo-http', JSON.stringify({ua: sel, uaCustom: custom.value, headers: document.getElementById('hdrInput').value}));
+  } catch(e) {}
+}
+
 // ── Scan ──
 function newScanId(){ return (crypto.randomUUID?crypto.randomUUID():Date.now()+'-'+Math.random().toString(16).slice(2)); }
 
 async function startScan(fast) {
   const domain = document.getElementById('domInput').value.trim();
   if (!domain || scanning) return;
+  let httpOpts;
+  try { httpOpts = getHttpOptions(); }
+  catch(e) {
+    const panel = document.getElementById('httpPanel');
+    if (!panel.classList.contains('on')) toggleHttpPanel();
+    onHttpChange(true);
+    return;
+  }
   scanning = true; currentDomain = domain;
   window._scanResults = {};
   completedCount = 0; errorCount = 0;
@@ -1988,7 +2093,7 @@ async function startScan(fast) {
     const resp = await fetch('/api/scan', {
       method: 'POST',
       headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({domain, modules: toRun, fast, scan_id: myId}),
+      body: JSON.stringify({domain, modules: toRun, fast, scan_id: myId, user_agent: httpOpts.user_agent, headers: httpOpts.headers}),
       signal: scanAbort.signal
     });
     const reader = resp.body.getReader();
@@ -2526,6 +2631,7 @@ function updateCounts(){
 }
 
 document.getElementById('domInput').addEventListener('keydown', e => { if(e.key==='Enter') startScan(false); });
+initHttpPanel();
 document.addEventListener('keydown', e => {
   if (e.key !== 'Escape') return;
   if (document.getElementById('cmpOverlay').classList.contains('on')) { closeCompletionModal(); return; }
@@ -2582,6 +2688,7 @@ def index():
     # Use simple string replacement instead of Jinja2 to avoid
     # conflicts with CSS/JS {{ }} and {% %} syntax
     html = HTML_TEMPLATE.replace('__MODULES_JSON__', modules_json)
+    html = html.replace('__UA_PRESETS_JSON__', json.dumps(UA_PRESETS).replace('</', '<\\/'))
     return html
 
 
@@ -2594,12 +2701,31 @@ def api_scan():
 
     modules = data.get('modules', list(ALL_MODULES.keys()))
     fast = data.get('fast', False)
+    user_agent = data.get('user_agent') or None
+    try:
+        custom_headers = parse_headers(data.get('headers'))
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    if user_agent is not None and (not isinstance(user_agent, str) or '\r' in user_agent or '\n' in user_agent):
+        return jsonify({"error": "Invalid User-Agent"}), 400
 
     scan_id = data.get('scan_id') or ''
     stop_event = _register_scan(scan_id) if scan_id else threading.Event()
 
+    import concurrent.futures
+    futures = []
+
     def generate():
-        import concurrent.futures
+        profile_token = set_http_profile(domain, user_agent=user_agent, headers=custom_headers)
+        try:
+            yield from _stream()
+        finally:
+            def _release():
+                concurrent.futures.wait(futures)
+                clear_http_profile(domain, profile_token)
+            threading.Thread(target=_release, daemon=True).start()
+
+    def _stream():
         import queue as queue_mod
 
         start = time.time()
@@ -2630,7 +2756,7 @@ def api_scan():
         executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=min(total, 12) if total else 1)
         for key, (desc, func) in to_run.items():
-            executor.submit(run_module, key, desc, func)
+            futures.append(executor.submit(run_module, key, desc, func))
 
         # Signal start for all modules immediately
         for key, (desc, _) in to_run.items():
