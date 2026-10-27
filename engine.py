@@ -7,12 +7,13 @@ All scanning modules, separated from CLI/Web presentation.
 import os
 import socket
 import ssl
+import threading
 import concurrent.futures
 import re
 import ipaddress
 import json
 from datetime import datetime
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 try:
     import requests
@@ -45,6 +46,156 @@ def req(url, timeout=10, headers=None):
         return r if r.status_code == 200 else None
     except Exception:
         return None
+
+
+DEFAULT_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+
+UA_PRESETS = {
+    "chrome": DEFAULT_UA,
+    "firefox": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0",
+    "edge": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0",
+    "safari": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
+    "chrome-linux": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "android": "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36",
+    "iphone": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
+    "googlebot": "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+    "bingbot": "Mozilla/5.0 (compatible; bingbot/2.0; +http://www.bing.com/bingbot.htm)",
+    "curl": "curl/8.7.1",
+}
+
+_BROWSER_PRESETS = ("chrome", "firefox", "edge", "safari", "chrome-linux", "android", "iphone")
+_HEADER_NAME_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
+_HTTP_PROFILES = {}
+_HTTP_PROFILES_LOCK = threading.Lock()
+
+
+def resolve_user_agent(value):
+    if not value:
+        return None
+    value = str(value).strip()
+    if not value:
+        return None
+    key = value.lower()
+    if key == "random":
+        return "random"
+    return UA_PRESETS.get(key, value)
+
+
+def parse_headers(raw):
+    if not raw:
+        return {}
+    if isinstance(raw, dict):
+        items = list(raw.items())
+    else:
+        if isinstance(raw, str):
+            raw = raw.splitlines()
+        items = []
+        for line in raw:
+            line = str(line).strip()
+            if not line:
+                continue
+            if ":" not in line:
+                raise ValueError(f"Invalid header (expected 'Name: value'): {line}")
+            name, value = line.split(":", 1)
+            items.append((name, value))
+    headers = {}
+    for name, value in items:
+        name = str(name).strip()
+        value = "" if value is None else str(value).strip()
+        if not _HEADER_NAME_RE.match(name):
+            raise ValueError(f"Invalid header name: {name!r}")
+        if "\r" in value or "\n" in value:
+            raise ValueError(f"Invalid header value for {name}")
+        headers[name] = value
+    return headers
+
+
+def set_http_profile(domain, user_agent=None, headers=None):
+    headers = parse_headers(headers)
+    for name in list(headers):
+        if name.lower() == "user-agent":
+            user_agent = user_agent or headers.pop(name)
+    profile = {"user_agent": resolve_user_agent(user_agent), "headers": headers}
+    if not profile["user_agent"] and not profile["headers"]:
+        return None
+    token = object()
+    with _HTTP_PROFILES_LOCK:
+        _HTTP_PROFILES.setdefault(domain.lower(), []).append((token, profile))
+    return token
+
+
+def clear_http_profile(domain, token):
+    if token is None:
+        return
+    key = domain.lower()
+    with _HTTP_PROFILES_LOCK:
+        stack = [entry for entry in _HTTP_PROFILES.get(key, []) if entry[0] is not token]
+        if stack:
+            _HTTP_PROFILES[key] = stack
+        else:
+            _HTTP_PROFILES.pop(key, None)
+
+
+def http_profile(host):
+    if not host or not _HTTP_PROFILES:
+        return None
+    host = host.lower().rstrip(".")
+    with _HTTP_PROFILES_LOCK:
+        for domain, stack in _HTTP_PROFILES.items():
+            if stack and (host == domain or host.endswith("." + domain)):
+                return stack[-1][1]
+    return None
+
+
+def profile_user_agent(host, default=DEFAULT_UA):
+    profile = http_profile(host)
+    ua = profile and profile["user_agent"]
+    if ua == "random":
+        import random
+        return UA_PRESETS[random.choice(_BROWSER_PRESETS)]
+    return ua or default
+
+
+def profile_headers(host):
+    profile = http_profile(host)
+    return dict(profile["headers"]) if profile else {}
+
+
+def _merge_profile_headers(host, headers):
+    from requests.structures import CaseInsensitiveDict
+    merged = CaseInsensitiveDict(profile_headers(host))
+    if headers:
+        merged.update(headers)
+    ua = profile_user_agent(host, default=None)
+    if ua:
+        merged["User-Agent"] = ua
+    return merged
+
+
+if HAS_REQUESTS:
+    _orig_session_request = requests.sessions.Session.request
+
+    def _profile_target(url, headers):
+        try:
+            host = urlsplit(str(url)).hostname
+        except ValueError:
+            host = None
+        if http_profile(host):
+            return host
+        for name, value in (headers or {}).items():
+            if str(name).lower() == "host" and value:
+                host = str(value).split(":")[0]
+                return host if http_profile(host) else None
+        return None
+
+    def _profiled_session_request(self, method, url, **kwargs):
+        if _HTTP_PROFILES:
+            target = _profile_target(url, kwargs.get("headers"))
+            if target:
+                kwargs["headers"] = _merge_profile_headers(target, kwargs.get("headers"))
+        return _orig_session_request(self, method, url, **kwargs)
+
+    requests.sessions.Session.request = _profiled_session_request
 
 
 def dns_query(domain, qtype):
@@ -1277,8 +1428,10 @@ def _verify_port(ip, hostname, port, banner=""):
                 8181, 8888, 9000, 3000, 5000, 5601, 9090, 9200, 15672, 10000):
         try:
             with socket.create_connection((ip, port), timeout=3) as raw:
+                ua = profile_user_agent(hostname, default="Mozilla/5.0")
                 raw.sendall(b"GET / HTTP/1.1\r\nHost: " + hostname.encode() +
-                            b"\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n")
+                            b"\r\nUser-Agent: " + ua.encode("latin-1", "replace") +
+                            b"\r\nConnection: close\r\n\r\n")
                 data = raw.recv(256)
             return data.startswith(b"HTTP/")
         except Exception:
@@ -5939,7 +6092,12 @@ def _screenshot_playwright(domain):
     from playwright.sync_api import sync_playwright
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox"])
-        page = browser.new_page(viewport={"width": 1280, "height": 800})
+        page_opts = {"viewport": {"width": 1280, "height": 800}}
+        if http_profile(domain):
+            page_opts["user_agent"] = profile_user_agent(domain)
+            if profile_headers(domain):
+                page_opts["extra_http_headers"] = profile_headers(domain)
+        page = browser.new_page(**page_opts)
         page.goto(f"https://{domain}", wait_until="domcontentloaded", timeout=15000)
         page.wait_for_timeout(2000)
         png_bytes = page.screenshot(full_page=False)
@@ -6314,9 +6472,13 @@ def scan_whatweb(domain):
     whatweb_bin = shutil.which("whatweb")
     if whatweb_bin:
         try:
+            cmd = [whatweb_bin, "--color=never", "--no-errors", "-a", "3"]
+            if http_profile(domain):
+                cmd += ["--user-agent", profile_user_agent(domain)]
+                for name, value in profile_headers(domain).items():
+                    cmd += ["--header", f"{name}:{value}"]
             result = subprocess.run(
-                [whatweb_bin, "--color=never", "--no-errors", "-a", "3",
-                 f"https://{domain}"],
+                cmd + [f"https://{domain}"],
                 capture_output=True, text=True, timeout=30
             )
             output = result.stdout.strip() or result.stderr.strip()
@@ -8386,11 +8548,17 @@ def scan_wafw00f(domain):
     wafw00f_bin = shutil.which("wafw00f")
 
     if wafw00f_bin:
+        hdr_file = None
         try:
-            result = subprocess.run(
-                [wafw00f_bin, f"https://{domain}", "-a", "-o", "-"],
-                capture_output=True, text=True, timeout=45
-            )
+            cmd = [wafw00f_bin, f"https://{domain}", "-a", "-o", "-"]
+            if http_profile(domain):
+                import tempfile
+                extra = {"User-Agent": profile_user_agent(domain), **profile_headers(domain)}
+                with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as fh:
+                    fh.write("".join(f"{k}: {v}\n" for k, v in extra.items()))
+                    hdr_file = fh.name
+                cmd += ["-H", hdr_file]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
             output = result.stdout + result.stderr
             detected = _parse_wafw00f_output(output)
             return {
@@ -8404,6 +8572,12 @@ def scan_wafw00f(domain):
             pass
         except Exception:
             pass
+        finally:
+            if hdr_file:
+                try:
+                    os.unlink(hdr_file)
+                except OSError:
+                    pass
 
     return _wafw00f_python(domain)
 
@@ -12117,11 +12291,20 @@ ALL_MODULES = {
 FAST_SKIP = {"wayback", "brute", "subdomains", "screenshot", "email_harvest",
              "nuclei", "cloud_buckets"}  # slow modules skipped in fast mode
 
-def run_scan(domain, modules=None, fast=False, callback=None):
+def run_scan(domain, modules=None, fast=False, callback=None, user_agent=None, headers=None):
     """Run scan modules. callback(module_name, description, result) called per module."""
     domain = clean_domain(domain)
     if not domain:
         return None
+
+    token = set_http_profile(domain, user_agent=user_agent, headers=headers)
+    try:
+        return _run_scan(domain, modules, fast, callback)
+    finally:
+        clear_http_profile(domain, token)
+
+
+def _run_scan(domain, modules, fast, callback):
 
     if modules:
         to_run = {k: v for k, v in ALL_MODULES.items() if k in modules}

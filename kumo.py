@@ -21,7 +21,8 @@ import threading
 import itertools
 from datetime import datetime, timezone
 
-from engine import clean_domain, ALL_MODULES, FAST_SKIP, run_scan
+from engine import (clean_domain, ALL_MODULES, FAST_SKIP, run_scan,
+                    UA_PRESETS, resolve_user_agent, parse_headers)
 
 # ═══════════════════════════════════════════════════════════════
 # COLORS
@@ -1785,6 +1786,9 @@ Examples:
   %(prog)s --web -p 9000                     Web UI on custom port
   %(prog)s example.com -o report.json        Save JSON report
   %(prog)s example.com --no-color            Pipe-friendly
+  %(prog)s example.com -A firefox            Use a preset browser User-Agent
+  %(prog)s example.com -A "MyAgent/1.0"      Use a custom User-Agent
+  %(prog)s example.com -H "Cookie: sid=abc" -H "X-Bug-Bounty: me"
 
 Modules ({len(ALL_MODULES)}):
 {mod_list}""")
@@ -1805,6 +1809,14 @@ Modules ({len(ALL_MODULES)}):
                         help=f"Colour theme (default: {DEFAULT_THEME})")
     parser.add_argument("--no-spider", action="store_true",
                         help="Disable the crawl animation")
+    parser.add_argument("-A", "--user-agent", metavar="UA",
+                        help="User-Agent preset name, 'random', or a custom string")
+    parser.add_argument("-H", "--header", action="append", default=[], metavar="'Name: value'",
+                        help="Extra HTTP header sent to the target (repeatable)")
+    parser.add_argument("--headers-file", metavar="FILE",
+                        help="File with one 'Name: value' header per line")
+    parser.add_argument("--list-agents", action="store_true",
+                        help="List User-Agent presets")
 
     args = parser.parse_args()
 
@@ -1823,6 +1835,28 @@ Modules ({len(ALL_MODULES)}):
             print(f"{C.R}[✗] Flask required for web mode: pip install flask{C.RS}")
             sys.exit(1)
         return
+
+    if args.list_agents:
+        for k, v in UA_PRESETS.items():
+            print(f"  {C.ACC}{k:<14}{C.RS}{C.GR}{v}{C.RS}")
+        print(f"  {C.ACC}{'random':<14}{C.RS}{C.GR}a different browser preset per request{C.RS}")
+        sys.exit(0)
+
+    header_lines = list(args.header)
+    if args.headers_file:
+        try:
+            with open(args.headers_file) as f:
+                header_lines = [l for l in f.read().splitlines()
+                                if l.strip() and not l.lstrip().startswith("#")] + header_lines
+        except OSError as e:
+            print(f"{C.R}[✗] Could not read headers file: {e}{C.RS}")
+            sys.exit(1)
+    try:
+        custom_headers = parse_headers(header_lines)
+    except ValueError as e:
+        print(f"{C.R}[✗] {e}{C.RS}")
+        sys.exit(1)
+    user_agent = resolve_user_agent(args.user_agent)
 
     # ──── List modules ────
     if args.list_modules:
@@ -1883,7 +1917,8 @@ Modules ({len(ALL_MODULES)}):
         ("Date", datetime.now().strftime('%Y-%m-%d %H:%M:%S')),
         ("Modules", f"{len(to_run)} / {len(ALL_MODULES)}"),
         ("Mode", "fast" if args.fast else ("custom" if args.modules else "full")),
-    ])
+    ] + ([("UA", "random preset" if user_agent == "random" else user_agent)] if user_agent else [])
+      + ([("Headers", ", ".join(custom_headers))] if custom_headers else []))
 
     start = time.time()
     all_results = {}
@@ -1922,7 +1957,8 @@ Modules ({len(ALL_MODULES)}):
         crawl.update(counter["n"], [SHORT_NAMES.get(k, k) for k in remaining])
 
     try:
-        run_scan(domain, modules=to_run, fast=args.fast, callback=callback)
+        run_scan(domain, modules=to_run, fast=args.fast, callback=callback,
+                 user_agent=user_agent, headers=custom_headers)
     finally:
         el = time.time() - start
         crawl.stop(f"\n  {C.G}✓{C.RS} {C.W}web spun{C.RS} {C.DM}·{C.RS} "
