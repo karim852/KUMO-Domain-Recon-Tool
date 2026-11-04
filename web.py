@@ -1681,13 +1681,23 @@ function renderContent(id, data) {
       return h;
     }
     const sc={critical:'var(--red)',high:'var(--orange)',medium:'var(--yellow)',low:'var(--green)'};
-    h+='<table class="tbl"><thead><tr><th>Panel</th><th>Where</th><th>Severity</th></tr></thead><tbody>';
+    // Status and size, as the endpoints and CMS modules show them. On a panel
+    // the status is the most informative part: 401 or 403 is a login that is
+    // there and refusing, 200 is one that answered.
+    h+='<table class="tbl"><thead><tr><th>Panel</th><th>Where</th><th>Status</th><th>Size</th><th>Severity</th></tr></thead><tbody>';
     ps.forEach(p=>{
       const where=p.port?('port '+p.port):escH(p.path||'/');
+      const st = (p.status===undefined||p.status===null)
+        ? '<span class="c-dim" style="font-size:10px">—</span>'
+        : (p.url
+            ? `<a href="${escH(p.url)}" target="_blank" class="c-cyan" style="font-size:10px">[${escH(p.status)}]</a>`
+            : `<span class="c-cyan" style="font-size:10px">[${escH(p.status)}]</span>`);
       h+=`<tr><td style="font-weight:700;font-size:11px">${escH(p.panel)}${p.version?` <span class="c-yellow mono" style="font-size:10px">${escH(p.version)}</span>`:''}</td>`
        + `<td class="mono c-cyan" style="font-size:10px">${where}</td>`
+       + `<td style="white-space:nowrap">${st}</td>`
+       + `<td class="mono c-dim" style="font-size:9px;white-space:nowrap">${p.size===undefined||p.size===null?'—':fmtBytes(p.size)}</td>`
        + `<td style="color:${sc[p.severity]||'var(--text)'};font-weight:700;font-size:10px">${escH((p.severity||'').toUpperCase())}</td></tr>`;
-      if(p.signals?.length) h+=`<tr><td colspan="3" class="c-dim" style="font-size:9px;padding-top:0">matched: ${escH(p.signals.join(' · '))}</td></tr>`;
+      if(p.signals?.length) h+=`<tr><td colspan="5" class="c-dim" style="font-size:9px;padding-top:0">matched: ${escH(p.signals.join(' · '))}</td></tr>`;
     });
     h+='</tbody></table>';
     (data.findings||[]).forEach(f=>{
@@ -1731,13 +1741,25 @@ function renderContent(id, data) {
     if(f.length){
       const sc={critical:'var(--red)',high:'var(--orange)',medium:'var(--yellow)',low:'var(--green)',info:'var(--text3)'};
       h+='<div class="sec">Findings</div>';
-      h+='<table class="tbl"><thead><tr><th>Severity</th><th>Finding</th><th>Path</th></tr></thead><tbody>';
+      // Status and size alongside the path, as the endpoints module does. They
+      // are what lets a finding be judged instead of taken on trust: a 401 is
+      // the thing being there and asking for credentials, which is also why
+      // its severity was reduced, and a few hundred bytes where a credentials
+      // file was expected is usually an error page.
+      h+='<table class="tbl"><thead><tr><th>Severity</th><th>Finding</th><th>Path</th><th>Status</th><th>Size</th></tr></thead><tbody>';
       f.forEach(x=>{
         const inf = x.confidence==='version-inference'
           ? ' <span class="badge b-info" style="font-size:8px">inferred</span>' : '';
+        const st = (x.status===undefined||x.status===null)
+          ? '<span class="c-dim" style="font-size:10px">—</span>'
+          : (x.url
+              ? `<a href="${escH(x.url)}" target="_blank" class="c-cyan" style="font-size:10px">[${escH(x.status)}]</a>`
+              : `<span class="c-cyan" style="font-size:10px">[${escH(x.status)}]</span>`);
         h+=`<tr><td style="color:${sc[x.severity]||'var(--text)'};font-weight:700;font-size:10px">${escH((x.severity||'').toUpperCase())}</td>`
          + `<td style="font-size:11px">${escH(x.name||'')}${inf}</td>`
-         + `<td class="mono c-cyan" style="font-size:10px">${escH(x.path||'')}</td></tr>`;
+         + `<td class="mono c-cyan" style="font-size:10px">${escH(x.path||'')}</td>`
+         + `<td style="white-space:nowrap">${st}</td>`
+         + `<td class="mono c-dim" style="font-size:9px;white-space:nowrap">${x.size===undefined||x.size===null?'—':fmtBytes(x.size)}</td></tr>`;
       });
       h+='</tbody></table>';
     }

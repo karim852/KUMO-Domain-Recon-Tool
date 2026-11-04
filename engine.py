@@ -485,11 +485,10 @@ def scan_dns(domain):
     if dkim["revoked_selectors"]:
         dkim["notes"].append("revoked key (empty p=) at: "
                              + ", ".join(dkim["revoked_selectors"]))
-    if not dkim["found"]:
-        # Selectors cannot be enumerated, so absence is not proof.
-        dkim["notes"].append(f"none of {len(DKIM_SELECTORS)} known selectors resolved; "
-                             f"a custom selector would not be found this way, so this "
-                             f"is not proof that the domain does not sign its mail")
+    # No note when nothing resolved. Selectors still cannot be enumerated, so
+    # absence is still not proof -- that is why DKIM is never reported as
+    # missing or scored against the domain. Saying so on every scan of every
+    # domain without a known selector was noise rather than information.
     results["email_security"]["dkim"] = dkim
 
     # ── Transport security and BIMI ───────────────────────────────────────
@@ -12075,8 +12074,13 @@ def scan_control_panels(domain):
         hits = _panel_match(r, panel)
         if not hits:
             return None
+        try:
+            size = len(r.content or b"")
+        except Exception:
+            size = None
         return {"panel": name, "port": port, "path": path if not port else "/",
                 "url": getattr(r, "url", ""), "status": r.status_code,
+                "size": size,
                 "signals": hits, "version": _panel_version(r),
                 "severity": panel["severity"]}
 
@@ -12102,6 +12106,10 @@ def scan_control_panels(domain):
                          f"whole hosting account; restrict it by IP or put it "
                          f"behind a VPN rather than exposing it publicly."),
             "url": p["url"], "port": p["port"], "path": p["path"],
+            # what the panel actually answered, so the finding can be judged
+            # rather than taken on trust: a 401 is a panel that is there and
+            # asking for credentials, a 200 is one that is not
+            "status": p.get("status"), "size": p.get("size"),
             "evidence": ", ".join(p["signals"]),
             "confidence": "confirmed",
         })

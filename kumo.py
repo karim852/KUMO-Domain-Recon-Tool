@@ -1521,6 +1521,26 @@ def render_api_fuzzer(data):
 
 
 
+def _hsz(n):
+    """Response size, short. '—' when the module did not record one."""
+    if n is None or n == "":
+        return "\u2014"
+    try:
+        n = int(n)
+    except Exception:
+        return "\u2014"
+    if n < 1024:
+        return f"{n} B"
+    if n < 1048576:
+        return f"{n / 1024:.1f} KB"
+    return f"{n / 1048576:.2f} MB"
+
+
+def _hstatus(code):
+    """[401] etc. '—' when the module did not record one."""
+    return f"[{code}]" if code not in (None, "") else "\u2014"
+
+
 def render_cms(data):
     section("CMS DEEP SCAN", "🧱")
     if data.get("error"):
@@ -1556,7 +1576,12 @@ def render_cms(data):
             tag = " [inferred]" if f.get("confidence") == "version-inference" else ""
             print(f"      {col}{sev:<9}{C.RS} {f.get('name','')}{C.DM}{tag}{C.RS}")
             if f.get("path"):
-                dimprint(str(f["path"])[:76], 8)
+                # what the path answered, so the finding can be judged: a 401
+                # is the thing being there and asking for credentials, which
+                # is also why its severity was reduced
+                meta = f"  {_hstatus(f.get('status'))} {_hsz(f.get('size'))}" \
+                    if (f.get("status") is not None or f.get("size") is not None) else ""
+                dimprint(str(f["path"])[:62] + meta, 8)
 
     if data.get("users"):
         print(f"\n    {C.M}Users exposed:{C.RS}")
@@ -1591,7 +1616,9 @@ def render_panels(data):
         sev = (p.get("severity") or "").upper()
         col = {"CRITICAL": C.R, "HIGH": C.Y, "MEDIUM": C.Y}.get(sev, C.W)
         name = p["panel"] + (f" {p['version']}" if p.get("version") else "")
-        print(f"      {col}{sev:<9}{C.RS} {name}  {C.DM}({where}){C.RS}")
+        meta = (f" {_hstatus(p.get('status'))} {_hsz(p.get('size'))}"
+                if (p.get("status") is not None or p.get("size") is not None) else "")
+        print(f"      {col}{sev:<9}{C.RS} {name}  {C.DM}({where}){meta}{C.RS}")
         if p.get("signals"):
             dimprint("matched: " + ", ".join(p["signals"]), 8)
     print()
