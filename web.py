@@ -31,23 +31,34 @@ _SCAN_LOCK = threading.Lock()
 # Every module runs against its OWN clock, so a slow scanner (nuclei) can take
 # its time without other modules killing it, and fast modules are never held
 # hostage waiting on a slow one.
+# Per-module budgets, in seconds. Tripled from the original figures: modules
+# were being cut off on slow targets and on links with high latency, and a
+# module killed mid-flight reports nothing rather than reporting less.
+#
+# ABS_CAP is tripled with them on purpose. It is applied as
+# min(MODULE_TIMEOUTS[k], ABS_CAP), so leaving it at the old ceiling would have
+# silently thrown away most of this: nuclei at 1800 would still have died at
+# 720, and so would everything above it.
 MODULE_TIMEOUTS = {
     # fast / cheap
-    'dns': 60, 'geo': 45, 'whois': 75, 'robots': 45, 'ssl': 60,
-    'headers': 60, 'favicon': 90, 'dorks': 30, 'osint': 30,
+    'dns': 180, 'geo': 135, 'whois': 225, 'robots': 135, 'ssl': 180,
+    'headers': 180, 'favicon': 270, 'dorks': 90, 'osint': 90,
     # medium (single API / moderate crawling)
-    'shodan': 90, 'censys': 90, 'whatweb': 150, 'wafw00f': 150,
-    'ports': 240, 'endpoints': 240, 'wayback': 210,
-    'email_harvest': 210, 'screenshot': 150, 'http_inspect': 90,
+    'shodan': 270, 'censys': 270, 'whatweb': 450, 'wafw00f': 450,
+    'ports': 720, 'endpoints': 720, 'wayback': 630,
+    'email_harvest': 630, 'screenshot': 450, 'http_inspect': 270,
     # heavy (many parallel requests / brute / enumeration)
-    'js_secrets': 300, 'api_fuzzer': 300, 'content_intel': 300,
-    'cloud_buckets': 300,
-    'subdomains': 360, 'brute': 360, 'breachintel': 360,
-    # vulnerability scanner — 145 path checks + exploit templates + recent CVEs
-    'nuclei': 600,
+    'js_secrets': 900, 'api_fuzzer': 900, 'content_intel': 900,
+    'cloud_buckets': 900,
+    'subdomains': 1080, 'brute': 1080, 'breachintel': 1080,
+    # CMS deep scan probes one platform's own paths; panels is mostly waiting
+    # on ports that may not answer at all
+    'cms': 540, 'panels': 540,
+    # vulnerability scanner — 419 path checks
+    'nuclei': 1800,
 }
-DEFAULT_TIMEOUT = 180    # anything unlisted
-ABS_CAP = 720            # hard safety ceiling per module (12 min)
+DEFAULT_TIMEOUT = 540    # anything unlisted
+ABS_CAP = 2160           # hard safety ceiling per module (36 min)
 
 
 def _register_scan(scan_id):

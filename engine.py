@@ -6375,7 +6375,13 @@ _WW_CMS_SIGS = {
                            r'\.webflow\.io',
                            ("b", r'name=["\']generator["\'][^>]*Webflow')],
     "Magento":            [r'Mage\.Cookies', r'/skin/frontend/', r'var BLANK_URL'],
-    "PrestaShop":         [r'/modules/blockcart/', r'var\s+prestashop',
+    # The 1.6-era signature (blockcart + `var prestashop`) misses every modern
+    # shop, so the deep scan found PrestaShop while the fingerprint table said
+    # nothing and the two disagreed. All structural: native modules are named
+    # ps_*, and the front office sets a window.prestashop object.
+    "PrestaShop":         [r'/modules/ps_[a-z]{4,}/', r'/modules/blockcart/',
+                           r'(?:window|var)\s*\.?\s*prestashop\s*=',
+                           r'/themes/_core/js/',
                            ("h", r'PrestaShop-\w+')],
     "OpenCart":           [r'catalog/view/theme', r'route=common/home'],
     "Ghost":              [r'/ghost/api/', ("b", r'content=["\']Ghost\s')],
@@ -6397,7 +6403,7 @@ _WW_ECOM_SIGS = {
 # The platforms scan_cms can actually go deep on. Anything else that is
 # fingerprinted gets reported as identified-but-not-deep-scanned, so a
 # Magento site is never mistaken for a site with nothing to check.
-_CMS_DEEP_SCANNED = {"WordPress", "Joomla", "Drupal"}
+_CMS_DEEP_SCANNED = {"WordPress", "Joomla", "Drupal", "PrestaShop"}
 
 
 # The full whatweb signature table, at module level so the browser-extension
@@ -11257,7 +11263,8 @@ def scan_api_fuzzer(domain):
 # count, which is why an article about a CMS is not reported as running it.
 
 # Proper display names: .title() turns "wordpress" into "Wordpress".
-_CMS_NAMES = {"wordpress": "WordPress", "joomla": "Joomla", "drupal": "Drupal"}
+_CMS_NAMES = {"wordpress": "WordPress", "joomla": "Joomla", "drupal": "Drupal",
+              "prestashop": "PrestaShop"}
 
 
 def _cms_name(cms):
@@ -11310,6 +11317,14 @@ _CMS_SIGNALS = {
         (2, "body", r'Drupal\.settings|drupal-settings-json', "Drupal JS settings"),
         (1, "body", r'<body[^>]+class=["\'][^"\']*\bpath-node\b', "Drupal body class"),
     ],
+    "prestashop": [
+        (3, "body", r'/modules/ps_[a-z]{4,}/', "ps_* native module path"),
+        (3, "header", r'set-cookie:[^\n]*PrestaShop-', "PrestaShop session cookie"),
+        (3, "body", r'(?:window|var)\s*\.?\s*prestashop\s*=', "prestashop JS global"),
+        (2, "body", r'/themes/_core/js/', "PrestaShop core theme assets"),
+        (2, "body", r'/modules/blockcart/', "blockcart module (1.6)"),
+        (1, "body", r'/img/p/\d', "PrestaShop product image path"),
+    ],
 }
 
 # Where each CMS states its version, and how to read it.
@@ -11328,6 +11343,11 @@ _CMS_VERSION_SOURCES = {
         ("/CHANGELOG.txt", r'Drupal\s+([\d.]+),'),
         ("/core/CHANGELOG.txt", r'Drupal\s+([\d.]+),'),
         ("/", r'<meta[^>]+name=["\']generator["\'][^>]+content=["\']\s*Drupal\s+([\d.]+)'),
+    ],
+    "prestashop": [
+        # the front office stamps ?version= on its theme and module assets
+        ("/", r'/(?:themes|modules)/[^"\'\s]+\?version=([\d]+\.[\d.]+)'),
+        ("/docs/CHANGELOG.txt", r'(?:^|\n)\s*v?([\d]+\.[\d]+\.[\d]+(?:\.[\d]+)?)'),
     ],
 }
 
@@ -11375,6 +11395,19 @@ _CMS_PATHS = {
         ("/user/register", "open registration", "low"),
         ("/admin", "admin area", "low"),
     ],
+    "prestashop": [
+        # 1.7 and later keep database credentials here; 1.6 used config/
+        ("/app/config/parameters.php",     "parameters.php (database credentials)", "critical"),
+        ("/app/config/parameters.yml",     "parameters.yml (database credentials)", "critical"),
+        ("/config/settings.inc.php.bak",   "settings.inc.php backup",               "critical"),
+        ("/config/settings.old.php",       "old settings file",                     "critical"),
+        ("/install/",                      "installer still present",               "critical"),
+        ("/admin/",                        "default admin directory not renamed",   "high"),
+        ("/var/logs/",                     "application log directory",             "high"),
+        ("/modules/",                      "modules directory listing",             "medium"),
+        ("/docs/CHANGELOG.txt",            "version changelog",                     "low"),
+        ("/robots.txt",                    "robots.txt reveals the admin path",     "low"),
+    ],
 }
 
 # Markers proving a probed CMS path really is what it claims, so an HTML error
@@ -11408,6 +11441,9 @@ _CMS_PATH_ANTI_MARKERS = {
     "/install.php": [b"already installed"],
     "/update.php": [b"access denied", b"Access denied", b"update.php?op=login"],
     "/installation/": [b"already installed", b"Joomla! is already installed"],
+    "/install/": [b"already installed", b"PrestaShop is already installed",
+                  b"delete the install"],
+    "/robots.txt": [b"<html", b"<!DOCTYPE"],
 }
 
 _CMS_PATH_MARKERS = {
@@ -11427,6 +11463,12 @@ _CMS_PATH_MARKERS = {
     "/sites/default/settings.php~": [b"$databases", b"<?php", b"drupal"],
     "/CHANGELOG.txt": [b"Drupal"],
     "/core/install.php": [b"Drupal", b"install"],
+    "/app/config/parameters.php":   [b"database_password", b"database_user", b"database_prefix"],
+    "/app/config/parameters.yml":   [b"database_password", b"database_user", b"database_prefix"],
+    "/config/settings.inc.php.bak": [b"_DB_PASSWD_", b"_DB_NAME_", b"_DB_USER_"],
+    "/config/settings.old.php":     [b"_DB_PASSWD_", b"_DB_NAME_", b"_DB_USER_"],
+    "/docs/CHANGELOG.txt":          [b"PrestaShop"],
+    "/var/logs/":                   [b".log", b"Index of"],
 }
 
 _DIRLIST_MARKERS = (b"Index of /", b"<title>Index of", b"Parent Directory",
