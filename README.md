@@ -547,6 +547,12 @@ python3 kumo.py --list-modules                every module, grouped
 python3 kumo.py --theme carbon example.com    void · glass · web · carbon
 python3 kumo.py example.com --no-spider       disable the crawl animation
 python3 kumo.py example.com --no-color        pipe-friendly output
+python3 kumo.py example.com -A firefox         preset User-Agent
+python3 kumo.py example.com -A "MyAgent/1.0"   custom User-Agent
+python3 kumo.py example.com -A random          rotate browser User-Agents
+python3 kumo.py example.com -H "Cookie: sid=1" -H "X-Bug-Bounty: me"
+python3 kumo.py example.com --headers-file h.txt
+python3 kumo.py --list-agents                  User-Agent presets
 ```
 
 | Flag | Default |
@@ -554,6 +560,17 @@ python3 kumo.py example.com --no-color        pipe-friendly output
 | `--theme` | `void`, or `$KUMO_THEME` |
 | `-p` / `--port` | `8888` |
 | `--host` | `0.0.0.0` |
+| `-A` / `--user-agent` | Chrome 125 on Windows |
+| `-H` / `--header` | none, repeatable |
+
+Custom headers and the User-Agent apply to every request sent to the target
+and its subdomains, including the WhatWeb and wafw00f binaries and the
+screenshot browser. Third-party APIs (crt.sh, Shodan, Censys, etc.) never
+receive them. Headers a module sets for a specific probe (an `Origin` for
+CORS, a `Host` for header injection) take precedence over custom ones.
+
+In the dashboard, the **⚙ HTTP** button next to SCAN opens the same options.
+They are remembered in the browser between sessions.
 
 Fast mode skips: `wayback` · `brute` · `subdomains` · `screenshot` ·
 `email_harvest` · `nuclei` · `cloud_buckets`
